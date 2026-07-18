@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Lock
+from time import monotonic, sleep
 from typing import Any
 
 try:
@@ -46,6 +47,9 @@ class RecentEpisodeMaintenance(_PluginBase):
     _STATE_COMPLETE = "complete"
     _STATE_ATTENTION = "attention"
     _MAX_REORGANIZE_ATTEMPTS = 2
+    _MAX_SIDECAR_ATTEMPTS = 2
+    _SIDECAR_WAIT_SECONDS = 60
+    _SIDECAR_POLL_SECONDS = 3
     _PREVIEW_CACHE_HOURS = 24
     _INSPECTION_MULTIPLIER = 5
     _CRON_HINT_EXPRESSION = (
@@ -92,7 +96,7 @@ class RecentEpisodeMaintenance(_PluginBase):
     plugin_name = "最近剧集维护"
     plugin_desc = "维护 MoviePilot 最近整理入库的 Jellyfin 剧集"
     plugin_icon = "https://raw.githubusercontent.com/byangmath/RecentEpisodeMaintenance/main/icons/recentepisodemaintenance.png"
-    plugin_version = "0.1.0"
+    plugin_version = "0.1.1"
     plugin_author = "byangmath"
     author_url = "https://github.com/byangmath"
     plugin_config_prefix = "recentepisodemaintenance_"
@@ -368,6 +372,7 @@ class RecentEpisodeMaintenance(_PluginBase):
 
         client: JellyfinServiceClient | None = None
         deferred_reorganize_targets: set[str] = set()
+        refresh_first_targets: set[str] = set()
         history_keys_by_target: dict[str, set[str]] = {}
         expected_paths: dict[str, Path] = {}
         preview_failed_keys: set[str] = set()
@@ -516,6 +521,9 @@ class RecentEpisodeMaintenance(_PluginBase):
                     deferred_reorganize_targets.update(
                         episode_target_keys.get(episode.item_id) or set()
                     )
+                    refresh_first_targets.update(
+                        episode_target_keys.get(episode.item_id) or set()
+                    )
                     if result.operations_used >= result.operation_limit:
                         result.skipped += 1
                         if not self._dry_run:
@@ -582,7 +590,8 @@ class RecentEpisodeMaintenance(_PluginBase):
                             self._STATE_PENDING_REFRESH,
                         )
 
-        any_reorganized = False
+        reorganized_sidecars: list[dict[str, Any]] = []
+        sidecars_ready_for_scan = False
         if self._enable_reorganize:
             for history in histories:
                 label = reorganizer.display_name(history)
@@ -590,7 +599,36 @@ class RecentEpisodeMaintenance(_PluginBase):
                 current_file = reorganizer.target_path(history)
                 target_key = JellyfinServiceClient.path_key(current_file)
                 expected_path = expected_paths.get(processing_key)
-                if target_key in deferred_reorganize_targets:
+                state_hint = processing_state.get(processing_key) or {}
+                sidecar_pending_hint = bool(state_hint.get("sidecar_pending"))
+                if (
+                    not sidecar_pending_hint
+                    and expected_path
+                    and state_hint.get("status") == self._STATE_PENDING_REORGANIZE
+                    and bool(state_hint.get("had_action"))
+                    and self._same_path(current_file, expected_path)
+                    and self._missing_reorganized_sidecars(expected_path)
+                ):
+                    sidecar_pending_hint = True
+                    if not self._dry_run:
+                        self._mark_processing_state(
+                            processing_state,
+                            {processing_key},
+                            self._STATE_PENDING_REORGANIZE,
+                            sidecar_pending=True,
+                            sidecar_attempts=0,
+                        )
+                        logger.info(
+                            f"[最近剧集维护] 检测到既有重新整理记录附件不完整，"
+                            f"将补充刮削 {label}｜文件：{Path(expected_path).name}"
+                        )
+                if (
+                    target_key in deferred_reorganize_targets
+                    and not (
+                        sidecar_pending_hint
+                        and target_key not in refresh_first_targets
+                    )
+                ):
                     result.skipped += 1
                     prefix = "试运行：" if self._dry_run else ""
                     logger.info(
@@ -615,7 +653,56 @@ class RecentEpisodeMaintenance(_PluginBase):
                 try:
                     state_item = processing_state.get(processing_key) or {}
                     rename_attempts = int(state_item.get("rename_attempts") or 0)
-                    if self._skip_same_name and self._same_path(current_file, expected_path):
+                    sidecar_pending = bool(state_item.get("sidecar_pending"))
+                    sidecar_attempts = int(state_item.get("sidecar_attempts") or 0)
+                    same_path = self._same_path(current_file, expected_path)
+                    if sidecar_pending and not self._missing_reorganized_sidecars(expected_path):
+                        sidecar_pending = False
+                        sidecars_ready_for_scan = True
+                        self._mark_processing_state(
+                            processing_state,
+                            {processing_key},
+                            self._STATE_PENDING_REORGANIZE,
+                            sidecar_pending=False,
+                            sidecar_attempts=sidecar_attempts,
+                        )
+                        logger.info(
+                            f"[最近剧集维护] 重新整理附件已补齐 {label}｜"
+                            f"文件：{Path(expected_path).name}"
+                        )
+                    elif (
+                        not sidecar_pending
+                        and state_item.get("status") == self._STATE_PENDING_REORGANIZE
+                        and bool(state_item.get("had_action"))
+                        and same_path
+                        and self._missing_reorganized_sidecars(expected_path)
+                    ):
+                        sidecar_pending = True
+                        sidecar_attempts = 0
+                        logger.info(
+                            f"[最近剧集维护] 检测到既有重新整理记录附件不完整，"
+                            f"将补充刮削 {label}｜文件：{Path(expected_path).name}"
+                        )
+                    if sidecar_pending and sidecar_attempts >= self._MAX_SIDECAR_ATTEMPTS:
+                        message = (
+                            f"{label} 已连续触发刮削 {sidecar_attempts} 次，"
+                            "NFO 或图片仍未生成，已停止自动重试；请检查 MoviePilot 刮削日志"
+                        )
+                        result.add_error(message)
+                        if not self._dry_run:
+                            self._mark_processing_state(
+                                processing_state,
+                                {processing_key},
+                                self._STATE_ATTENTION,
+                            )
+                        logger.error(f"[最近剧集维护] {message}")
+                        continue
+
+                    if (
+                        self._skip_same_name
+                        and not sidecar_pending
+                        and same_path
+                    ):
                         result.skipped += 1
                         if not self._dry_run:
                             self._mark_processing_verified(
@@ -640,13 +727,23 @@ class RecentEpisodeMaintenance(_PluginBase):
                             continue
                         result.operations_used += 1
                         result.previewed += 1
-                        logger.info(
-                            f"[最近剧集维护] 试运行：{label} 预计重新命名｜"
-                            f"{self._file_change_details(current_file, expected_path)}"
-                        )
+                        if sidecar_pending:
+                            logger.info(
+                                f"[最近剧集维护] 试运行：{label} 将重试重新整理并补齐刮削附件｜"
+                                f"文件：{Path(expected_path).name}"
+                            )
+                        else:
+                            logger.info(
+                                f"[最近剧集维护] 试运行：{label} 预计重新命名｜"
+                                f"{self._file_change_details(current_file, expected_path)}"
+                            )
                         continue
 
-                    if not self._dry_run and rename_attempts >= self._MAX_REORGANIZE_ATTEMPTS:
+                    if (
+                        not self._dry_run
+                        and not sidecar_pending
+                        and rename_attempts >= self._MAX_REORGANIZE_ATTEMPTS
+                    ):
                         preview = reorganizer.reorganize(
                             history=history,
                             skip_same_name=self._skip_same_name,
@@ -703,29 +800,36 @@ class RecentEpisodeMaintenance(_PluginBase):
                     result.operations_used += 1
                     operation = reorganizer.reorganize(
                         history=history,
-                        skip_same_name=self._skip_same_name,
+                        skip_same_name=False if sidecar_pending else self._skip_same_name,
                     )
                     if operation.success:
                         if self._dry_run:
                             result.previewed += 1
                         else:
-                            result.reorganized += 1
-                            result.add_reorganized_title(
-                                self._result_title(label, operation.target)
-                            )
-                            any_reorganized = True
+                            target = operation.target or expected_path or current_file
+                            next_sidecar_attempts = sidecar_attempts + 1 if sidecar_pending else 1
                             self._mark_processing_state(
                                 processing_state,
                                 {processing_key},
                                 self._STATE_PENDING_REORGANIZE,
-                                rename_attempts=rename_attempts + 1,
+                                rename_attempts=(
+                                    rename_attempts if sidecar_pending else rename_attempts + 1
+                                ),
                                 had_action=True,
-                                expected_path=operation.target,
+                                expected_path=target,
+                                sidecar_pending=True,
+                                sidecar_attempts=next_sidecar_attempts,
                             )
-                        logger.info(
-                            f"[最近剧集维护] {label}：{operation.message}｜"
-                            f"{self._file_change_details(current_file, operation.target)}"
-                        )
+                            reorganized_sidecars.append({
+                                "key": processing_key,
+                                "label": label,
+                                "target": Path(target) if target else None,
+                                "attempts": next_sidecar_attempts,
+                            })
+                            logger.info(
+                                f"[最近剧集维护] 已提交重新整理并等待刮削附件 {label}｜"
+                                f"{self._file_change_details(current_file, target)}"
+                            )
                     elif operation.skipped:
                         result.skipped += 1
                         if not self._dry_run:
@@ -762,7 +866,62 @@ class RecentEpisodeMaintenance(_PluginBase):
                         f"文件：{current_file or '未知文件'}"
                     )
 
-        if any_reorganized and self._scan_after_reorganize and not self._dry_run:
+        missing_sidecars: dict[str, list[str]] = {}
+        if reorganized_sidecars and not self._dry_run:
+            logger.info(
+                f"[最近剧集维护] 等待 {len(reorganized_sidecars)} 个重新整理文件生成 NFO 和图片，"
+                f"最长 {self._SIDECAR_WAIT_SECONDS} 秒"
+            )
+            missing_sidecars = self._wait_for_reorganized_sidecars(reorganized_sidecars)
+            for item in reorganized_sidecars:
+                processing_key = str(item["key"])
+                label = str(item["label"])
+                target = item.get("target")
+                attempts = int(item.get("attempts") or 1)
+                missing = missing_sidecars.get(processing_key)
+                if not missing:
+                    result.reorganized += 1
+                    result.add_reorganized_title(self._result_title(label, target))
+                    self._mark_processing_state(
+                        processing_state,
+                        {processing_key},
+                        self._STATE_PENDING_REORGANIZE,
+                        sidecar_pending=False,
+                        sidecar_attempts=attempts,
+                    )
+                    logger.info(
+                        f"[最近剧集维护] 重新整理及刮削附件已完成 {label}｜"
+                        f"文件：{Path(target).name if target else '未知文件'}"
+                    )
+                    continue
+
+                missing_text = "、".join(missing)
+                exhausted = attempts >= self._MAX_SIDECAR_ATTEMPTS
+                status = self._STATE_ATTENTION if exhausted else self._STATE_PENDING_REORGANIZE
+                self._mark_processing_state(
+                    processing_state,
+                    {processing_key},
+                    status,
+                    sidecar_pending=True,
+                    sidecar_attempts=attempts,
+                )
+                if exhausted:
+                    message = (
+                        f"{label}：重新整理后仍缺少{missing_text}，已连续尝试 {attempts} 次，"
+                        "请检查 MoviePilot 刮削日志"
+                    )
+                else:
+                    message = (
+                        f"{label}：重新整理后缺少{missing_text}，"
+                        f"下次运行将重试（{attempts}/{self._MAX_SIDECAR_ATTEMPTS}）"
+                    )
+                result.add_error(message)
+                logger.error(f"[最近剧集维护] {message}")
+
+        sidecars_complete = (
+            bool(reorganized_sidecars) or sidecars_ready_for_scan
+        ) and not missing_sidecars
+        if sidecars_complete and self._scan_after_reorganize and not self._dry_run:
             client = client or self._get_jellyfin_client()
             try:
                 if client:
@@ -772,6 +931,11 @@ class RecentEpisodeMaintenance(_PluginBase):
                     result.add_error("重新整理后无法触发 Jellyfin 媒体库扫描")
             except Exception as err:
                 result.add_error(f"媒体库扫描失败：{err}")
+        elif missing_sidecars and self._scan_after_reorganize and not self._dry_run:
+            logger.warning(
+                "[最近剧集维护] 部分重新整理文件的 NFO 或图片尚未生成，"
+                "本轮不触发 Jellyfin 媒体库扫描"
+            )
 
         if not self._dry_run:
             self._save_processing_state(processing_state)
@@ -797,6 +961,64 @@ class RecentEpisodeMaintenance(_PluginBase):
             self._refresh_mode == "all",
             self._replace_images,
         )
+
+    @classmethod
+    def _wait_for_reorganized_sidecars(
+        cls,
+        items: list[dict[str, Any]],
+    ) -> dict[str, list[str]]:
+        pending = {
+            str(item["key"]): item
+            for item in items
+        }
+        deadline = monotonic() + cls._SIDECAR_WAIT_SECONDS
+        missing_by_key: dict[str, list[str]] = {}
+        while pending:
+            for key, item in list(pending.items()):
+                missing = cls._missing_reorganized_sidecars(item.get("target"))
+                if missing:
+                    missing_by_key[key] = missing
+                    continue
+                missing_by_key.pop(key, None)
+                pending.pop(key, None)
+
+            remaining = deadline - monotonic()
+            if not pending or remaining <= 0:
+                break
+            sleep(min(cls._SIDECAR_POLL_SECONDS, remaining))
+
+        return {
+            key: missing_by_key.get(
+                key,
+                cls._missing_reorganized_sidecars(item.get("target")),
+            )
+            for key, item in pending.items()
+        }
+
+    @staticmethod
+    def _missing_reorganized_sidecars(target: Any) -> list[str]:
+        if not target:
+            return ["目标文件", "NFO", "图片"]
+
+        media_path = Path(target)
+        missing: list[str] = []
+        try:
+            if not media_path.is_file():
+                missing.append("目标文件")
+            if not media_path.with_suffix(".nfo").is_file():
+                missing.append("NFO")
+
+            image_extensions = (".jpg", ".jpeg", ".png", ".webp", ".avif")
+            image_paths = [media_path.with_suffix(extension) for extension in image_extensions]
+            image_paths.extend(
+                media_path.parent / f"{media_path.stem}-thumb{extension}"
+                for extension in image_extensions
+            )
+            if not any(path.is_file() for path in image_paths):
+                missing.append("图片")
+        except OSError:
+            return ["目标文件", "NFO", "图片"]
+        return missing
 
     @staticmethod
     def _file_change_details(current_file: Any, new_file: Any) -> str:
@@ -993,6 +1215,8 @@ class RecentEpisodeMaintenance(_PluginBase):
         had_action: bool | None = None,
         expected_path: Any = None,
         next_preview_at: str | None = None,
+        sidecar_pending: bool | None = None,
+        sidecar_attempts: int | None = None,
     ) -> None:
         updated_at = datetime.now().isoformat(timespec="seconds")
         for key in keys:
@@ -1010,6 +1234,16 @@ class RecentEpisodeMaintenance(_PluginBase):
                 item["next_preview_at"] = next_preview_at
             elif status != RecentEpisodeMaintenance._STATE_MONITORING:
                 item.pop("next_preview_at", None)
+            if sidecar_pending is not None:
+                item["sidecar_pending"] = sidecar_pending
+            if sidecar_attempts is not None:
+                item["sidecar_attempts"] = sidecar_attempts
+            if status in {
+                RecentEpisodeMaintenance._STATE_COMPLETE,
+                RecentEpisodeMaintenance._STATE_MONITORING,
+            }:
+                item.pop("sidecar_pending", None)
+                item.pop("sidecar_attempts", None)
             state[key] = item
 
     def _get_jellyfin_client(self) -> JellyfinServiceClient | None:
