@@ -29,7 +29,7 @@ from .reorganizer import MoviePilotReorganizer
 class RecentEpisodeMaintenance(_PluginBase):
     plugin_name = "最近剧集维护"
     plugin_desc = "定时刷新和重新整理最近发布的 Jellyfin 剧集"
-    plugin_icon = "https://raw.githubusercontent.com/jellyfin/jellyfin-ux/master/branding/SVG/icon-transparent.svg"
+    plugin_icon = "https://raw.githubusercontent.com/byangmath/RecentEpisodeMaintenance/main/icons/recentepisodemaintenance.png"
     plugin_version = "0.1.0"
     plugin_author = "byangmath"
     author_url = "https://github.com/byangmath"
