@@ -1,14 +1,21 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from time import sleep
 from typing import Any, Iterable
 from urllib.parse import urlencode
 
 from .models import EpisodeItem, EpisodeTarget
 
+logger = logging.getLogger(__name__)
+
 
 class JellyfinServiceClient:
+    _REQUEST_ATTEMPTS = 3
+    _REQUEST_RETRY_DELAY_SECONDS = 30
+
     def __init__(self, service: Any):
         self.service = service
 
@@ -40,6 +47,40 @@ class JellyfinServiceClient:
             return json_method()
         return response
 
+    def _get_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        return self._request_json("get_data", path, params)
+
+    def _post_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        return self._request_json("post_data", path, params)
+
+    def _request_json(
+        self,
+        method_name: str,
+        path: str,
+        params: dict[str, Any] | None = None,
+    ) -> Any:
+        url = self._url(path, params)
+        last_error: Exception | None = None
+        for attempt in range(1, self._REQUEST_ATTEMPTS + 1):
+            try:
+                method = getattr(self.service, method_name)
+                return self._json(method(url))
+            except Exception as err:
+                last_error = err
+                if attempt >= self._REQUEST_ATTEMPTS:
+                    break
+                logger.warning(
+                    "[最近剧集维护] Jellyfin 请求失败，%s 秒后重试（%s/%s）：%s",
+                    self._REQUEST_RETRY_DELAY_SECONDS,
+                    attempt,
+                    self._REQUEST_ATTEMPTS,
+                    err,
+                )
+                sleep(self._REQUEST_RETRY_DELAY_SECONDS)
+        if last_error:
+            raise last_error
+        raise RuntimeError("媒体服务器无响应")
+
     def recent_added_episodes(
         self,
         days: int,
@@ -65,8 +106,7 @@ class JellyfinServiceClient:
             if parent_id:
                 params["ParentId"] = parent_id
 
-            response = self.service.get_data(self._url("Items", params))
-            for item in self._json(response).get("Items") or []:
+            for item in self._get_json("Items", params).get("Items") or []:
                 episode = EpisodeItem.from_jellyfin(item)
                 if episode.item_id and episode.path and self._created_after(episode.date_created, since):
                     episodes[episode.item_id] = episode
@@ -253,8 +293,7 @@ class JellyfinServiceClient:
                 "Limit": page_size,
                 "EnableTotalRecordCount": "true",
             }
-            response = self.service.get_data(self._url("Items", page_params))
-            payload = self._json(response) or {}
+            payload = self._get_json("Items", page_params) or {}
             page = payload.get("Items") or []
             items.extend(item for item in page if isinstance(item, dict))
             start_index += len(page)
@@ -282,8 +321,7 @@ class JellyfinServiceClient:
             return False
 
     def libraries(self) -> list[dict[str, str]]:
-        response = self.service.get_data(self._url("Library/VirtualFolders"))
-        items = self._json(response) or []
+        items = self._get_json("Library/VirtualFolders") or []
         libraries: list[dict[str, str]] = []
         for item in items:
             if not isinstance(item, dict):
@@ -308,9 +346,7 @@ class JellyfinServiceClient:
             "ReplaceAllMetadata": str(bool(replace_metadata)).lower(),
             "ReplaceAllImages": str(bool(replace_images)).lower(),
         }
-        response = self.service.post_data(self._url(f"Items/{item_id}/Refresh", params))
-        self._json(response)
+        self._post_json(f"Items/{item_id}/Refresh", params)
 
     def scan_library(self) -> None:
-        response = self.service.post_data(self._url("Library/Refresh"))
-        self._json(response)
+        self._post_json("Library/Refresh")
