@@ -2,30 +2,38 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
-
-import requests
+from urllib.parse import urlencode
 
 from .models import EpisodeItem
 
 
-class JellyfinClient:
-    def __init__(self, server_url: str, api_key: str, user_id: str = "", timeout: int = 30):
-        self.server_url = (server_url or "").rstrip("/")
-        self.api_key = api_key or ""
-        self.user_id = user_id or ""
-        self.timeout = timeout
+class JellyfinServiceClient:
+    def __init__(self, service: Any):
+        self.service = service
 
     def enabled(self) -> bool:
-        return bool(self.server_url and self.api_key)
+        return bool(self.service)
 
-    def _headers(self) -> dict[str, str]:
-        return {
-            "X-Emby-Token": self.api_key,
-            "Accept": "application/json",
-        }
+    @staticmethod
+    def _url(path: str, params: dict[str, Any] | None = None) -> str:
+        query = urlencode(params or {})
+        if query:
+            return f"[HOST]{path.lstrip('/')}?{query}&api_key=[APIKEY]"
+        return f"[HOST]{path.lstrip('/')}?api_key=[APIKEY]"
 
-    def _url(self, path: str) -> str:
-        return f"{self.server_url}/{path.lstrip('/')}"
+    @staticmethod
+    def _json(response: Any) -> Any:
+        if response is None:
+            raise RuntimeError("媒体服务器无响应")
+        if isinstance(response, (dict, list)):
+            return response
+        raise_for_status = getattr(response, "raise_for_status", None)
+        if callable(raise_for_status):
+            raise_for_status()
+        json_method = getattr(response, "json", None)
+        if callable(json_method):
+            return json_method()
+        return response
 
     def recent_episodes(self, days: int, library_ids: Iterable[str] | None = None) -> list[EpisodeItem]:
         since = datetime.now(timezone.utc) - timedelta(days=max(int(days or 1), 1))
@@ -42,17 +50,23 @@ class JellyfinClient:
         if ids:
             params["ParentId"] = ",".join(ids)
 
-        endpoint = f"/Users/{self.user_id}/Items" if self.user_id else "/Items"
-        response = requests.get(
-            self._url(endpoint),
-            params=params,
-            headers=self._headers(),
-            timeout=self.timeout,
-        )
-        response.raise_for_status()
-        items = response.json().get("Items") or []
+        response = self.service.get_data(self._url("Items", params))
+        items = self._json(response).get("Items") or []
         episodes = [EpisodeItem.from_jellyfin(item) for item in items]
         return [item for item in episodes if item.item_id and item.path and item.premiere_date]
+
+    def libraries(self) -> list[dict[str, str]]:
+        response = self.service.get_data(self._url("Library/VirtualFolders"))
+        items = self._json(response) or []
+        libraries: list[dict[str, str]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item_id = item.get("ItemId") or item.get("Id")
+            name = item.get("Name")
+            if item_id and name:
+                libraries.append({"title": str(name), "value": str(item_id)})
+        return libraries
 
     def refresh_episode(
         self,
@@ -68,18 +82,9 @@ class JellyfinClient:
             "ReplaceAllMetadata": str(bool(replace_metadata)).lower(),
             "ReplaceAllImages": str(bool(replace_images)).lower(),
         }
-        response = requests.post(
-            self._url(f"/Items/{item_id}/Refresh"),
-            params=params,
-            headers=self._headers(),
-            timeout=self.timeout,
-        )
-        response.raise_for_status()
+        response = self.service.post_data(self._url(f"Items/{item_id}/Refresh", params))
+        self._json(response)
 
     def scan_library(self) -> None:
-        response = requests.post(
-            self._url("/Library/Refresh"),
-            headers=self._headers(),
-            timeout=self.timeout,
-        )
-        response.raise_for_status()
+        response = self.service.post_data(self._url("Library/Refresh"))
+        self._json(response)

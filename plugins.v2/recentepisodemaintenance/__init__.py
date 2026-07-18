@@ -20,7 +20,12 @@ except Exception:
     class _PluginBase:  # type: ignore
         pass
 
-from .jellyfin_client import JellyfinClient
+try:
+    from app.helper.mediaserver import MediaServerHelper
+except Exception:
+    MediaServerHelper = None
+
+from .jellyfin_client import JellyfinServiceClient
 from .models import RunResult
 from .path_mapper import PathMapper
 from .reorganizer import MoviePilotReorganizer
@@ -39,6 +44,7 @@ class RecentEpisodeMaintenance(_PluginBase):
 
     def init_plugin(self, config: dict[str, Any] | None = None):
         config = config or {}
+        config_changed = False
         self._enabled = bool(config.get("enabled", False))
         self._cron = config.get("cron") or "0 4 * * *"
         self._days = int(config.get("days") or 7)
@@ -49,20 +55,28 @@ class RecentEpisodeMaintenance(_PluginBase):
         self._enable_reorganize = bool(config.get("enable_reorganize", False))
         self._scan_after_reorganize = bool(config.get("scan_after_reorganize", True))
         self._skip_same_name = bool(config.get("skip_same_name", True))
-        self._transfer_type = config.get("transfer_type") or "move"
-        self._jellyfin_url = config.get("jellyfin_url") or ""
-        self._jellyfin_api_key = config.get("jellyfin_api_key") or ""
-        self._jellyfin_user_id = config.get("jellyfin_user_id") or ""
-        self._library_ids = config.get("library_ids") or ""
+        self._transfer_type = "move"
+        self._media_server_name = config.get("media_server_name") or self._first_jellyfin_service_name()
+        library_ids_selection = self._library_ids_selection(config.get("library_ids"))
+        self._library_ids = self._normalize_values(library_ids_selection)
+        if config.get("library_ids") != library_ids_selection:
+            config["library_ids"] = library_ids_selection
+            config_changed = True
         self._path_mappings = config.get("path_mappings") or ""
         self._metadata_mode = config.get("metadata_mode") or "FullRefresh"
         self._image_mode = config.get("image_mode") or "Default"
         self._replace_metadata = bool(config.get("replace_metadata", False))
         self._replace_images = bool(config.get("replace_images", False))
 
-        if bool(config.get("run_once", False)):
+        run_once = bool(config.get("run_once", False))
+        if run_once:
             config["run_once"] = False
+            config_changed = True
+
+        if config_changed:
             self.__update_config(config)
+
+        if run_once:
             self.run_once()
 
     def get_state(self) -> bool:
@@ -84,9 +98,12 @@ class RecentEpisodeMaintenance(_PluginBase):
         return []
 
     def get_api(self) -> list[dict[str, Any]]:
-        return []
+        pass
 
     def get_form(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        jellyfin_services = self._jellyfin_service_options()
+        library_options = self._library_options()
+        default_media_server = jellyfin_services[0]["value"] if jellyfin_services else ""
         return [
             {
                 "component": "VForm",
@@ -101,20 +118,31 @@ class RecentEpisodeMaintenance(_PluginBase):
                             self._number("max_items", "单次最大处理数量", 6),
                             self._switch("dry_run", "试运行模式", 6),
                             self._switch("notify", "运行完成后发送通知", 6),
-                            self._switch("enable_refresh", "刷新 Jellyfin 元数据", 6),
+                            self._switch("enable_refresh", "刷新媒体库元数据", 6),
                             self._switch("enable_reorganize", "重新整理最近剧集文件", 6),
                             self._switch("scan_after_reorganize", "整理后扫描媒体库", 6),
                             self._switch("skip_same_name", "跳过名称未变化的文件", 6),
-                            self._text("transfer_type", "整理方式", "传给 MoviePilot 整理链路的方式，默认 move", 6),
                         ],
                     },
                     {
                         "component": "VRow",
                         "content": [
-                            self._text("jellyfin_url", "Jellyfin 地址", "例如 http://jellyfin:8096", 12),
-                            self._text("jellyfin_api_key", "Jellyfin API Key", "", 12),
-                            self._text("jellyfin_user_id", "Jellyfin 用户 ID", "可留空", 12),
-                            self._textarea("library_ids", "媒体库 ID", "每行一个，可留空表示所有剧集库", 12),
+                            self._select(
+                                "media_server_name",
+                                "媒体服务器",
+                                jellyfin_services,
+                                12,
+                                clearable=False,
+                                hint="用于查询和刷新最近发布剧集",
+                            ),
+                            self._select(
+                                "library_ids",
+                                "维护媒体库",
+                                library_options,
+                                12,
+                                multiple=True,
+                                hint="选择全部时处理所有剧集库",
+                            ),
                             self._textarea("path_mappings", "路径映射", "/media/动画TV => /media\n/media/电视剧 => /tv", 12),
                         ],
                     },
@@ -141,11 +169,8 @@ class RecentEpisodeMaintenance(_PluginBase):
             "enable_reorganize": False,
             "scan_after_reorganize": True,
             "skip_same_name": True,
-            "transfer_type": "move",
-            "jellyfin_url": "",
-            "jellyfin_api_key": "",
-            "jellyfin_user_id": "",
-            "library_ids": "",
+            "media_server_name": self._media_server_name or default_media_server,
+            "library_ids": self._library_ids_selection(self._library_ids),
             "path_mappings": "",
             "metadata_mode": "FullRefresh",
             "image_mode": "Default",
@@ -157,31 +182,25 @@ class RecentEpisodeMaintenance(_PluginBase):
         pass
 
     def get_page(self) -> list[dict[str, Any]]:
-        return []
+        pass
 
     def run_once(self):
         if not self._enable_refresh and not self._enable_reorganize:
             logger.warning("[最近剧集维护] 未启用任何功能")
             return
 
-        client = JellyfinClient(
-            server_url=self._jellyfin_url,
-            api_key=self._jellyfin_api_key,
-            user_id=self._jellyfin_user_id,
-        )
-        if not client.enabled():
-            logger.error("[最近剧集维护] Jellyfin 地址或 API Key 未配置")
+        client = self._get_jellyfin_client()
+        if not client:
             return
 
         result = RunResult()
         try:
-            library_ids = self._library_ids.splitlines() if self._library_ids else []
-            episodes = client.recent_episodes(days=self._days, library_ids=library_ids)
+            episodes = client.recent_episodes(days=self._days, library_ids=self._library_ids)
             episodes = episodes[:max(self._max_items, 1)]
             result.total = len(episodes)
             logger.info(f"[最近剧集维护] 查询最近 {self._days} 天剧集，共 {result.total} 集")
         except Exception as err:
-            logger.error(f"[最近剧集维护] 查询 Jellyfin 失败：{err}")
+            logger.error(f"[最近剧集维护] 查询媒体服务器失败：{err}")
             return
 
         mapper = PathMapper(self._path_mappings)
@@ -234,9 +253,9 @@ class RecentEpisodeMaintenance(_PluginBase):
         if any_reorganized and self._scan_after_reorganize and not self._dry_run:
             try:
                 client.scan_library()
-                logger.info("[最近剧集维护] 已触发 Jellyfin 媒体库扫描")
+                logger.info("[最近剧集维护] 已触发媒体库扫描")
             except Exception as err:
-                result.add_error(f"Jellyfin 媒体库扫描失败：{err}")
+                result.add_error(f"媒体库扫描失败：{err}")
 
         logger.info("[最近剧集维护] 运行完成\n" + result.summary())
         if self._notify:
@@ -249,6 +268,124 @@ class RecentEpisodeMaintenance(_PluginBase):
                 post_message(title=title, text=text)
             except TypeError:
                 post_message(mtype=None, title=title, text=text)
+
+    def _get_jellyfin_client(self) -> JellyfinServiceClient | None:
+        service_items = self._jellyfin_services()
+        if service_items is None:
+            return None
+
+        if not service_items:
+            logger.error("[最近剧集维护] 未找到已配置的 Jellyfin 媒体服务器")
+            return None
+
+        selected_service = None
+        selected_name = ""
+        expected_name = self._media_server_name.strip()
+        for name, service in service_items:
+            candidate_name = self._service_name(service, str(name))
+            if not expected_name or candidate_name == expected_name or str(name) == expected_name:
+                selected_service = service
+                selected_name = candidate_name
+                break
+
+        if not selected_service:
+            available = "、".join(self._service_name(service, str(name)) for name, service in service_items)
+            logger.error(f"[最近剧集维护] 未找到 Jellyfin 服务：{expected_name}；可用服务：{available}")
+            return None
+
+        instance = getattr(selected_service, "instance", selected_service)
+        if not instance or not hasattr(instance, "get_data") or not hasattr(instance, "post_data"):
+            logger.error(f"[最近剧集维护] Jellyfin 服务不可用：{selected_name}")
+            return None
+
+        logger.info(f"[最近剧集维护] 使用 Jellyfin 服务：{selected_name}")
+        return JellyfinServiceClient(instance)
+
+    def _jellyfin_services(self, quiet: bool = False) -> list[tuple[str, Any]] | None:
+        if MediaServerHelper is None:
+            if not quiet:
+                logger.error("[最近剧集维护] 当前环境无法读取 MoviePilot 媒体服务器配置")
+            return None
+
+        try:
+            services = MediaServerHelper().get_services(type_filter="jellyfin") or {}
+        except Exception as err:
+            if not quiet:
+                logger.error(f"[最近剧集维护] 读取 Jellyfin 服务失败：{err}")
+            return None
+
+        return list(services.items()) if isinstance(services, dict) else [
+            (self._service_name(service, str(index)), service)
+            for index, service in enumerate(services)
+        ]
+
+    def _jellyfin_service_options(self) -> list[dict[str, str]]:
+        options: list[dict[str, str]] = []
+        service_items = self._jellyfin_services(quiet=True) or []
+        for name, service in service_items:
+            service_name = self._service_name(service, str(name))
+            options.append({"title": service_name, "value": service_name})
+        return options
+
+    def _first_jellyfin_service_name(self) -> str:
+        service_items = self._jellyfin_services(quiet=True) or []
+        if not service_items:
+            return ""
+        name, service = service_items[0]
+        return self._service_name(service, str(name))
+
+    def _library_options(self) -> list[dict[str, str]]:
+        options = [{"title": "全部", "value": "__all__"}]
+        client = self._get_jellyfin_client()
+        if not client:
+            return options
+        try:
+            return options + client.libraries()
+        except Exception as err:
+            logger.warning(f"[最近剧集维护] 读取 Jellyfin 媒体库列表失败：{err}")
+            return options
+
+    @staticmethod
+    def _service_name(service: Any, fallback: str) -> str:
+        for obj in (service, getattr(service, "instance", None), getattr(service, "config", None)):
+            if not obj:
+                continue
+            if isinstance(obj, dict):
+                for key in ("name", "server_name", "server", "id"):
+                    value = obj.get(key)
+                    if value:
+                        return str(value)
+                continue
+            for attr in ("name", "server_name", "server", "id"):
+                value = getattr(obj, attr, None)
+                if value:
+                    return str(value)
+        return fallback
+
+    @staticmethod
+    def _normalize_values(value: Any) -> list[str]:
+        if not value:
+            return []
+        if isinstance(value, str):
+            items = [item.strip() for item in value.splitlines() if item.strip()]
+            return [] if "__all__" in items else items
+        if isinstance(value, list):
+            items = [str(item).strip() for item in value if str(item).strip()]
+            return [] if "__all__" in items else items
+        item = str(value).strip()
+        return [] if item == "__all__" else [item]
+
+    @staticmethod
+    def _library_ids_selection(value: Any) -> list[str]:
+        if not value:
+            return ["__all__"]
+        if isinstance(value, str):
+            items = [item.strip() for item in value.splitlines() if item.strip()]
+            return items or ["__all__"]
+        if isinstance(value, list):
+            items = [str(item).strip() for item in value if str(item).strip()]
+            return items or ["__all__"]
+        return [str(value).strip()]
 
     def __update_config(self, config: dict[str, Any]) -> None:
         update_config = getattr(self, "update_config", None)
@@ -274,6 +411,45 @@ class RecentEpisodeMaintenance(_PluginBase):
             "content": [{
                 "component": "VTextField",
                 "props": {"model": model, "label": label, "placeholder": placeholder},
+            }],
+        }
+
+    @staticmethod
+    def _select(
+        model: str,
+        label: str,
+        items: list[dict[str, str]],
+        cols: int,
+        multiple: bool = False,
+        placeholder: str = "",
+        clearable: bool = True,
+        hint: str = "",
+    ) -> dict[str, Any]:
+        props: dict[str, Any] = {
+            "model": model,
+            "label": label,
+            "items": items,
+            "item-title": "title",
+            "item-value": "value",
+            "clearable": clearable,
+        }
+        if placeholder:
+            props["placeholder"] = placeholder
+        if hint:
+            props["hint"] = hint
+            props["persistent-hint"] = True
+        if multiple:
+            props.update({
+                "multiple": True,
+                "chips": True,
+                "closable-chips": True,
+            })
+        return {
+            "component": "VCol",
+            "props": {"cols": cols},
+            "content": [{
+                "component": "VSelect",
+                "props": props,
             }],
         }
 
