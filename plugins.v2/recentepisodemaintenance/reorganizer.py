@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+import inspect
 from pathlib import Path
 from typing import Any
 
-from .models import EpisodeItem, OperationResult
+from .models import OperationResult
 
 
 def _first_import(candidates: list[tuple[str, str]]) -> Any | None:
@@ -25,171 +27,258 @@ class MoviePilotReorganizer:
         self._transfer_history_cls = _first_import([
             ("app.db.models.transferhistory", "TransferHistory"),
         ])
-        self._file_item_cls = _first_import([
-            ("app.schemas", "FileItem"),
-            ("app.schemas.file", "FileItem"),
+        self._manual_transfer_item_cls = _first_import([
+            ("app.schemas", "ManualTransferItem"),
+            ("app.schemas.transfer", "ManualTransferItem"),
         ])
-        self._media_type_cls = _first_import([
-            ("app.schemas", "MediaType"),
-            ("app.schemas.types", "MediaType"),
-        ])
-        self._episode_format_cls = _first_import([
-            ("app.schemas", "EpisodeFormat"),
-            ("app.schemas.transfer", "EpisodeFormat"),
-        ])
-        self._transfer_chain_cls = _first_import([
-            ("app.chain.transfer", "TransferChain"),
-            ("app.chain", "TransferChain"),
-        ])
-        self._storage_chain_cls = _first_import([
-            ("app.chain.storage", "StorageChain"),
-            ("app.chain", "StorageChain"),
+        self._manual_transfer_endpoint = _first_import([
+            ("app.api.endpoints.transfer", "manual_transfer"),
         ])
         self._get_db = _first_import([
             ("app.db", "get_db"),
         ])
 
-    def reorganize(self, episode: EpisodeItem, path: Path, skip_same_name: bool = True) -> OperationResult:
-        if not self._available():
+    def recent_histories(self, days: int, max_items: int) -> list[Any]:
+        """Return the latest successful TV transfer record for each episode."""
+        if not self._history_available():
+            raise RuntimeError("当前 MoviePilot 未找到兼容的历史重新整理接口")
+
+        cutoff = datetime.now() - timedelta(days=max(int(days), 0))
+        history_cls = self._transfer_history_cls
+        with self._db_session() as db:
+            query = db.query(history_cls).filter(history_cls.date >= cutoff)
+            if getattr(history_cls, "status", None) is not None:
+                query = query.filter(history_cls.status.is_(True))
+            if getattr(history_cls, "seasons", None) is not None:
+                query = query.filter(history_cls.seasons.isnot(None))
+            if getattr(history_cls, "episodes", None) is not None:
+                query = query.filter(history_cls.episodes.isnot(None))
+            if getattr(history_cls, "date", None) is not None:
+                query = query.order_by(history_cls.date.desc())
+            if getattr(history_cls, "id", None) is not None:
+                query = query.order_by(history_cls.id.desc())
+            candidates = query.limit(max(max_items, 1) * 20).all()
+
+        histories: list[Any] = []
+        seen: set[tuple[str, str, str]] = set()
+        for history in candidates:
+            key = self._episode_key(history)
+            if key in seen:
+                continue
+            seen.add(key)
+            histories.append(history)
+            if len(histories) >= max(max_items, 1):
+                break
+        return histories
+
+    def reorganize(self, history: Any, skip_same_name: bool = True) -> OperationResult:
+        if not self._reorganize_available():
             return OperationResult(
                 success=False,
-                message="当前 MoviePilot 未找到兼容的历史整理接口，已安全跳过",
-                source=path,
+                message="当前 MoviePilot 未找到兼容的历史重新整理接口，已安全跳过",
             )
 
-        history = self._find_history(path)
-        if not history:
-            return OperationResult(
-                success=False,
-                skipped=True,
-                message="未找到对应的媒体整理记录",
-                source=path,
-            )
+        history_id = getattr(history, "id", None)
+        source = self._history_source(history)
+        current_target = self._history_target(history)
+        preview_target = None
+
+        if self._supports_preview():
+            try:
+                preview_response = self._call_manual_transfer(history, preview=True)
+            except Exception as err:
+                return OperationResult(
+                    success=False,
+                    message=f"重新整理预览失败，未修改文件：{err}",
+                    source=source,
+                    target=current_target,
+                )
+
+            if not self._response_success(preview_response):
+                return OperationResult(
+                    success=False,
+                    message=f"重新整理预览失败，未修改文件：{self._response_message(preview_response)}",
+                    source=source,
+                    target=current_target,
+                )
+
+            preview_target = self._preview_target(preview_response)
+            if skip_same_name and preview_target and self._same_path(current_target, preview_target):
+                return OperationResult(
+                    success=False,
+                    skipped=True,
+                    message="按当前命名规则预览后文件名没有变化",
+                    source=source,
+                    target=current_target,
+                )
 
         if self.dry_run:
+            if preview_target:
+                message = f"试运行：整理记录 #{history_id} 预计重命名为 {preview_target.name}"
+            else:
+                message = f"试运行：已匹配整理记录 #{history_id}，未修改文件"
             return OperationResult(
                 success=True,
-                message=f"试运行：已匹配整理记录 #{getattr(history, 'id', '')}，未执行重新整理",
-                source=path,
-                target=self._history_target(history),
+                message=message,
+                source=source,
+                target=preview_target or current_target,
             )
 
         try:
-            state, message = self._manual_transfer_from_history(history)
-            if not state:
-                return OperationResult(
-                    success=False,
-                    message=f"历史记录重新整理失败：{message}",
-                    source=path,
-                    target=self._history_target(history),
-                )
-            return OperationResult(
-                success=True,
-                message=f"已按整理记录 #{getattr(history, 'id', '')} 重新整理",
-                source=path,
-                target=self._history_target(history),
-            )
+            response = self._call_manual_transfer(history, preview=False)
         except Exception as err:
             return OperationResult(
                 success=False,
-                message=f"历史记录重新整理接口调用失败：{err}",
-                source=path,
-                target=self._history_target(history),
+                message=f"MoviePilot 历史记录重新整理接口调用失败：{err}",
+                source=source,
+                target=preview_target or current_target,
             )
 
-    def _available(self) -> bool:
+        if not self._response_success(response):
+            return OperationResult(
+                success=False,
+                message=f"MoviePilot 历史记录重新整理失败：{self._response_message(response)}",
+                source=source,
+                target=preview_target or current_target,
+            )
+
+        return OperationResult(
+            success=True,
+            message=f"已按 MoviePilot 整理记录 #{history_id} 重新整理",
+            source=source,
+            target=preview_target or current_target,
+        )
+
+    @staticmethod
+    def display_name(history: Any) -> str:
+        title = str(getattr(history, "title", None) or "未知剧集")
+        season = str(getattr(history, "seasons", None) or "S??")
+        episode = str(getattr(history, "episodes", None) or "E??")
+        return f"{title} {season}{episode}"
+
+    @staticmethod
+    def target_path(history: Any) -> Path | None:
+        return MoviePilotReorganizer._history_target(history)
+
+    def _history_available(self) -> bool:
         return all([
             self._transfer_history_cls,
-            self._file_item_cls,
-            self._media_type_cls,
-            self._episode_format_cls,
-            self._transfer_chain_cls,
-            self._storage_chain_cls,
             self._get_db,
         ])
 
-    def _find_history(self, path: Path) -> Any | None:
-        dest = path.as_posix()
+    def _reorganize_available(self) -> bool:
+        return all([
+            self._transfer_history_cls,
+            self._manual_transfer_item_cls,
+            self._manual_transfer_endpoint,
+            self._get_db,
+        ])
+
+    @staticmethod
+    def _episode_key(history: Any) -> tuple[str, str, str]:
+        media_id = (
+            getattr(history, "tmdbid", None)
+            or getattr(history, "doubanid", None)
+            or f"{getattr(history, 'title', '')}:{getattr(history, 'year', '')}"
+        )
+        return (
+            str(media_id),
+            str(getattr(history, "seasons", None) or ""),
+            str(getattr(history, "episodes", None) or ""),
+        )
+
+    def _supports_preview(self) -> bool:
+        fields = getattr(self._manual_transfer_item_cls, "model_fields", None)
+        if fields is None:
+            fields = getattr(self._manual_transfer_item_cls, "__fields__", {})
+        return "preview" in fields
+
+    def _call_manual_transfer(self, history: Any, preview: bool) -> Any:
+        request = self._manual_transfer_request(history, preview)
+        endpoint = self._manual_transfer_endpoint
+        parameters = inspect.signature(endpoint).parameters
+        if not parameters:
+            raise RuntimeError("MoviePilot 重新整理接口参数不兼容")
+
+        request_parameter = next(iter(parameters))
+        kwargs: dict[str, Any] = {request_parameter: request}
         with self._db_session() as db:
-            history = self._transfer_history_cls.get_by_dest(db, dest)
-            if history:
-                return history
-            history = self._transfer_history_cls.get_by_src(db, dest)
-            if history:
-                return history
-            candidates = self._transfer_history_cls.list_by_title(db, dest, count=1, status=True, wildcard=False)
-            return candidates[0] if candidates else None
+            if "background" in parameters:
+                kwargs["background"] = False
+            if "db" in parameters:
+                kwargs["db"] = db
+            for name, parameter in parameters.items():
+                if name in kwargs:
+                    continue
+                if parameter.default is inspect.Parameter.empty:
+                    kwargs[name] = None
+            response = endpoint(**kwargs)
 
-    def _manual_transfer_from_history(self, history: Any) -> tuple[bool, Any]:
-        if getattr(history, "status", False) and "move" in (getattr(history, "mode", "") or ""):
-            fileitem_data = getattr(history, "dest_fileitem", None) or {}
+        if inspect.isawaitable(response):
+            raise RuntimeError("MoviePilot 重新整理接口变为异步接口，当前版本暂不兼容")
+        return response
+
+    def _manual_transfer_request(self, history: Any, preview: bool) -> Any:
+        fields = getattr(self._manual_transfer_item_cls, "model_fields", None)
+        if fields is None:
+            fields = getattr(self._manual_transfer_item_cls, "__fields__", {})
+
+        values = {
+            "logid": int(history.id),
+            "from_history": True,
+            "transfer_type": getattr(history, "mode", None),
+            "target_storage": getattr(history, "dest_storage", None),
+            "scrape": True,
+            "preview": preview,
+        }
+        if fields:
+            values = {key: value for key, value in values.items() if key in fields}
+        return self._manual_transfer_item_cls(**values)
+
+    @staticmethod
+    def _response_success(response: Any) -> bool:
+        if isinstance(response, dict):
+            return bool(response.get("success"))
+        return bool(getattr(response, "success", False))
+
+    @staticmethod
+    def _response_message(response: Any) -> str:
+        if isinstance(response, dict):
+            message = response.get("message")
         else:
-            fileitem_data = getattr(history, "src_fileitem", None) or {}
-        if not fileitem_data:
-            raise RuntimeError("整理记录缺少文件项")
+            message = getattr(response, "message", None)
+        return str(message or "未知错误")
 
-        dest_fileitem = None
-        if getattr(history, "dest_fileitem", None):
-            dest_fileitem = self._file_item_cls(**history.dest_fileitem)
-            deleted = self._storage_chain_cls().delete_media_file(dest_fileitem)
-            if not deleted:
-                return False, f"{dest_fileitem.path} 删除失败"
-
-        fileitem = self._file_item_cls(**fileitem_data)
-        mtype = self._media_type(getattr(history, "type", None))
-        epformat = self._episode_format(history)
-
-        return self._transfer_chain_cls().manual_transfer(
-            fileitem=fileitem,
-            tmdbid=int(history.tmdbid) if getattr(history, "tmdbid", None) else None,
-            doubanid=str(history.doubanid) if getattr(history, "doubanid", None) else None,
-            mtype=mtype,
-            season=self._season_number(getattr(history, "seasons", None)),
-            episode_group=getattr(history, "episode_group", None),
-            transfer_type=getattr(history, "mode", None),
-            epformat=epformat,
-            scrape=True,
-            force=True,
-            background=False,
-            downloader=getattr(history, "downloader", None),
-            download_hash=getattr(history, "download_hash", None),
-            preview=False,
-            sync_extra_files=True,
-        )
-
-    def _media_type(self, type_name: str | None) -> Any | None:
-        if not type_name:
-            return None
-        try:
-            return self._media_type_cls(type_name)
-        except Exception:
+    @classmethod
+    def _preview_target(cls, response: Any) -> Path | None:
+        if isinstance(response, dict):
+            data = response.get("data")
+        else:
+            data = getattr(response, "data", None)
+        if not isinstance(data, dict):
             return None
 
-    def _episode_format(self, history: Any) -> Any | None:
-        episodes = getattr(history, "episodes", None)
-        if not episodes:
-            return None
-        return self._episode_format_cls(
-            detail=self._episode_detail(str(episodes)),
-        )
+        candidates = data.get("items") or []
+        if isinstance(candidates, dict):
+            candidates = [candidates]
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            target = item.get("target") or item.get("target_path")
+            if target:
+                return Path(str(target))
+
+        target = data.get("target") or data.get("target_path")
+        return Path(str(target)) if target else None
 
     @staticmethod
-    def _episode_detail(episodes: str) -> str:
-        if "-" not in episodes:
-            return episodes.replace("E", "")
-        start, end = episodes.split("-", 1)
-        start_number = int(start.replace("E", ""))
-        end_number = int(end.replace("E", ""))
-        return ",".join(str(index) for index in range(start_number, end_number + 1))
-
-    @staticmethod
-    def _season_number(season: str | None) -> int | None:
-        if not season:
-            return None
-        try:
-            return int(str(season).replace("S", ""))
-        except ValueError:
-            return None
+    def _history_source(history: Any) -> Path | None:
+        mode = str(getattr(history, "mode", None) or "")
+        if bool(getattr(history, "status", False)) and "move" in mode:
+            value = getattr(history, "dest", None)
+        else:
+            value = getattr(history, "src", None)
+        return Path(value) if value else None
 
     @staticmethod
     def _history_target(history: Any) -> Path | None:
@@ -200,6 +289,18 @@ class MoviePilotReorganizer:
         if isinstance(dest_fileitem, dict) and dest_fileitem.get("path"):
             return Path(dest_fileitem["path"])
         return None
+
+    @classmethod
+    def _same_path(cls, left: Path | None, right: Path | None) -> bool:
+        if not left or not right:
+            return False
+        return cls._path_key(left) == cls._path_key(right)
+
+    @staticmethod
+    def _path_key(path: Path | str | None) -> str:
+        if path is None:
+            return ""
+        return str(path).strip().replace("\\", "/").rstrip("/")
 
     def _db_session(self):
         class _SessionContext:

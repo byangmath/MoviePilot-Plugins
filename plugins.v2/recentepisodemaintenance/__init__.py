@@ -27,13 +27,17 @@ except Exception:
 
 from .jellyfin_client import JellyfinServiceClient
 from .models import RunResult
-from .path_mapper import PathMapper
 from .reorganizer import MoviePilotReorganizer
 
 
 class RecentEpisodeMaintenance(_PluginBase):
+    _REFRESH_MODE_OPTIONS = [
+        {"title": "扫描新的和有修改的文件", "value": "scan"},
+        {"title": "搜索缺少的元数据", "value": "missing"},
+        {"title": "覆盖所有元数据", "value": "all"},
+    ]
     plugin_name = "最近剧集维护"
-    plugin_desc = "定时刷新和重新整理最近发布的 Jellyfin 剧集"
+    plugin_desc = "维护 MoviePilot 最近整理入库的 Jellyfin 剧集"
     plugin_icon = "https://raw.githubusercontent.com/byangmath/RecentEpisodeMaintenance/main/icons/recentepisodemaintenance.png"
     plugin_version = "0.1.0"
     plugin_author = "byangmath"
@@ -55,18 +59,34 @@ class RecentEpisodeMaintenance(_PluginBase):
         self._enable_reorganize = bool(config.get("enable_reorganize", False))
         self._scan_after_reorganize = bool(config.get("scan_after_reorganize", True))
         self._skip_same_name = bool(config.get("skip_same_name", True))
-        self._transfer_type = "move"
+        self._refresh_mode = str(config.get("refresh_mode") or "all")
+        if self._refresh_mode not in {"scan", "missing", "all"}:
+            self._refresh_mode = "all"
+        self._replace_images = bool(config.get("replace_images", True))
+        refresh_defaults = {
+            "refresh_mode": self._refresh_mode,
+            "replace_images": self._replace_images,
+        }
+        for key, value in refresh_defaults.items():
+            if key not in config or config.get(key) is None or (key == "refresh_mode" and config.get(key) != value):
+                config[key] = value
+                config_changed = True
         self._media_server_name = config.get("media_server_name") or self._first_jellyfin_service_name()
         library_ids_selection = self._library_ids_selection(config.get("library_ids"))
         self._library_ids = self._normalize_values(library_ids_selection)
         if config.get("library_ids") != library_ids_selection:
             config["library_ids"] = library_ids_selection
             config_changed = True
-        self._path_mappings = config.get("path_mappings") or ""
-        self._metadata_mode = config.get("metadata_mode") or "FullRefresh"
-        self._image_mode = config.get("image_mode") or "Default"
-        self._replace_metadata = bool(config.get("replace_metadata", False))
-        self._replace_images = bool(config.get("replace_images", False))
+
+        for obsolete_key in (
+            "path_mappings",
+            "metadata_mode",
+            "image_mode",
+            "replace_metadata",
+        ):
+            if obsolete_key in config:
+                config.pop(obsolete_key)
+                config_changed = True
 
         run_once = bool(config.get("run_once", False))
         if run_once:
@@ -111,17 +131,63 @@ class RecentEpisodeMaintenance(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
-                            self._switch("enabled", "启用插件", 6),
-                            self._switch("run_once", "立即运行一次", 6),
-                            self._text("cron", "执行周期", "APScheduler Cron，如 0 4 * * *", 6),
-                            self._number("days", "最近 N 天", 6),
-                            self._number("max_items", "单次最大处理数量", 6),
-                            self._switch("dry_run", "试运行模式", 6),
-                            self._switch("notify", "运行完成后发送通知", 6),
-                            self._switch("enable_refresh", "刷新媒体库元数据", 6),
-                            self._switch("enable_reorganize", "重新整理最近剧集文件", 6),
-                            self._switch("scan_after_reorganize", "整理后扫描媒体库", 6),
-                            self._switch("skip_same_name", "跳过名称未变化的文件", 6),
+                            self._switch("enabled", "启用插件", 6, "开启后按执行周期自动运行"),
+                            self._switch("run_once", "立即运行一次", 6, "保存配置后执行一次，随后自动关闭"),
+                            self._text(
+                                "cron",
+                                "执行周期",
+                                "APScheduler Cron，如 0 4 * * *",
+                                6,
+                                "0 4 * * * 表示每天 04:00 运行；依次填写分、时、日、月、星期",
+                            ),
+                            self._number(
+                                "days",
+                                "最近 N 天",
+                                6,
+                                "按 MoviePilot 整理时间筛选最近 N 天的成功剧集记录",
+                            ),
+                            self._number(
+                                "max_items",
+                                "单次最大处理数量",
+                                6,
+                                "限制每次最多处理的 MoviePilot 整理记录数",
+                            ),
+                            self._switch(
+                                "dry_run",
+                                "试运行模式",
+                                6,
+                                "只查询、匹配和预览，不刷新元数据或修改文件",
+                            ),
+                            self._switch(
+                                "notify",
+                                "运行完成后发送通知",
+                                6,
+                                "通过 MoviePilot 消息渠道发送本次执行结果",
+                            ),
+                            self._switch(
+                                "enable_refresh",
+                                "刷新最近整理剧集元数据",
+                                6,
+                                "在 Jellyfin 中定位最近整理入库的剧集并刷新元数据",
+                            ),
+                            self._switch(
+                                "enable_reorganize",
+                                "重命名最近整理剧集文件",
+                                6,
+                                "按原整理记录重新整理，使当前命名规则生效",
+                            ),
+                            self._switch(
+                                "scan_after_reorganize",
+                                "整理后扫描媒体库",
+                                6,
+                                "重新整理成功后通知 Jellyfin 扫描媒体库",
+                            ),
+                            self._switch(
+                                "skip_same_name",
+                                "跳过名称未变化的文件",
+                                6,
+                                "预览目标路径与当前路径相同时不重新整理",
+                            ),
                         ],
                     },
                     {
@@ -133,7 +199,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 jellyfin_services,
                                 12,
                                 clearable=False,
-                                hint="用于查询和刷新最近发布剧集",
+                                hint="选择需要刷新剧集元数据的 Jellyfin 服务",
                             ),
                             self._select(
                                 "library_ids",
@@ -141,18 +207,22 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 library_options,
                                 12,
                                 multiple=True,
-                                hint="选择全部时处理所有剧集库",
+                                hint="限制 Jellyfin 条目匹配范围；选择全部则包含所有剧集库",
                             ),
-                            self._textarea("path_mappings", "路径映射", "/media/动画TV => /media\n/media/电视剧 => /tv", 12),
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            self._text("metadata_mode", "元数据刷新模式", "默认 FullRefresh", 6),
-                            self._text("image_mode", "图片刷新模式", "默认 Default；不刷新图片可保持 Default", 6),
-                            self._switch("replace_metadata", "覆盖已有元数据", 6),
-                            self._switch("replace_images", "覆盖已有图片", 6),
+                            self._select(
+                                "refresh_mode",
+                                "刷新模式",
+                                self._REFRESH_MODE_OPTIONS,
+                                12,
+                                clearable=False,
+                                hint="控制 Jellyfin 如何查找或替换元数据",
+                            ),
+                            self._switch(
+                                "replace_images",
+                                "替换现有图片",
+                                12,
+                                "完整刷新时重新下载并替换现有图片",
+                            ),
                         ],
                     },
                 ],
@@ -171,11 +241,8 @@ class RecentEpisodeMaintenance(_PluginBase):
             "skip_same_name": True,
             "media_server_name": self._media_server_name or default_media_server,
             "library_ids": self._library_ids_selection(self._library_ids),
-            "path_mappings": "",
-            "metadata_mode": "FullRefresh",
-            "image_mode": "Default",
-            "replace_metadata": False,
-            "replace_images": False,
+            "refresh_mode": "all",
+            "replace_images": True,
         }
 
     def stop_service(self):
@@ -189,71 +256,114 @@ class RecentEpisodeMaintenance(_PluginBase):
             logger.warning("[最近剧集维护] 未启用任何功能")
             return
 
-        client = self._get_jellyfin_client()
-        if not client:
-            return
-
         result = RunResult()
+        reorganizer = MoviePilotReorganizer(logger=logger, dry_run=self._dry_run)
         try:
-            episodes = client.recent_episodes(days=self._days, library_ids=self._library_ids)
-            episodes = episodes[:max(self._max_items, 1)]
-            result.total = len(episodes)
-            logger.info(f"[最近剧集维护] 查询最近 {self._days} 天剧集，共 {result.total} 集")
+            histories = reorganizer.recent_histories(
+                days=self._days,
+                max_items=self._max_items,
+            )
+            result.reorganize_candidates = len(histories)
+            logger.info(
+                f"[最近剧集维护] 查询 MP 最近 {self._days} 天成功整理记录，"
+                f"共 {len(histories)} 条"
+            )
         except Exception as err:
-            logger.error(f"[最近剧集维护] 查询媒体服务器失败：{err}")
+            logger.error(f"[最近剧集维护] 查询 MP 整理历史失败：{err}")
             return
 
-        mapper = PathMapper(self._path_mappings)
-        reorganizer = MoviePilotReorganizer(
-            logger=logger,
-            dry_run=self._dry_run,
-            transfer_type=self._transfer_type,
-        )
-        any_reorganized = False
+        client: JellyfinServiceClient | None = None
+        if self._enable_refresh:
+            client = self._get_jellyfin_client()
+            if client:
+                targets = [
+                    target
+                    for history in histories
+                    if (target := reorganizer.target_path(history)) is not None
+                ]
+                try:
+                    matches = client.match_recent_episodes(
+                        target_paths=targets,
+                        days=self._days,
+                        library_ids=self._library_ids,
+                    )
+                except Exception as err:
+                    matches = {}
+                    result.add_error(f"匹配 Jellyfin 剧集失败：{err}")
+                    logger.error(f"[最近剧集维护] 匹配 Jellyfin 剧集失败：{err}")
 
-        for episode in episodes:
-            try:
-                if self._enable_reorganize:
-                    mapped_path = mapper.map(episode.path)
-                    if not mapped_path:
+                matched_episodes = {}
+                for history in histories:
+                    target = reorganizer.target_path(history)
+                    target_key = client.path_key(target)
+                    episodes = matches.get(target_key) or []
+                    if not episodes:
                         result.skipped += 1
-                        logger.warning(f"[最近剧集维护] 跳过 {episode.display_name}：路径未匹配 {episode.path}")
-                    else:
-                        reorganize_result = reorganizer.reorganize(
-                            episode=episode,
-                            path=mapped_path,
-                            skip_same_name=self._skip_same_name,
+                        logger.warning(
+                            f"[最近剧集维护] Jellyfin 中未找到整理记录对应条目："
+                            f"{reorganizer.display_name(history)}，目标路径 {target or '未知'}"
                         )
-                        if reorganize_result.success:
+                        continue
+                    for episode in episodes:
+                        matched_episodes[episode.item_id] = episode
+
+                result.refresh_candidates = len(matched_episodes)
+                metadata_mode, image_mode, replace_metadata, replace_images = self._refresh_options()
+                for episode in matched_episodes.values():
+                    if self._dry_run:
+                        result.refresh_previewed += 1
+                        logger.info(f"[最近剧集维护] 试运行：将完整刷新 {episode.display_name}")
+                        continue
+                    try:
+                        client.refresh_episode(
+                            item_id=episode.item_id,
+                            metadata_mode=metadata_mode,
+                            image_mode=image_mode,
+                            replace_metadata=replace_metadata,
+                            replace_images=replace_images,
+                        )
+                        result.refreshed += 1
+                        logger.info(f"[最近剧集维护] 元数据和图片刷新成功 {episode.display_name}")
+                    except Exception as err:
+                        result.add_error(f"{episode.display_name}：{err}")
+                        logger.error(f"[最近剧集维护] 元数据刷新失败 {episode.display_name}：{err}")
+            else:
+                result.add_error("未找到可用的 Jellyfin 媒体服务器")
+
+        any_reorganized = False
+        if self._enable_reorganize:
+            for history in histories:
+                label = reorganizer.display_name(history)
+                try:
+                    operation = reorganizer.reorganize(
+                        history=history,
+                        skip_same_name=self._skip_same_name,
+                    )
+                    if operation.success:
+                        if self._dry_run:
+                            result.previewed += 1
+                        else:
                             result.reorganized += 1
                             any_reorganized = True
-                            logger.info(f"[最近剧集维护] 整理成功 {episode.display_name}：{reorganize_result.message}")
-                        elif reorganize_result.skipped:
-                            result.skipped += 1
-                            logger.info(f"[最近剧集维护] 跳过 {episode.display_name}：{reorganize_result.message}")
-                        else:
-                            result.add_error(f"{episode.display_name}：{reorganize_result.message}")
-                            logger.error(f"[最近剧集维护] 整理失败 {episode.display_name}：{reorganize_result.message}")
-                            continue
-
-                if self._enable_refresh:
-                    client.refresh_episode(
-                        item_id=episode.item_id,
-                        metadata_mode=self._metadata_mode,
-                        image_mode=self._image_mode,
-                        replace_metadata=self._replace_metadata,
-                        replace_images=self._replace_images,
-                    )
-                    result.refreshed += 1
-                    logger.info(f"[最近剧集维护] 元数据刷新成功 {episode.display_name}")
-            except Exception as err:
-                result.add_error(f"{episode.display_name}：{err}")
-                logger.error(f"[最近剧集维护] 处理失败 {episode.display_name}：{err}")
+                        logger.info(f"[最近剧集维护] {label}：{operation.message}")
+                    elif operation.skipped:
+                        result.skipped += 1
+                        logger.info(f"[最近剧集维护] 跳过 {label}：{operation.message}")
+                    else:
+                        result.add_error(f"{label}：{operation.message}")
+                        logger.error(f"[最近剧集维护] 重新整理失败 {label}：{operation.message}")
+                except Exception as err:
+                    result.add_error(f"{label}：{err}")
+                    logger.error(f"[最近剧集维护] 重新整理失败 {label}：{err}")
 
         if any_reorganized and self._scan_after_reorganize and not self._dry_run:
+            client = client or self._get_jellyfin_client()
             try:
-                client.scan_library()
-                logger.info("[最近剧集维护] 已触发媒体库扫描")
+                if client:
+                    client.scan_library()
+                    logger.info("[最近剧集维护] 已触发 Jellyfin 媒体库扫描")
+                else:
+                    result.add_error("重新整理后无法触发 Jellyfin 媒体库扫描")
             except Exception as err:
                 result.add_error(f"媒体库扫描失败：{err}")
 
@@ -268,6 +378,16 @@ class RecentEpisodeMaintenance(_PluginBase):
                 post_message(title=title, text=text)
             except TypeError:
                 post_message(mtype=None, title=title, text=text)
+
+    def _refresh_options(self) -> tuple[str, str, bool, bool]:
+        if self._refresh_mode == "scan":
+            return "Default", "Default", False, False
+        return (
+            "FullRefresh",
+            "FullRefresh",
+            self._refresh_mode == "all",
+            self._replace_images,
+        )
 
     def _get_jellyfin_client(self) -> JellyfinServiceClient | None:
         service_items = self._jellyfin_services()
@@ -393,24 +513,36 @@ class RecentEpisodeMaintenance(_PluginBase):
             update_config(config)
 
     @staticmethod
-    def _switch(model: str, label: str, cols: int) -> dict[str, Any]:
+    def _switch(model: str, label: str, cols: int, hint: str = "") -> dict[str, Any]:
+        props: dict[str, Any] = {"model": model, "label": label}
+        if hint:
+            props["hint"] = hint
+            props["persistent-hint"] = True
         return {
             "component": "VCol",
             "props": {"cols": cols},
             "content": [{
                 "component": "VSwitch",
-                "props": {"model": model, "label": label},
+                "props": props,
             }],
         }
 
     @staticmethod
-    def _text(model: str, label: str, placeholder: str, cols: int) -> dict[str, Any]:
+    def _text(model: str, label: str, placeholder: str, cols: int, hint: str = "") -> dict[str, Any]:
+        props: dict[str, Any] = {
+            "model": model,
+            "label": label,
+            "placeholder": placeholder,
+        }
+        if hint:
+            props["hint"] = hint
+            props["persistent-hint"] = True
         return {
             "component": "VCol",
             "props": {"cols": cols},
             "content": [{
                 "component": "VTextField",
-                "props": {"model": model, "label": label, "placeholder": placeholder},
+                "props": props,
             }],
         }
 
@@ -454,23 +586,16 @@ class RecentEpisodeMaintenance(_PluginBase):
         }
 
     @staticmethod
-    def _number(model: str, label: str, cols: int) -> dict[str, Any]:
+    def _number(model: str, label: str, cols: int, hint: str = "") -> dict[str, Any]:
+        props: dict[str, Any] = {"model": model, "label": label, "type": "number"}
+        if hint:
+            props["hint"] = hint
+            props["persistent-hint"] = True
         return {
             "component": "VCol",
             "props": {"cols": cols},
             "content": [{
                 "component": "VTextField",
-                "props": {"model": model, "label": label, "type": "number"},
-            }],
-        }
-
-    @staticmethod
-    def _textarea(model: str, label: str, placeholder: str, cols: int) -> dict[str, Any]:
-        return {
-            "component": "VCol",
-            "props": {"cols": cols},
-            "content": [{
-                "component": "VTextarea",
-                "props": {"model": model, "label": label, "placeholder": placeholder, "rows": 4},
+                "props": props,
             }],
         }

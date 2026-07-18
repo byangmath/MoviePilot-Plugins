@@ -10,7 +10,7 @@ class EpisodeItem:
     series_name: str = ""
     season_number: Optional[int] = None
     episode_number: Optional[int] = None
-    premiere_date: str = ""
+    date_created: str = ""
     path: str = ""
     provider_ids: dict[str, Any] = field(default_factory=dict)
 
@@ -22,7 +22,7 @@ class EpisodeItem:
             series_name=item.get("SeriesName") or "",
             season_number=item.get("ParentIndexNumber"),
             episode_number=item.get("IndexNumber"),
-            premiere_date=item.get("PremiereDate") or "",
+            date_created=item.get("DateCreated") or "",
             path=item.get("Path") or "",
             provider_ids=item.get("ProviderIds") or {},
         )
@@ -47,7 +47,10 @@ class OperationResult:
 
 @dataclass
 class RunResult:
-    total: int = 0
+    reorganize_candidates: int = 0
+    refresh_candidates: int = 0
+    previewed: int = 0
+    refresh_previewed: int = 0
     reorganized: int = 0
     refreshed: int = 0
     skipped: int = 0
@@ -60,8 +63,11 @@ class RunResult:
 
     def summary(self) -> str:
         lines = [
-            f"查询到 {self.total} 集",
+            f"MP 最近整理记录 {self.reorganize_candidates} 条",
+            f"重新整理试运行预览 {self.previewed} 条",
             f"重新整理成功 {self.reorganized} 集",
+            f"匹配到 Jellyfin 剧集 {self.refresh_candidates} 集",
+            f"元数据刷新试运行预览 {self.refresh_previewed} 集",
             f"元数据刷新成功 {self.refreshed} 集",
             f"跳过 {self.skipped} 集",
             f"失败 {self.failed} 集",

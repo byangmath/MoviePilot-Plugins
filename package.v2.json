@@ -1,7 +1,7 @@
 {
   "RecentEpisodeMaintenance": {
     "name": "最近剧集维护",
-    "description": "定时刷新和重新整理最近发布的 Jellyfin 剧集。",
+    "description": "刷新元数据并重命名 MoviePilot 最近整理入库的 Jellyfin 剧集。",
     "labels": "Jellyfin,媒体库,剧集",
     "version": "0.1.0",
     "icon": "https://raw.githubusercontent.com/byangmath/RecentEpisodeMaintenance/main/icons/recentepisodemaintenance.png",
@@ -9,7 +9,7 @@
     "level": 1,
     "system_version": ">=2.0.0",
     "history": {
-      "v0.1.0": "初始版本：支持 Jellyfin 最近剧集查询、元数据刷新、路径映射、试运行和 MoviePilot 整理链路安全桥接。"
+      "v0.1.0": "初始版本：按 MoviePilot 最近整理记录刷新 Jellyfin 元数据和图片，并支持通过原整理记录重新整理剧集文件。"
     }
   }
 }
