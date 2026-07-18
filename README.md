@@ -29,6 +29,8 @@ MoviePilot V2 也可以在插件页面右上角的插件市场设置中添加上
 
 配置项：执行周期，最近 N 天，Jellyfin 地址，API Key，路径映射，试运行模式，单次最大处理数量。
 
+详细配置说明和推荐测试步骤见：[最近剧集维护插件说明](plugins.v2/recentepisodemaintenance/README.md)
+
 ## 使用建议
 
 首次使用建议开启试运行模式，并将单次最大处理数量设置为 1，确认 Jellyfin 查询、路径映射和 MoviePilot 整理链路正常后再正式启用。
