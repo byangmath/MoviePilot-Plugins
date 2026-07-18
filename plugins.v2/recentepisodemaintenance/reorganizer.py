@@ -5,7 +5,7 @@ import inspect
 from pathlib import Path
 from typing import Any
 
-from .models import OperationResult
+from .models import EpisodeTarget, OperationResult
 
 
 def _first_import(candidates: list[tuple[str, str]]) -> Any | None:
@@ -38,12 +38,12 @@ class MoviePilotReorganizer:
             ("app.db", "get_db"),
         ])
 
-    def recent_histories(self, days: int, max_items: int) -> list[Any]:
+    def recent_histories(self, days: int) -> list[Any]:
         """Return the latest successful TV transfer record for each episode."""
         if not self._history_available():
             raise RuntimeError("当前 MoviePilot 未找到兼容的历史重新整理接口")
 
-        cutoff = datetime.now() - timedelta(days=max(int(days), 0))
+        cutoff = (datetime.now() - timedelta(days=max(int(days), 0))).strftime("%Y-%m-%d %H:%M:%S")
         history_cls = self._transfer_history_cls
         with self._db_session() as db:
             query = db.query(history_cls).filter(history_cls.date >= cutoff)
@@ -57,7 +57,7 @@ class MoviePilotReorganizer:
                 query = query.order_by(history_cls.date.desc())
             if getattr(history_cls, "id", None) is not None:
                 query = query.order_by(history_cls.id.desc())
-            candidates = query.limit(max(max_items, 1) * 20).all()
+            candidates = query.all()
 
         histories: list[Any] = []
         seen: set[tuple[str, str, str]] = set()
@@ -67,11 +67,14 @@ class MoviePilotReorganizer:
                 continue
             seen.add(key)
             histories.append(history)
-            if len(histories) >= max(max_items, 1):
-                break
         return histories
 
-    def reorganize(self, history: Any, skip_same_name: bool = True) -> OperationResult:
+    def reorganize(
+        self,
+        history: Any,
+        skip_same_name: bool = True,
+        preview_only: bool = False,
+    ) -> OperationResult:
         if not self._reorganize_available():
             return OperationResult(
                 success=False,
@@ -107,14 +110,14 @@ class MoviePilotReorganizer:
                 return OperationResult(
                     success=False,
                     skipped=True,
-                    message="按当前命名规则预览后文件名没有变化",
+                    message="按当前命名规则预览，路径未变化",
                     source=source,
                     target=current_target,
                 )
 
-        if self.dry_run:
+        if self.dry_run or preview_only:
             if preview_target:
-                message = f"试运行：整理记录 #{history_id} 预计重命名为 {preview_target.name}"
+                message = f"试运行：整理记录 #{history_id} 预计重新命名"
             else:
                 message = f"试运行：已匹配整理记录 #{history_id}，未修改文件"
             return OperationResult(
@@ -149,6 +152,59 @@ class MoviePilotReorganizer:
             target=preview_target or current_target,
         )
 
+    def preview(self, history: Any) -> OperationResult:
+        """Preview the current MoviePilot destination without changing files."""
+        source = self._history_source(history)
+        current_target = self._history_target(history)
+        if not self._reorganize_available():
+            return OperationResult(
+                success=False,
+                message="当前 MoviePilot 未找到兼容的整理预览接口",
+                source=source,
+                target=current_target,
+            )
+        if not self._supports_preview():
+            return OperationResult(
+                success=False,
+                message="当前 MoviePilot 版本不支持整理预览，无法安全判断最新剧集标题",
+                source=source,
+                target=current_target,
+            )
+
+        try:
+            response = self._call_manual_transfer(history, preview=True)
+        except Exception as err:
+            return OperationResult(
+                success=False,
+                message=f"整理预览失败，未修改文件：{err}",
+                source=source,
+                target=current_target,
+            )
+
+        if not self._response_success(response):
+            return OperationResult(
+                success=False,
+                message=f"整理预览失败，未修改文件：{self._response_message(response)}",
+                source=source,
+                target=current_target,
+            )
+
+        preview_target = self._preview_target(response)
+        if not preview_target:
+            return OperationResult(
+                success=False,
+                message="整理预览未返回目标文件，无法安全判断最新剧集标题",
+                source=source,
+                target=current_target,
+            )
+
+        return OperationResult(
+            success=True,
+            message="已获取 MoviePilot 当前命名规则的整理预览",
+            source=source,
+            target=preview_target,
+        )
+
     @staticmethod
     def display_name(history: Any) -> str:
         title = str(getattr(history, "title", None) or "未知剧集")
@@ -159,6 +215,24 @@ class MoviePilotReorganizer:
     @staticmethod
     def target_path(history: Any) -> Path | None:
         return MoviePilotReorganizer._history_target(history)
+
+    @classmethod
+    def episode_target(cls, history: Any) -> EpisodeTarget | None:
+        path = cls._history_target(history)
+        if not path:
+            return None
+        return EpisodeTarget(path=str(path))
+
+    @classmethod
+    def processing_key(cls, history: Any) -> str:
+        """Identify one organized episode while keeping replacements independent."""
+        media_id, season, episode = cls._episode_key(history)
+        transfer_identity = (
+            getattr(history, "download_hash", None)
+            or getattr(history, "src", None)
+            or f"history:{getattr(history, 'id', '')}"
+        )
+        return "|".join((media_id, season, episode, str(transfer_identity)))
 
     def _history_available(self) -> bool:
         return all([

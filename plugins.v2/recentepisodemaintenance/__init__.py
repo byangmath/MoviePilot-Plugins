@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+from pathlib import Path
+from threading import Lock
 from typing import Any
 
 try:
@@ -30,7 +33,57 @@ from .models import RunResult
 from .reorganizer import MoviePilotReorganizer
 
 
+_RUN_STATE_LOCK = Lock()
+_RUN_ACTIVE = False
+_PENDING_RUNNER: Any | None = None
+
+
 class RecentEpisodeMaintenance(_PluginBase):
+    _PROCESSING_STATE_KEY = "processing_state_v1"
+    _STATE_PENDING_REFRESH = "pending_refresh"
+    _STATE_PENDING_REORGANIZE = "pending_reorganize"
+    _STATE_MONITORING = "monitoring"
+    _STATE_COMPLETE = "complete"
+    _STATE_ATTENTION = "attention"
+    _MAX_REORGANIZE_ATTEMPTS = 2
+    _PREVIEW_CACHE_HOURS = 24
+    _INSPECTION_MULTIPLIER = 5
+    _CRON_HINT_EXPRESSION = (
+        "{{ (() => {"
+        "const value = String(cron || '').trim();"
+        "const prefix = '依次填写分、时、日、月、星期：';"
+        "const parts = value.split(/\\s+/);"
+        "if (parts.length !== 5) return prefix + '请输入有效的 5 位 Cron 表达式';"
+        "const [minute, hour, day, month, weekday] = parts;"
+        "const integer = item => /^\\d+$/.test(item);"
+        "const minuteOk = integer(minute) && Number(minute) <= 59;"
+        "const hourOk = integer(hour) && Number(hour) <= 23;"
+        "const time = minuteOk && hourOk"
+        " ? `${String(Number(hour)).padStart(2, '0')}:${String(Number(minute)).padStart(2, '0')}`"
+        " : '';"
+        "if (minuteOk && hourOk && day === '*' && month === '*' && weekday === '*')"
+        " return prefix + `每天 ${time} 运行`;"
+        "const minuteInterval = minute.match(/^\\*\\/([1-9]|[1-5]\\d)$/);"
+        "if (minuteInterval && hour === '*' && day === '*' && month === '*' && weekday === '*')"
+        " return prefix + `每 ${minuteInterval[1]} 分钟运行`;"
+        "const hourInterval = hour.match(/^\\*\\/([1-9]|1\\d|2[0-3])$/);"
+        "if (minuteOk && hourInterval && day === '*' && month === '*' && weekday === '*')"
+        " return prefix + (Number(minute) === 0"
+        " ? `每 ${hourInterval[1]} 小时运行`"
+        " : `每 ${hourInterval[1]} 小时的第 ${Number(minute)} 分钟运行`);"
+        "if (minuteOk && hourOk && integer(day) && Number(day) >= 1 && Number(day) <= 31"
+        " && month === '*' && weekday === '*')"
+        " return prefix + `每月 ${Number(day)} 日 ${time} 运行`;"
+        "if (minuteOk && hourOk && integer(day) && Number(day) >= 1 && Number(day) <= 31"
+        " && integer(month) && Number(month) >= 1 && Number(month) <= 12 && weekday === '*')"
+        " return prefix + `每年 ${Number(month)} 月 ${Number(day)} 日 ${time} 运行`;"
+        "const weekdays = {mon: '星期一', tue: '星期二', wed: '星期三', thu: '星期四',"
+        " fri: '星期五', sat: '星期六', sun: '星期日'};"
+        "if (minuteOk && hourOk && day === '*' && month === '*' && weekdays[weekday.toLowerCase()])"
+        " return prefix + `每周${weekdays[weekday.toLowerCase()]} ${time} 运行`;"
+        "return prefix + `自定义计划（${value}）`;"
+        "})() }}"
+    )
     _REFRESH_MODE_OPTIONS = [
         {"title": "扫描新的和有修改的文件", "value": "scan"},
         {"title": "搜索缺少的元数据", "value": "missing"},
@@ -138,7 +191,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 "执行周期",
                                 "APScheduler Cron，如 0 4 * * *",
                                 6,
-                                "0 4 * * * 表示每天 04:00 运行；依次填写分、时、日、月、星期",
+                                self._CRON_HINT_EXPRESSION,
                             ),
                             self._number(
                                 "days",
@@ -150,7 +203,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 "max_items",
                                 "单次最大处理数量",
                                 6,
-                                "限制每次最多处理的 MoviePilot 整理记录数",
+                                "限制每轮刷新和重新整理的合计操作数；最多检查该数量五倍的记录",
                             ),
                             self._switch(
                                 "dry_run",
@@ -168,7 +221,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 "enable_refresh",
                                 "刷新最近整理剧集元数据",
                                 6,
-                                "在 Jellyfin 中定位最近整理入库的剧集并刷新元数据",
+                                "Jellyfin 标题与 MoviePilot 当前整理预览中的剧集标题不一致时刷新元数据",
                             ),
                             self._switch(
                                 "enable_reorganize",
@@ -184,9 +237,9 @@ class RecentEpisodeMaintenance(_PluginBase):
                             ),
                             self._switch(
                                 "skip_same_name",
-                                "跳过名称未变化的文件",
+                                "跳过命名未变化的文件",
                                 6,
-                                "预览目标路径与当前路径相同时不重新整理",
+                                "按当前命名规则预览，若生成的文件路径与上次整理结果相同，则跳过。",
                             ),
                         ],
                     },
@@ -252,38 +305,127 @@ class RecentEpisodeMaintenance(_PluginBase):
         pass
 
     def run_once(self):
+        global _PENDING_RUNNER, _RUN_ACTIVE
+
+        with _RUN_STATE_LOCK:
+            if _RUN_ACTIVE:
+                _PENDING_RUNNER = self
+                logger.info(
+                    "[最近剧集维护] 已有任务正在运行，本次触发已排队，"
+                    "将在本轮结束后运行"
+                )
+                return
+            _RUN_ACTIVE = True
+
+        runner: RecentEpisodeMaintenance | None = self
+        while runner is not None:
+            try:
+                runner._run_once()
+            except Exception as err:
+                logger.exception(f"[最近剧集维护] 运行异常：{err}")
+
+            with _RUN_STATE_LOCK:
+                runner = _PENDING_RUNNER
+                _PENDING_RUNNER = None
+                if runner is None:
+                    _RUN_ACTIVE = False
+                    return
+
+            logger.info("[最近剧集维护] 上一轮已结束，开始执行排队任务")
+
+    def _run_once(self):
         if not self._enable_refresh and not self._enable_reorganize:
             logger.warning("[最近剧集维护] 未启用任何功能")
             return
 
-        result = RunResult()
+        operation_limit = max(int(self._max_items), 1)
+        result = RunResult(operation_limit=operation_limit)
         reorganizer = MoviePilotReorganizer(logger=logger, dry_run=self._dry_run)
         try:
-            histories = reorganizer.recent_histories(
-                days=self._days,
-                max_items=self._max_items,
+            history_pool = reorganizer.recent_histories(days=self._days)
+            histories, processing_state, selection = self._select_histories(
+                histories=history_pool,
+                reorganizer=reorganizer,
             )
             result.reorganize_candidates = len(histories)
             logger.info(
                 f"[最近剧集维护] 查询 MP 最近 {self._days} 天成功整理记录，"
-                f"共 {len(histories)} 条"
+                f"共 {len(history_pool)} 条；本轮最多执行 {operation_limit} 次操作，"
+                f"检查 {len(histories)} 条记录"
+                f"（待复查 {selection['pending']} 条，新记录 {selection['new']} 条，"
+                f"到期监测 {selection['monitoring']} 条，"
+                f"已完成 {selection['complete']} 条，需人工检查 {selection['attention']} 条）"
             )
         except Exception as err:
             logger.error(f"[最近剧集维护] 查询 MP 整理历史失败：{err}")
             return
 
+        if not histories:
+            if not self._dry_run:
+                self._save_processing_state(processing_state)
+            logger.info("[最近剧集维护] 当前时间范围内没有待处理的整理记录")
+            return
+
         client: JellyfinServiceClient | None = None
+        deferred_reorganize_targets: set[str] = set()
+        history_keys_by_target: dict[str, set[str]] = {}
+        expected_paths: dict[str, Path] = {}
+        preview_failed_keys: set[str] = set()
+        for history in histories:
+            processing_key = reorganizer.processing_key(history)
+            target_key = JellyfinServiceClient.path_key(reorganizer.target_path(history))
+            history_keys_by_target.setdefault(target_key, set()).add(processing_key)
+
+            state_item = processing_state.get(processing_key) or {}
+            status = state_item.get("status")
+            cached_path = state_item.get("expected_path")
+            if cached_path and status in {
+                self._STATE_PENDING_REFRESH,
+                self._STATE_PENDING_REORGANIZE,
+            }:
+                expected_paths[processing_key] = Path(str(cached_path))
+                continue
+
+            preview = reorganizer.preview(history)
+            if preview.success and preview.target:
+                expected_paths[processing_key] = preview.target
+                if not self._dry_run:
+                    self._cache_processing_preview(
+                        processing_state,
+                        {processing_key},
+                        preview.target,
+                    )
+                continue
+
+            preview_failed_keys.add(processing_key)
+            deferred_reorganize_targets.add(target_key)
+            message = f"{reorganizer.display_name(history)}：{preview.message}"
+            result.add_error(message)
+            logger.error(
+                f"[最近剧集维护] 获取 MP 整理预览失败 {message}｜"
+                f"文件：{reorganizer.target_path(history) or '未知文件'}"
+            )
+            if not self._dry_run:
+                self._mark_processing_state(
+                    processing_state,
+                    {processing_key},
+                    self._STATE_PENDING_REFRESH
+                    if self._enable_refresh
+                    else self._STATE_PENDING_REORGANIZE,
+                )
+
         if self._enable_refresh:
             client = self._get_jellyfin_client()
             if client:
                 targets = [
                     target
                     for history in histories
-                    if (target := reorganizer.target_path(history)) is not None
+                    if reorganizer.processing_key(history) not in preview_failed_keys
+                    and (target := reorganizer.episode_target(history)) is not None
                 ]
                 try:
                     matches = client.match_recent_episodes(
-                        target_paths=targets,
+                        targets=targets,
                         days=self._days,
                         library_ids=self._library_ids,
                     )
@@ -293,26 +435,107 @@ class RecentEpisodeMaintenance(_PluginBase):
                     logger.error(f"[最近剧集维护] 匹配 Jellyfin 剧集失败：{err}")
 
                 matched_episodes = {}
+                episode_target_keys: dict[str, set[str]] = {}
+                unmatched_histories: list[str] = []
                 for history in histories:
+                    if reorganizer.processing_key(history) in preview_failed_keys:
+                        continue
                     target = reorganizer.target_path(history)
                     target_key = client.path_key(target)
                     episodes = matches.get(target_key) or []
                     if not episodes:
                         result.skipped += 1
-                        logger.warning(
-                            f"[最近剧集维护] Jellyfin 中未找到整理记录对应条目："
-                            f"{reorganizer.display_name(history)}，目标路径 {target or '未知'}"
-                        )
+                        unmatched_histories.append(reorganizer.display_name(history))
+                        deferred_reorganize_targets.add(target_key)
+                        if not self._dry_run:
+                            self._mark_processing_state(
+                                processing_state,
+                                history_keys_by_target.get(target_key) or set(),
+                                self._STATE_PENDING_REFRESH,
+                            )
                         continue
                     for episode in episodes:
                         matched_episodes[episode.item_id] = episode
+                        episode_target_keys.setdefault(episode.item_id, set()).add(target_key)
+
+                if unmatched_histories:
+                    examples = "、".join(unmatched_histories[:3])
+                    omitted = len(unmatched_histories) - 3
+                    suffix = f" 等，另有 {omitted} 条" if omitted > 0 else ""
+                    logger.warning(
+                        f"[最近剧集维护] 共 {len(unmatched_histories)} 条 MP 整理记录未在 Jellyfin 中匹配到剧集："
+                        f"{examples}{suffix}"
+                    )
 
                 result.refresh_candidates = len(matched_episodes)
                 metadata_mode, image_mode, replace_metadata, replace_images = self._refresh_options()
                 for episode in matched_episodes.values():
+                    episode_history_keys = self._history_keys_for_episode(
+                        episode.item_id,
+                        episode_target_keys,
+                        history_keys_by_target,
+                    )
+                    expected_path = self._expected_path_for_keys(
+                        episode_history_keys,
+                        expected_paths,
+                    )
+                    comparison_details = (
+                        f"{episode.display_name}｜MP 预览文件："
+                        f"{expected_path.name if expected_path else '未知文件'}"
+                    )
+                    if not expected_path:
+                        result.add_error(f"{episode.display_name}：缺少 MP 整理预览")
+                        deferred_reorganize_targets.update(
+                            episode_target_keys.get(episode.item_id) or set()
+                        )
+                        if not self._dry_run:
+                            self._mark_processing_state(
+                                processing_state,
+                                episode_history_keys,
+                                self._STATE_PENDING_REFRESH,
+                            )
+                        logger.error(
+                            f"[最近剧集维护] 缺少 MP 整理预览，无法判断是否刷新 "
+                            f"{comparison_details}"
+                        )
+                        continue
+
+                    if episode.title_matches_path(expected_path):
+                        result.skipped += 1
+                        prefix = "试运行：" if self._dry_run else ""
+                        logger.info(
+                            f"[最近剧集维护] {prefix}标题一致，跳过元数据刷新 "
+                            f"{comparison_details}"
+                        )
+                        if not self._enable_reorganize and not self._dry_run:
+                            self._mark_processing_verified(
+                                processing_state,
+                                episode_history_keys,
+                            )
+                        continue
+                    deferred_reorganize_targets.update(
+                        episode_target_keys.get(episode.item_id) or set()
+                    )
+                    if result.operations_used >= result.operation_limit:
+                        result.skipped += 1
+                        if not self._dry_run:
+                            self._mark_processing_state(
+                                processing_state,
+                                episode_history_keys,
+                                self._STATE_PENDING_REFRESH,
+                            )
+                        logger.info(
+                            f"[最近剧集维护] 已达到单次操作上限，延后元数据刷新 "
+                            f"{comparison_details}"
+                        )
+                        continue
+                    result.operations_used += 1
                     if self._dry_run:
                         result.refresh_previewed += 1
-                        logger.info(f"[最近剧集维护] 试运行：将完整刷新 {episode.display_name}")
+                        logger.info(
+                            f"[最近剧集维护] 试运行：标题不一致，将完整刷新 "
+                            f"{comparison_details}"
+                        )
                         continue
                     try:
                         client.refresh_episode(
@@ -323,18 +546,161 @@ class RecentEpisodeMaintenance(_PluginBase):
                             replace_images=replace_images,
                         )
                         result.refreshed += 1
-                        logger.info(f"[最近剧集维护] 元数据和图片刷新成功 {episode.display_name}")
+                        result.add_refreshed_title(
+                            self._result_title(episode.display_name, expected_path)
+                        )
+                        logger.info(
+                            f"[最近剧集维护] 标题不一致，已提交元数据和图片刷新 "
+                            f"{comparison_details}"
+                        )
+                        self._mark_processing_state(
+                            processing_state,
+                            episode_history_keys,
+                            self._STATE_PENDING_REFRESH,
+                            had_action=True,
+                        )
                     except Exception as err:
+                        self._mark_processing_state(
+                            processing_state,
+                            episode_history_keys,
+                            self._STATE_PENDING_REFRESH,
+                        )
                         result.add_error(f"{episode.display_name}：{err}")
-                        logger.error(f"[最近剧集维护] 元数据刷新失败 {episode.display_name}：{err}")
+                        logger.error(
+                            f"[最近剧集维护] 标题不一致，提交元数据刷新失败 "
+                            f"{comparison_details}：{err}"
+                        )
             else:
                 result.add_error("未找到可用的 Jellyfin 媒体服务器")
+                for history in histories:
+                    target_key = JellyfinServiceClient.path_key(reorganizer.target_path(history))
+                    deferred_reorganize_targets.add(target_key)
+                    if not self._dry_run:
+                        self._mark_processing_state(
+                            processing_state,
+                            {reorganizer.processing_key(history)},
+                            self._STATE_PENDING_REFRESH,
+                        )
 
         any_reorganized = False
         if self._enable_reorganize:
             for history in histories:
                 label = reorganizer.display_name(history)
+                processing_key = reorganizer.processing_key(history)
+                current_file = reorganizer.target_path(history)
+                target_key = JellyfinServiceClient.path_key(current_file)
+                expected_path = expected_paths.get(processing_key)
+                if target_key in deferred_reorganize_targets:
+                    result.skipped += 1
+                    prefix = "试运行：" if self._dry_run else ""
+                    logger.info(
+                        f"[最近剧集维护] {prefix}本轮暂缓重新整理 {label}，"
+                        f"待后续运行确认元数据刷新或媒体匹配结果｜"
+                        f"文件：{current_file or '未知文件'}"
+                    )
+                    continue
+                if not expected_path:
+                    result.add_error(f"{label}：缺少 MP 整理预览")
+                    if not self._dry_run:
+                        self._mark_processing_state(
+                            processing_state,
+                            {processing_key},
+                            self._STATE_PENDING_REORGANIZE,
+                        )
+                    logger.error(
+                        f"[最近剧集维护] 缺少 MP 整理预览，无法安全重新整理 {label}｜"
+                        f"文件：{current_file or '未知文件'}"
+                    )
+                    continue
                 try:
+                    state_item = processing_state.get(processing_key) or {}
+                    rename_attempts = int(state_item.get("rename_attempts") or 0)
+                    if self._skip_same_name and self._same_path(current_file, expected_path):
+                        result.skipped += 1
+                        if not self._dry_run:
+                            self._mark_processing_verified(
+                                processing_state,
+                                {processing_key},
+                            )
+                        prefix = "试运行：" if self._dry_run else ""
+                        logger.info(
+                            f"[最近剧集维护] {prefix}跳过 {label}：按当前命名规则预览，"
+                            f"路径未变化｜{self._file_change_details(current_file, expected_path)}"
+                        )
+                        continue
+
+                    if self._dry_run:
+                        if result.operations_used >= result.operation_limit:
+                            result.skipped += 1
+                            logger.info(
+                                f"[最近剧集维护] 试运行：已达到单次操作上限，"
+                                f"延后重新整理 {label}｜"
+                                f"{self._file_change_details(current_file, expected_path)}"
+                            )
+                            continue
+                        result.operations_used += 1
+                        result.previewed += 1
+                        logger.info(
+                            f"[最近剧集维护] 试运行：{label} 预计重新命名｜"
+                            f"{self._file_change_details(current_file, expected_path)}"
+                        )
+                        continue
+
+                    if not self._dry_run and rename_attempts >= self._MAX_REORGANIZE_ATTEMPTS:
+                        preview = reorganizer.reorganize(
+                            history=history,
+                            skip_same_name=self._skip_same_name,
+                            preview_only=True,
+                        )
+                        if preview.skipped:
+                            result.skipped += 1
+                            self._mark_processing_verified(
+                                processing_state,
+                                {processing_key},
+                            )
+                            logger.info(
+                                f"[最近剧集维护] 跳过 {label}：{preview.message}｜"
+                                f"{self._file_change_details(current_file, preview.target)}"
+                            )
+                        elif preview.success:
+                            message = (
+                                f"{label} 已连续重新整理 {rename_attempts} 次，"
+                                "按当前规则预览文件名仍会变化，已停止自动处理；"
+                                "请检查 MoviePilot 剧集数据和命名规则｜"
+                                f"{self._file_change_details(current_file, preview.target)}"
+                            )
+                            self._mark_processing_state(
+                                processing_state,
+                                {processing_key},
+                                self._STATE_ATTENTION,
+                            )
+                            result.add_error(message)
+                            logger.error(f"[最近剧集维护] {message}")
+                        else:
+                            self._mark_processing_state(
+                                processing_state,
+                                {processing_key},
+                                self._STATE_PENDING_REORGANIZE,
+                            )
+                            result.add_error(f"{label}：{preview.message}")
+                            logger.error(
+                                f"[最近剧集维护] 重新整理预览失败 {label}：{preview.message}｜"
+                                f"{self._file_change_details(current_file, preview.target)}"
+                            )
+                        continue
+                    if result.operations_used >= result.operation_limit:
+                        result.skipped += 1
+                        self._mark_processing_state(
+                            processing_state,
+                            {processing_key},
+                            self._STATE_PENDING_REORGANIZE,
+                        )
+                        logger.info(
+                            f"[最近剧集维护] 已达到单次操作上限，延后重新整理 {label}｜"
+                            f"{self._file_change_details(current_file, expected_path)}"
+                        )
+                        continue
+                    result.operations_used += 1
                     operation = reorganizer.reorganize(
                         history=history,
                         skip_same_name=self._skip_same_name,
@@ -344,17 +710,57 @@ class RecentEpisodeMaintenance(_PluginBase):
                             result.previewed += 1
                         else:
                             result.reorganized += 1
+                            result.add_reorganized_title(
+                                self._result_title(label, operation.target)
+                            )
                             any_reorganized = True
-                        logger.info(f"[最近剧集维护] {label}：{operation.message}")
+                            self._mark_processing_state(
+                                processing_state,
+                                {processing_key},
+                                self._STATE_PENDING_REORGANIZE,
+                                rename_attempts=rename_attempts + 1,
+                                had_action=True,
+                                expected_path=operation.target,
+                            )
+                        logger.info(
+                            f"[最近剧集维护] {label}：{operation.message}｜"
+                            f"{self._file_change_details(current_file, operation.target)}"
+                        )
                     elif operation.skipped:
                         result.skipped += 1
-                        logger.info(f"[最近剧集维护] 跳过 {label}：{operation.message}")
+                        if not self._dry_run:
+                            self._mark_processing_verified(
+                                processing_state,
+                                {processing_key},
+                            )
+                        logger.info(
+                            f"[最近剧集维护] 跳过 {label}：{operation.message}｜"
+                            f"{self._file_change_details(current_file, operation.target)}"
+                        )
                     else:
+                        if not self._dry_run:
+                            self._mark_processing_state(
+                                processing_state,
+                                {processing_key},
+                                self._STATE_PENDING_REORGANIZE,
+                            )
                         result.add_error(f"{label}：{operation.message}")
-                        logger.error(f"[最近剧集维护] 重新整理失败 {label}：{operation.message}")
+                        logger.error(
+                            f"[最近剧集维护] 重新整理失败 {label}：{operation.message}｜"
+                            f"{self._file_change_details(current_file, operation.target)}"
+                        )
                 except Exception as err:
+                    if not self._dry_run:
+                        self._mark_processing_state(
+                            processing_state,
+                            {processing_key},
+                            self._STATE_PENDING_REORGANIZE,
+                        )
                     result.add_error(f"{label}：{err}")
-                    logger.error(f"[最近剧集维护] 重新整理失败 {label}：{err}")
+                    logger.error(
+                        f"[最近剧集维护] 重新整理失败 {label}：{err}｜"
+                        f"文件：{current_file or '未知文件'}"
+                    )
 
         if any_reorganized and self._scan_after_reorganize and not self._dry_run:
             client = client or self._get_jellyfin_client()
@@ -366,6 +772,9 @@ class RecentEpisodeMaintenance(_PluginBase):
                     result.add_error("重新整理后无法触发 Jellyfin 媒体库扫描")
             except Exception as err:
                 result.add_error(f"媒体库扫描失败：{err}")
+
+        if not self._dry_run:
+            self._save_processing_state(processing_state)
 
         logger.info("[最近剧集维护] 运行完成\n" + result.summary())
         if self._notify:
@@ -388,6 +797,220 @@ class RecentEpisodeMaintenance(_PluginBase):
             self._refresh_mode == "all",
             self._replace_images,
         )
+
+    @staticmethod
+    def _file_change_details(current_file: Any, new_file: Any) -> str:
+        current = str(current_file or "未知文件")
+        target = str(new_file or current_file or "未知文件")
+        if JellyfinServiceClient.path_key(current) == JellyfinServiceClient.path_key(target):
+            return f"文件：{current}"
+        return f"原文件：{current}｜新文件：{target}"
+
+    @staticmethod
+    def _result_title(fallback: str, path: Any) -> str:
+        return Path(path).stem if path else fallback
+
+    def _select_histories(
+        self,
+        histories: list[Any],
+        reorganizer: MoviePilotReorganizer,
+    ) -> tuple[list[Any], dict[str, dict[str, Any]], dict[str, int]]:
+        state = self._load_processing_state()
+        keyed_histories = [
+            (history, reorganizer.processing_key(history))
+            for history in histories
+        ]
+        active_keys = {key for _, key in keyed_histories}
+        state = {
+            key: value
+            for key, value in state.items()
+            if key in active_keys and isinstance(value, dict)
+        }
+
+        pending_statuses = {
+            self._STATE_PENDING_REFRESH,
+            self._STATE_PENDING_REORGANIZE,
+        }
+        known_statuses = {
+            *pending_statuses,
+            self._STATE_MONITORING,
+            self._STATE_COMPLETE,
+            self._STATE_ATTENTION,
+        }
+        pending = [
+            (history, key)
+            for history, key in keyed_histories
+            if (state.get(key) or {}).get("status") in pending_statuses
+        ]
+        pending.sort(key=lambda item: str((state.get(item[1]) or {}).get("updated_at") or ""))
+        new_items = [
+            (history, key)
+            for history, key in keyed_histories
+            if key not in state
+            or (state.get(key) or {}).get("status") not in known_statuses
+        ]
+        monitoring = [
+            (history, key)
+            for history, key in keyed_histories
+            if (state.get(key) or {}).get("status") == self._STATE_MONITORING
+            and self._timestamp_is_due((state.get(key) or {}).get("next_preview_at"))
+        ]
+        monitoring.sort(
+            key=lambda item: str((state.get(item[1]) or {}).get("next_preview_at") or "")
+        )
+
+        operation_limit = max(int(self._max_items), 1)
+        limit = max(operation_limit, operation_limit * self._INSPECTION_MULTIPLIER)
+        selected: list[tuple[Any, str]] = []
+        other_items = new_items + monitoring
+        if pending and other_items:
+            other_reserve = min(len(other_items), max(1, limit // 4)) if limit > 1 else 0
+            selected.extend(pending[:max(limit - other_reserve, 0)])
+            selected.extend(other_items[:max(limit - len(selected), 0)])
+            if len(selected) < limit:
+                selected_pending = sum(1 for _, key in selected if key in {item[1] for item in pending})
+                selected.extend(pending[selected_pending:selected_pending + limit - len(selected)])
+        else:
+            selected.extend((pending + other_items)[:limit])
+
+        pending_keys = {key for _, key in pending}
+        new_keys = {key for _, key in new_items}
+        monitoring_keys = {key for _, key in monitoring}
+        return (
+            [history for history, _ in selected],
+            state,
+            {
+                "pending": sum(1 for _, key in selected if key in pending_keys),
+                "new": sum(1 for _, key in selected if key in new_keys),
+                "monitoring": sum(1 for _, key in selected if key in monitoring_keys),
+                "complete": sum(
+                    1
+                    for _, key in keyed_histories
+                    if (state.get(key) or {}).get("status") == self._STATE_COMPLETE
+                ),
+                "attention": sum(
+                    1
+                    for _, key in keyed_histories
+                    if (state.get(key) or {}).get("status") == self._STATE_ATTENTION
+                ),
+            },
+        )
+
+    @staticmethod
+    def _timestamp_is_due(value: Any) -> bool:
+        if not value:
+            return True
+        try:
+            return datetime.fromisoformat(str(value)) <= datetime.now()
+        except (TypeError, ValueError):
+            return True
+
+    def _load_processing_state(self) -> dict[str, dict[str, Any]]:
+        get_data = getattr(self, "get_data", None)
+        if not callable(get_data):
+            return {}
+        try:
+            value = get_data(self._PROCESSING_STATE_KEY)
+        except Exception as err:
+            logger.warning(f"[最近剧集维护] 读取处理状态失败，将重新建立队列：{err}")
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def _save_processing_state(self, state: dict[str, dict[str, Any]]) -> None:
+        save_data = getattr(self, "save_data", None)
+        if not callable(save_data):
+            logger.warning("[最近剧集维护] 当前环境不支持保存处理状态")
+            return
+        try:
+            save_data(self._PROCESSING_STATE_KEY, state)
+        except Exception as err:
+            logger.error(f"[最近剧集维护] 保存处理状态失败：{err}")
+
+    @staticmethod
+    def _history_keys_for_episode(
+        item_id: str,
+        episode_target_keys: dict[str, set[str]],
+        history_keys_by_target: dict[str, set[str]],
+    ) -> set[str]:
+        return {
+            history_key
+            for target_key in episode_target_keys.get(item_id) or set()
+            for history_key in history_keys_by_target.get(target_key) or set()
+        }
+
+    @staticmethod
+    def _expected_path_for_keys(
+        keys: set[str],
+        expected_paths: dict[str, Path],
+    ) -> Path | None:
+        return next(
+            (expected_paths[key] for key in sorted(keys) if key in expected_paths),
+            None,
+        )
+
+    @staticmethod
+    def _same_path(left: Any, right: Any) -> bool:
+        return JellyfinServiceClient.path_key(left) == JellyfinServiceClient.path_key(right)
+
+    @staticmethod
+    def _cache_processing_preview(
+        state: dict[str, dict[str, Any]],
+        keys: set[str],
+        expected_path: Any,
+    ) -> None:
+        previewed_at = datetime.now().isoformat(timespec="seconds")
+        for key in keys:
+            item = dict(state.get(key) or {})
+            item["expected_path"] = str(expected_path)
+            item["previewed_at"] = previewed_at
+            state[key] = item
+
+    def _mark_processing_verified(
+        self,
+        state: dict[str, dict[str, Any]],
+        keys: set[str],
+    ) -> None:
+        next_preview_at = (
+            datetime.now() + timedelta(hours=self._PREVIEW_CACHE_HOURS)
+        ).isoformat(timespec="seconds")
+        for key in keys:
+            if bool((state.get(key) or {}).get("had_action")):
+                self._mark_processing_state(state, {key}, self._STATE_COMPLETE)
+            else:
+                self._mark_processing_state(
+                    state,
+                    {key},
+                    self._STATE_MONITORING,
+                    next_preview_at=next_preview_at,
+                )
+
+    @staticmethod
+    def _mark_processing_state(
+        state: dict[str, dict[str, Any]],
+        keys: set[str],
+        status: str,
+        rename_attempts: int | None = None,
+        had_action: bool | None = None,
+        expected_path: Any = None,
+        next_preview_at: str | None = None,
+    ) -> None:
+        updated_at = datetime.now().isoformat(timespec="seconds")
+        for key in keys:
+            item = dict(state.get(key) or {})
+            item["status"] = status
+            item["updated_at"] = updated_at
+            if rename_attempts is not None:
+                item["rename_attempts"] = rename_attempts
+            if had_action is not None:
+                item["had_action"] = had_action
+            if expected_path is not None:
+                item["expected_path"] = str(expected_path)
+                item["previewed_at"] = updated_at
+            if next_preview_at is not None:
+                item["next_preview_at"] = next_preview_at
+            elif status != RecentEpisodeMaintenance._STATE_MONITORING:
+                item.pop("next_preview_at", None)
+            state[key] = item
 
     def _get_jellyfin_client(self) -> JellyfinServiceClient | None:
         service_items = self._jellyfin_services()
