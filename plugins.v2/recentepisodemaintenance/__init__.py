@@ -97,7 +97,7 @@ class RecentEpisodeMaintenance(_PluginBase):
     plugin_name = "最近剧集维护"
     plugin_desc = "维护 MoviePilot 最近整理入库的 Jellyfin 剧集"
     plugin_icon = "https://raw.githubusercontent.com/byangmath/MoviePilot-Plugins/main/icons/recentepisodemaintenance.png"
-    plugin_version = "0.2.0"
+    plugin_version = "0.2.1"
     plugin_author = "byangmath"
     author_url = "https://github.com/byangmath"
     plugin_config_prefix = "recentepisodemaintenance_"
@@ -414,7 +414,7 @@ class RecentEpisodeMaintenance(_PluginBase):
             deferred_reorganize_targets.add(target_key)
             deferred_reorganize_reasons[target_key] = "MP 整理预览失败"
             message = f"{reorganizer.display_name(history)}：{preview.message}"
-            result.add_error(message)
+            result.add_error(message, reorganizer.target_path(history))
             logger.error(
                 f"[最近剧集维护] 预览失败 {reorganizer.display_name(history)}："
                 f"{preview.message}｜文件：{reorganizer.target_path(history) or '未知文件'}"
@@ -503,7 +503,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                     episode_label = episode.episode_label
                     episode_file = expected_path or episode.path or "未知文件"
                     if not expected_path:
-                        result.add_error(f"{episode_label}：缺少 MP 整理预览")
+                        result.add_error(f"{episode_label}：缺少 MP 整理预览", episode_file)
                         missing_preview_targets = (
                             episode_target_keys.get(episode.item_id) or set()
                         )
@@ -603,7 +603,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                             episode_history_keys,
                             self._STATE_PENDING_REFRESH,
                         )
-                        result.add_error(f"{episode_label}：{err}")
+                        result.add_error(f"{episode_label}：{err}", episode_file)
                         for refresh_target in refresh_targets:
                             deferred_reorganize_reasons[refresh_target] = (
                                 "标题不一致，元数据刷新提交失败"
@@ -683,7 +683,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                     )
                     continue
                 if not expected_path:
-                    result.add_error(f"{label}：缺少 MP 整理预览")
+                    result.add_error(f"{label}：缺少 MP 整理预览", current_file)
                     if not self._dry_run:
                         self._mark_processing_state(
                             processing_state,
@@ -739,7 +739,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                             f"{label} 已连续触发刮削 {sidecar_attempts} 次，"
                             "NFO 或图片仍未生成，已停止自动重试；请检查 MoviePilot 刮削日志"
                         )
-                        result.add_error(message)
+                        result.add_error(message, expected_path)
                         if not self._dry_run:
                             self._mark_processing_state(
                                 processing_state,
@@ -827,7 +827,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 {processing_key},
                                 self._STATE_ATTENTION,
                             )
-                            result.add_error(message)
+                            result.add_error(message, preview.target or current_file)
                             logger.error(
                                 f"[最近剧集维护] 停止重命名 {label}：连续重新整理 "
                                 f"{rename_attempts} 次后路径仍会变化｜"
@@ -839,7 +839,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 {processing_key},
                                 self._STATE_PENDING_REORGANIZE,
                             )
-                            result.add_error(f"{label}：{preview.message}")
+                            result.add_error(f"{label}：{preview.message}", preview.target or current_file)
                             logger.error(
                                 f"[最近剧集维护] 预览失败 {label}：{preview.message}｜"
                                 f"{self._file_change_details(current_file, preview.target)}"
@@ -910,7 +910,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 {processing_key},
                                 self._STATE_PENDING_REORGANIZE,
                             )
-                        result.add_error(f"{label}：{operation.message}")
+                        result.add_error(f"{label}：{operation.message}", operation.target or current_file)
                         logger.error(
                             f"[最近剧集维护] 重命名失败 {label}：{operation.message}｜"
                             f"{self._file_change_details(current_file, operation.target)}"
@@ -922,7 +922,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                             {processing_key},
                             self._STATE_PENDING_REORGANIZE,
                         )
-                    result.add_error(f"{label}：{err}")
+                    result.add_error(f"{label}：{err}", current_file)
                     logger.error(
                         f"[最近剧集维护] 重命名失败 {label}：{err}｜"
                         f"文件：{current_file or '未知文件'}"
@@ -977,7 +977,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                         f"{label}：重新整理后缺少{missing_text}，"
                         f"下次运行将重试（{attempts}/{self._MAX_SIDECAR_ATTEMPTS}）"
                     )
-                result.add_error(message)
+                result.add_error(message, target)
                 action = "停止刮削" if exhausted else "附件缺失"
                 logger.error(
                     f"[最近剧集维护] {action} {label}：重新整理后缺少{missing_text}，"

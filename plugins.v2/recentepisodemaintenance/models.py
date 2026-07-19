@@ -98,11 +98,15 @@ class RunResult:
     errors: list[str] = field(default_factory=list)
     refreshed_titles: list[str] = field(default_factory=list)
     reorganized_titles: list[str] = field(default_factory=list)
+    failed_titles: list[str] = field(default_factory=list)
     _skipped_keys: set[str] = field(default_factory=set, repr=False)
 
-    def add_error(self, message: str) -> None:
+    def add_error(self, message: str, file_path: str | Path | None = None) -> None:
         self.failed += 1
         self.errors.append(message)
+        normalized_path = str(file_path or "").strip()
+        if normalized_path and normalized_path not in self.failed_titles:
+            self.failed_titles.append(normalized_path)
 
     def add_refreshed_title(self, title: str) -> None:
         if title and title not in self.refreshed_titles:
@@ -141,6 +145,9 @@ class RunResult:
         if self.reorganized_titles:
             lines.append("重新整理成功剧集：")
             lines.extend(f"- {title}" for title in self.reorganized_titles)
+        if self.failed_titles:
+            lines.append("处理失败剧集：")
+            lines.extend(f"- {title}" for title in self.failed_titles)
         if self.errors:
             lines.append("失败详情：")
             lines.extend(f"- {item}" for item in self.errors[:10])

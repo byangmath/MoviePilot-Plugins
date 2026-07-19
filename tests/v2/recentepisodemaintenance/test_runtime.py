@@ -30,11 +30,16 @@ def test_summary_lists_bare_full_file_paths():
     result = RunResult(refreshed=1, reorganized=1)
     result.add_refreshed_title("/media/搞笑一家人3 S01E83.mkv")
     result.add_reorganized_title("/media/仙逆 S01E149.mp4")
+    result.add_error("刷新失败", "/media/秘密森林 S02E16.mkv")
 
     summary = result.summary()
 
     assert "- /media/搞笑一家人3 S01E83.mkv" in summary
     assert "- /media/仙逆 S01E149.mp4" in summary
+    assert "处理失败剧集：" in summary
+    assert "- /media/秘密森林 S02E16.mkv" in summary
+    assert "失败详情：" in summary
+    assert "- 刷新失败" in summary
     assert "Jellyfin 标题" not in summary
     assert "MP 预览文件" not in summary
 
