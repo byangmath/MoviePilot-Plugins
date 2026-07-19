@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 from recentepisodemaintenance.reorganizer import MoviePilotReorganizer
+from recentepisodemaintenance import RecentEpisodeMaintenance
 
 
 def history(
@@ -13,6 +14,7 @@ def history(
 ):
     return SimpleNamespace(
         id=history_id,
+        date=date,
         src=source,
         dest=dest,
         src_fileitem={"path": source},
@@ -85,3 +87,40 @@ def test_ignores_episode_group_without_video_history():
     )
 
     assert reorganizer._select_primary_histories([subtitle]) == []
+
+
+def test_attachment_histories_do_not_consume_video_inspection_limit():
+    plugin = RecentEpisodeMaintenance()
+    plugin._max_items = 1
+    reorganizer = MoviePilotReorganizer(logger=None)
+    candidates = []
+
+    for index in range(12):
+        subtitle = history(
+            history_id=100 + index,
+            source=f"/source/show/subtitle-{index}.srt",
+            dest=f"/library/show/Season 01/subtitle-{index}.srt",
+            date=f"2026-07-19 12:{index:02d}:00",
+        )
+        subtitle.episodes = f"E{20 + index:02d}"
+        candidates.append(subtitle)
+
+    for index in range(6):
+        video = history(
+            history_id=index + 1,
+            source=f"/source/show/episode-{index + 1}.mkv",
+            dest=f"/library/show/Season 01/episode-{index + 1}.mkv",
+            date=f"2026-07-19 11:{index:02d}:00",
+        )
+        video.episodes = f"E{index + 1:02d}"
+        candidates.append(video)
+
+    video_pool = reorganizer._select_primary_histories(candidates)
+    selected, _, _ = plugin._select_histories(
+        histories=video_pool,
+        reorganizer=reorganizer,
+    )
+
+    assert len(video_pool) == 6
+    assert len(selected) == 5
+    assert all(reorganizer._is_video_history(item) for item in selected)

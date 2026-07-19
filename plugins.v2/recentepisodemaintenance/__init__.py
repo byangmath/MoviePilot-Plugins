@@ -208,7 +208,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 "max_items",
                                 "单次最大处理数量",
                                 6,
-                                "限制每轮刷新和重新整理的合计操作数；最多检查该数量五倍的记录",
+                                "限制每轮刷新和重新整理的合计操作数；最多检查该数量五倍的视频整理记录",
                             ),
                             self._switch(
                                 "dry_run",
@@ -354,9 +354,9 @@ class RecentEpisodeMaintenance(_PluginBase):
             )
             result.reorganize_candidates = len(histories)
             logger.info(
-                f"[最近剧集维护] 查询 MP 最近 {self._days} 天成功整理记录，"
+                f"[最近剧集维护] 查询 MP 最近 {self._days} 天成功视频整理记录，"
                 f"共 {len(history_pool)} 条；本轮最多执行 {operation_limit} 次操作，"
-                f"检查 {len(histories)} 条记录"
+                f"检查 {len(histories)} 条视频记录"
                 f"（待复查 {selection['pending']} 条，新记录 {selection['new']} 条，"
                 f"到期监测 {selection['monitoring']} 条，"
                 f"已完成 {selection['complete']} 条，需人工检查 {selection['attention']} 条）"

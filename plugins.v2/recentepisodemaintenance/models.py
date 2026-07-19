@@ -121,7 +121,7 @@ class RunResult:
 
     def summary(self) -> str:
         lines = [
-            f"本轮检查 MP 整理记录 {self.reorganize_candidates} 条",
+            f"本轮检查 MP 视频整理记录 {self.reorganize_candidates} 条",
             f"刷新和重新整理操作 {self.operations_used}/{self.operation_limit} 次",
             f"重新整理试运行预览 {self.previewed} 条",
             f"重新整理成功 {self.reorganized} 集",
