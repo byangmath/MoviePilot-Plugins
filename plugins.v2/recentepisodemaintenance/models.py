@@ -94,6 +94,7 @@ class RunResult:
     errors: list[str] = field(default_factory=list)
     refreshed_titles: list[str] = field(default_factory=list)
     reorganized_titles: list[str] = field(default_factory=list)
+    _skipped_keys: set[str] = field(default_factory=set, repr=False)
 
     def add_error(self, message: str) -> None:
         self.failed += 1
@@ -106,6 +107,17 @@ class RunResult:
     def add_reorganized_title(self, title: str) -> None:
         if title and title not in self.reorganized_titles:
             self.reorganized_titles.append(title)
+
+    def add_skipped(self, *keys: str) -> None:
+        values = keys or (f"unknown:{len(self._skipped_keys)}",)
+        for key in values:
+            normalized = str(key or "").strip()
+            if not normalized:
+                normalized = f"unknown:{len(self._skipped_keys)}"
+            if normalized in self._skipped_keys:
+                continue
+            self._skipped_keys.add(normalized)
+            self.skipped += 1
 
     def summary(self) -> str:
         lines = [

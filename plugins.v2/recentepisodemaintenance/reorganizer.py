@@ -21,6 +21,12 @@ def _first_import(candidates: list[tuple[str, str]]) -> Any | None:
 
 
 class MoviePilotReorganizer:
+    _VIDEO_EXTENSIONS = {
+        ".3gp", ".asf", ".avi", ".divx", ".flv", ".iso", ".m2ts", ".m4v",
+        ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".mts", ".rm", ".rmvb",
+        ".strm", ".ts", ".vob", ".webm", ".wmv",
+    }
+
     def __init__(self, logger: Any, dry_run: bool = True):
         self.logger = logger
         self.dry_run = dry_run
@@ -37,6 +43,7 @@ class MoviePilotReorganizer:
         self._get_db = _first_import([
             ("app.db", "get_db"),
         ])
+        self._related_histories: dict[str, list[Any]] = {}
 
     def recent_histories(self, days: int) -> list[Any]:
         """Return the latest successful TV transfer record for each episode."""
@@ -59,15 +66,43 @@ class MoviePilotReorganizer:
                 query = query.order_by(history_cls.id.desc())
             candidates = query.all()
 
-        histories: list[Any] = []
-        seen: set[tuple[str, str, str]] = set()
+        return self._select_primary_histories(candidates)
+
+    def _select_primary_histories(self, candidates: list[Any]) -> list[Any]:
+        grouped: dict[tuple[str, str, str], list[Any]] = {}
         for history in candidates:
-            key = self._episode_key(history)
-            if key in seen:
+            grouped.setdefault(self._episode_key(history), []).append(history)
+
+        histories: list[Any] = []
+        self._related_histories = {}
+        for episode_histories in grouped.values():
+            primary = next(
+                (history for history in episode_histories if self._is_video_history(history)),
+                None,
+            )
+            if primary is None:
                 continue
-            seen.add(key)
-            histories.append(history)
+            histories.append(primary)
+            self._related_histories[self.processing_key(primary)] = [
+                history
+                for history in episode_histories
+                if history is not primary
+                and not self._is_video_history(history)
+                and self._same_transfer(primary, history)
+            ]
+
+        histories.sort(
+            key=lambda history: (
+                str(getattr(history, "date", None) or ""),
+                int(getattr(history, "id", None) or 0),
+            ),
+            reverse=True,
+        )
         return histories
+
+    def related_history_count(self, history: Any) -> int:
+        """Return attachment records that MoviePilot will sync with the selected video."""
+        return len(self._related_histories.get(self.processing_key(history)) or [])
 
     def reorganize(
         self,
@@ -363,6 +398,34 @@ class MoviePilotReorganizer:
         if isinstance(dest_fileitem, dict) and dest_fileitem.get("path"):
             return Path(dest_fileitem["path"])
         return None
+
+    @classmethod
+    def _is_video_history(cls, history: Any) -> bool:
+        target = cls._history_target(history)
+        return bool(target and target.suffix.casefold() in cls._VIDEO_EXTENSIONS)
+
+    @classmethod
+    def _same_transfer(cls, primary: Any, candidate: Any) -> bool:
+        primary_hash = str(getattr(primary, "download_hash", None) or "").strip()
+        candidate_hash = str(getattr(candidate, "download_hash", None) or "").strip()
+        if primary_hash and candidate_hash:
+            return primary_hash == candidate_hash
+
+        primary_source = cls._history_source(primary)
+        candidate_source = cls._history_source(candidate)
+        if primary_source and candidate_source:
+            return cls._path_key(primary_source.parent) == cls._path_key(
+                candidate_source.parent
+            )
+
+        primary_target = cls._history_target(primary)
+        candidate_target = cls._history_target(candidate)
+        return bool(
+            primary_target
+            and candidate_target
+            and cls._path_key(primary_target.parent)
+            == cls._path_key(candidate_target.parent)
+        )
 
     @classmethod
     def _same_path(cls, left: Path | None, right: Path | None) -> bool:

@@ -4,7 +4,7 @@
     "description": "刷新元数据并重命名 MoviePilot 最近整理入库的 Jellyfin 剧集。",
     "labels": "Jellyfin,媒体库,剧集",
     "version": "0.1.1",
-    "icon": "https://raw.githubusercontent.com/byangmath/RecentEpisodeMaintenance/main/icons/recentepisodemaintenance.png",
+    "icon": "https://raw.githubusercontent.com/byangmath/MoviePilot-Plugins/main/icons/recentepisodemaintenance.png",
     "author": "byangmath",
     "level": 1,
     "system_version": ">=2.0.0",
