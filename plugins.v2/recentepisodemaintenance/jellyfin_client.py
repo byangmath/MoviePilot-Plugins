@@ -47,33 +47,48 @@ class JellyfinServiceClient:
             return json_method()
         return response
 
-    def _get_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        return self._request_json("get_data", path, params)
+    def _get_json(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        *,
+        retry: bool = True,
+    ) -> Any:
+        return self._request_json("get_data", path, params, retry=retry)
 
-    def _post_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        return self._request_json("post_data", path, params)
+    def _post_json(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        *,
+        retry: bool = True,
+    ) -> Any:
+        return self._request_json("post_data", path, params, retry=retry)
 
     def _request_json(
         self,
         method_name: str,
         path: str,
         params: dict[str, Any] | None = None,
+        *,
+        retry: bool = True,
     ) -> Any:
         url = self._url(path, params)
+        request_attempts = self._REQUEST_ATTEMPTS if retry else 1
         last_error: Exception | None = None
-        for attempt in range(1, self._REQUEST_ATTEMPTS + 1):
+        for attempt in range(1, request_attempts + 1):
             try:
                 method = getattr(self.service, method_name)
                 return self._json(method(url))
             except Exception as err:
                 last_error = err
-                if attempt >= self._REQUEST_ATTEMPTS:
+                if attempt >= request_attempts:
                     break
                 logger.warning(
                     "[最近剧集维护] Jellyfin 请求失败，%s 秒后重试（%s/%s）：%s",
                     self._REQUEST_RETRY_DELAY_SECONDS,
                     attempt,
-                    self._REQUEST_ATTEMPTS,
+                    request_attempts,
                     err,
                 )
                 sleep(self._REQUEST_RETRY_DELAY_SECONDS)
@@ -320,8 +335,8 @@ class JellyfinServiceClient:
         except ValueError:
             return False
 
-    def libraries(self) -> list[dict[str, str]]:
-        items = self._get_json("Library/VirtualFolders") or []
+    def libraries(self, *, retry: bool = True) -> list[dict[str, str]]:
+        items = self._get_json("Library/VirtualFolders", retry=retry) or []
         libraries: list[dict[str, str]] = []
         for item in items:
             if not isinstance(item, dict):

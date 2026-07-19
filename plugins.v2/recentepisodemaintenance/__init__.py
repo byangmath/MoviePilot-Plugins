@@ -1440,7 +1440,7 @@ class RecentEpisodeMaintenance(_PluginBase):
         if not client:
             return options
         try:
-            return options + client.libraries()
+            return options + client.libraries(retry=False)
         except Exception as err:
             logger.warning(f"[最近剧集维护] 读取 Jellyfin 媒体库列表失败：{err}")
             return options
