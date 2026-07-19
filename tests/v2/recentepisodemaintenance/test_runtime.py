@@ -30,6 +30,11 @@ def test_sidecar_checks_scan_shared_directory_once(tmp_path, monkeypatch):
         return real_scandir(directory)
 
     monkeypatch.setattr(plugin_module, "scandir", counting_scandir)
+    cache = {}
+
+    assert RecentEpisodeMaintenance._missing_reorganized_sidecars(first, cache) == []
+    assert RecentEpisodeMaintenance._missing_reorganized_sidecars(second, cache) == []
+    assert scan_count == 1
 
 
 def test_sidecar_checks_preserve_case_sensitive_file_names(tmp_path):
@@ -55,8 +60,3 @@ def test_sidecar_checks_do_not_treat_matching_directories_as_files(tmp_path):
         "NFO",
         "\u56fe\u7247",
     ]
-    cache = {}
-
-    assert RecentEpisodeMaintenance._missing_reorganized_sidecars(first, cache) == []
-    assert RecentEpisodeMaintenance._missing_reorganized_sidecars(second, cache) == []
-    assert scan_count == 1

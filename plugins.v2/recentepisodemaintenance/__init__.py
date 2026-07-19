@@ -533,18 +533,22 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 episode_history_keys,
                             )
                         continue
+                    refresh_reason = (
+                        f"Jellyfin 标题“{episode.name or '未知标题'}”与 "
+                        f"MP 预览文件“{expected_path.name}”中的标题不一致"
+                    )
                     refresh_targets = episode_target_keys.get(episode.item_id) or set()
                     deferred_reorganize_targets.update(refresh_targets)
                     refresh_first_targets.update(refresh_targets)
                     for refresh_target in refresh_targets:
                         deferred_reorganize_reasons[refresh_target] = (
-                            "Jellyfin 标题与 MP 预览不一致，本轮先刷新元数据"
+                            f"{refresh_reason}，本轮先刷新元数据"
                         )
                     if result.operations_used >= result.operation_limit:
                         result.add_skipped(*refresh_targets)
                         for refresh_target in refresh_targets:
                             deferred_reorganize_reasons[refresh_target] = (
-                                "已达到操作上限，元数据刷新尚未执行"
+                                f"{refresh_reason}，但已达到操作上限，元数据刷新尚未执行"
                             )
                         if not self._dry_run:
                             self._mark_processing_state(
@@ -562,7 +566,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                         result.refresh_previewed += 1
                         for refresh_target in refresh_targets:
                             deferred_reorganize_reasons[refresh_target] = (
-                                "试运行仅预览元数据刷新"
+                                f"{refresh_reason}；试运行仅预览元数据刷新"
                             )
                         logger.info(
                             f"[最近剧集维护] 试运行：标题不一致，将完整刷新 "
@@ -579,7 +583,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                         )
                         result.refreshed += 1
                         result.add_refreshed_title(
-                            self._result_title(episode.display_name, expected_path)
+                            comparison_details
                         )
                         logger.info(
                             f"[最近剧集维护] 标题不一致，已提交元数据和图片刷新 "
@@ -593,7 +597,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                         )
                         for refresh_target in refresh_targets:
                             deferred_reorganize_reasons[refresh_target] = (
-                                "已提交 Jellyfin 元数据刷新，等待后续确认"
+                                f"{refresh_reason}；已提交 Jellyfin 元数据刷新，等待后续确认"
                             )
                     except Exception as err:
                         self._mark_processing_state(
@@ -604,7 +608,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                         result.add_error(f"{episode.display_name}：{err}")
                         for refresh_target in refresh_targets:
                             deferred_reorganize_reasons[refresh_target] = (
-                                "Jellyfin 元数据刷新提交失败"
+                                f"{refresh_reason}；Jellyfin 元数据刷新提交失败"
                             )
                         logger.error(
                             f"[最近剧集维护] 标题不一致，提交元数据刷新失败 "
