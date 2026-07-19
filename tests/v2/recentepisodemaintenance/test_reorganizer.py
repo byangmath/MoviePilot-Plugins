@@ -124,3 +124,73 @@ def test_attachment_histories_do_not_consume_video_inspection_limit():
     assert len(video_pool) == 6
     assert len(selected) == 5
     assert all(reorganizer._is_video_history(item) for item in selected)
+
+def test_selection_counts_due_and_waiting_monitoring_records():
+    plugin = RecentEpisodeMaintenance()
+    plugin._max_items = 10
+    reorganizer = MoviePilotReorganizer(logger=None)
+    due = history(
+        history_id=1,
+        source="/source/show/due.mkv",
+        dest="/library/show/Season 01/测试剧 S01E01.mkv",
+        date="2026-07-19 12:00:00",
+        download_hash="due-transfer",
+    )
+    waiting = history(
+        history_id=2,
+        source="/source/show/waiting.mkv",
+        dest="/library/show/Season 01/测试剧 S01E02.mkv",
+        date="2026-07-19 12:01:00",
+        download_hash="waiting-transfer",
+    )
+    waiting.episodes = "E02"
+    plugin._load_processing_state = lambda: {
+        reorganizer.processing_key(due): {
+            "status": plugin._STATE_MONITORING,
+            "next_preview_at": "2000-01-01T00:00:00",
+        },
+        reorganizer.processing_key(waiting): {
+            "status": plugin._STATE_MONITORING,
+            "next_preview_at": "2999-01-01T00:00:00",
+        },
+    }
+
+    selected, _, selection = plugin._select_histories(
+        histories=[due, waiting],
+        reorganizer=reorganizer,
+    )
+
+    assert selected == [due]
+    assert selection["monitoring"] == 1
+    assert selection["monitoring_waiting"] == 1
+
+def test_selection_lists_attention_records_with_reason_and_path():
+    plugin = RecentEpisodeMaintenance()
+    plugin._max_items = 10
+    reorganizer = MoviePilotReorganizer(logger=None)
+    video = history(
+        history_id=1,
+        source="/source/show/episode.mkv",
+        dest="/library/show/Season 01/测试剧 S01E01.mkv",
+        date="2026-07-19 12:00:00",
+    )
+    key = reorganizer.processing_key(video)
+    plugin._load_processing_state = lambda: {
+        key: {
+            "status": plugin._STATE_ATTENTION,
+            "expected_path": "/library/show/Season 01/测试剧 S01E01.mkv",
+            "sidecar_pending": True,
+        }
+    }
+
+    selected, _, selection = plugin._select_histories(
+        histories=[video],
+        reorganizer=reorganizer,
+    )
+
+    assert selected == []
+    assert selection["attention"] == 1
+    assert selection["attention_items"] == [
+        "测试剧 S01E01：刮削附件多次补齐失败｜"
+        "文件：/library/show/Season 01/测试剧 S01E01.mkv"
+    ]

@@ -1,5 +1,5 @@
 from recentepisodemaintenance import RecentEpisodeMaintenance
-from recentepisodemaintenance.models import RunResult
+from recentepisodemaintenance.models import EpisodeItem, RunResult
 import recentepisodemaintenance as plugin_module
 
 
@@ -11,6 +11,32 @@ def test_skipped_count_is_unique_per_episode():
     result.add_skipped("/library/show/episode02.mkv")
 
     assert result.skipped == 2
+
+
+def test_episode_label_excludes_jellyfin_title_and_file():
+    episode = EpisodeItem(
+        item_id="1",
+        name="第83集",
+        series_name="搞笑一家人3",
+        season_number=1,
+        episode_number=83,
+        path="/media/搞笑一家人3 S01E83 - 1080p 第83集.mkv",
+    )
+
+    assert episode.episode_label == "搞笑一家人3 S01E83"
+
+
+def test_summary_lists_bare_full_file_paths():
+    result = RunResult(refreshed=1, reorganized=1)
+    result.add_refreshed_title("/media/搞笑一家人3 S01E83.mkv")
+    result.add_reorganized_title("/media/仙逆 S01E149.mp4")
+
+    summary = result.summary()
+
+    assert "- /media/搞笑一家人3 S01E83.mkv" in summary
+    assert "- /media/仙逆 S01E149.mp4" in summary
+    assert "Jellyfin 标题" not in summary
+    assert "MP 预览文件" not in summary
 
 
 def test_sidecar_checks_scan_shared_directory_once(tmp_path, monkeypatch):

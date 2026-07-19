@@ -3,12 +3,13 @@
     "name": "最近剧集维护",
     "description": "刷新元数据并重命名 MoviePilot 最近整理入库的 Jellyfin 剧集。",
     "labels": "Jellyfin,媒体库,剧集",
-    "version": "0.1.1",
+    "version": "0.2.0",
     "icon": "https://raw.githubusercontent.com/byangmath/MoviePilot-Plugins/main/icons/recentepisodemaintenance.png",
     "author": "byangmath",
     "level": 1,
     "system_version": ">=2.0.0",
     "history": {
+      "v0.2.0": "按视频整理记录建立复查队列，限制实际操作次数，统一刷新与重命名日志，并列出需人工检查记录。",
       "v0.1.1": "重新整理后等待并确认 NFO 与图片，附件缺失时自动重试，确认齐全后再扫描 Jellyfin。",
       "v0.1.0": "初始版本：按 MoviePilot 最近整理记录刷新 Jellyfin 元数据和图片，并支持通过原整理记录重新整理剧集文件。"
     }

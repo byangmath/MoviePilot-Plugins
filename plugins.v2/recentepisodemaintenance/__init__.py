@@ -97,7 +97,7 @@ class RecentEpisodeMaintenance(_PluginBase):
     plugin_name = "最近剧集维护"
     plugin_desc = "维护 MoviePilot 最近整理入库的 Jellyfin 剧集"
     plugin_icon = "https://raw.githubusercontent.com/byangmath/MoviePilot-Plugins/main/icons/recentepisodemaintenance.png"
-    plugin_version = "0.1.1"
+    plugin_version = "0.2.0"
     plugin_author = "byangmath"
     author_url = "https://github.com/byangmath"
     plugin_config_prefix = "recentepisodemaintenance_"
@@ -358,9 +358,15 @@ class RecentEpisodeMaintenance(_PluginBase):
                 f"共 {len(history_pool)} 条；本轮最多执行 {operation_limit} 次操作，"
                 f"检查 {len(histories)} 条视频记录"
                 f"（待复查 {selection['pending']} 条，新记录 {selection['new']} 条，"
-                f"到期监测 {selection['monitoring']} 条，"
-                f"已完成 {selection['complete']} 条，需人工检查 {selection['attention']} 条）"
+                f"到期复查 {selection['monitoring']} 条）；"
+                f"当前状态：等待复查 {selection['monitoring_waiting']} 条，"
+                f"已完成 {selection['complete']} 条，需人工检查 {selection['attention']} 条"
             )
+            if selection["attention_items"]:
+                logger.warning(
+                    "[最近剧集维护] 需人工检查记录：\n"
+                    + "\n".join(f"- {item}" for item in selection["attention_items"])
+                )
         except Exception as err:
             logger.error(f"[最近剧集维护] 查询 MP 整理历史失败：{err}")
             return
@@ -410,8 +416,8 @@ class RecentEpisodeMaintenance(_PluginBase):
             message = f"{reorganizer.display_name(history)}：{preview.message}"
             result.add_error(message)
             logger.error(
-                f"[最近剧集维护] 获取 MP 整理预览失败 {message}｜"
-                f"文件：{reorganizer.target_path(history) or '未知文件'}"
+                f"[最近剧集维护] 预览失败 {reorganizer.display_name(history)}："
+                f"{preview.message}｜文件：{reorganizer.target_path(history) or '未知文件'}"
             )
             if not self._dry_run:
                 self._mark_processing_state(
@@ -494,12 +500,10 @@ class RecentEpisodeMaintenance(_PluginBase):
                         episode_history_keys,
                         expected_paths,
                     )
-                    comparison_details = (
-                        f"{episode.display_name}｜MP 预览文件："
-                        f"{expected_path.name if expected_path else '未知文件'}"
-                    )
+                    episode_label = episode.episode_label
+                    episode_file = expected_path or episode.path or "未知文件"
                     if not expected_path:
-                        result.add_error(f"{episode.display_name}：缺少 MP 整理预览")
+                        result.add_error(f"{episode_label}：缺少 MP 整理预览")
                         missing_preview_targets = (
                             episode_target_keys.get(episode.item_id) or set()
                         )
@@ -513,8 +517,8 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 self._STATE_PENDING_REFRESH,
                             )
                         logger.error(
-                            f"[最近剧集维护] 缺少 MP 整理预览，无法判断是否刷新 "
-                            f"{comparison_details}"
+                            f"[最近剧集维护] 刷新失败 {episode_label}："
+                            f"缺少 MP 整理预览｜文件：{episode_file}"
                         )
                         continue
 
@@ -522,10 +526,10 @@ class RecentEpisodeMaintenance(_PluginBase):
                         result.add_skipped(
                             *(episode_target_keys.get(episode.item_id) or {episode.item_id})
                         )
-                        prefix = "试运行：" if self._dry_run else ""
+                        prefix = "试运行" if self._dry_run else ""
                         logger.info(
-                            f"[最近剧集维护] {prefix}标题一致，跳过元数据刷新 "
-                            f"{comparison_details}"
+                            f"[最近剧集维护] {prefix}跳过 {episode_label}："
+                            f"标题一致，无需刷新元数据｜文件：{episode_file}"
                         )
                         if not self._enable_reorganize and not self._dry_run:
                             self._mark_processing_verified(
@@ -533,22 +537,18 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 episode_history_keys,
                             )
                         continue
-                    refresh_reason = (
-                        f"Jellyfin 标题“{episode.name or '未知标题'}”与 "
-                        f"MP 预览文件“{expected_path.name}”中的标题不一致"
-                    )
                     refresh_targets = episode_target_keys.get(episode.item_id) or set()
                     deferred_reorganize_targets.update(refresh_targets)
                     refresh_first_targets.update(refresh_targets)
                     for refresh_target in refresh_targets:
                         deferred_reorganize_reasons[refresh_target] = (
-                            f"{refresh_reason}，本轮先刷新元数据"
+                            "标题不一致，本轮先刷新元数据"
                         )
                     if result.operations_used >= result.operation_limit:
                         result.add_skipped(*refresh_targets)
                         for refresh_target in refresh_targets:
                             deferred_reorganize_reasons[refresh_target] = (
-                                f"{refresh_reason}，但已达到操作上限，元数据刷新尚未执行"
+                                "标题不一致，已达到操作上限，元数据刷新尚未执行"
                             )
                         if not self._dry_run:
                             self._mark_processing_state(
@@ -557,8 +557,8 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 self._STATE_PENDING_REFRESH,
                             )
                         logger.info(
-                            f"[最近剧集维护] 已达到单次操作上限，延后元数据刷新 "
-                            f"{comparison_details}"
+                            f"[最近剧集维护] 暂缓刷新 {episode_label}："
+                            f"已达到单次操作上限｜文件：{episode_file}"
                         )
                         continue
                     result.operations_used += 1
@@ -566,11 +566,11 @@ class RecentEpisodeMaintenance(_PluginBase):
                         result.refresh_previewed += 1
                         for refresh_target in refresh_targets:
                             deferred_reorganize_reasons[refresh_target] = (
-                                f"{refresh_reason}；试运行仅预览元数据刷新"
+                                "标题不一致，试运行仅预览元数据刷新"
                             )
                         logger.info(
-                            f"[最近剧集维护] 试运行：标题不一致，将完整刷新 "
-                            f"{comparison_details}"
+                            f"[最近剧集维护] 试运行刷新 {episode_label}："
+                            f"标题不一致，将完整刷新元数据和图片｜文件：{episode_file}"
                         )
                         continue
                     try:
@@ -582,12 +582,10 @@ class RecentEpisodeMaintenance(_PluginBase):
                             replace_images=replace_images,
                         )
                         result.refreshed += 1
-                        result.add_refreshed_title(
-                            comparison_details
-                        )
+                        result.add_refreshed_title(str(episode_file))
                         logger.info(
-                            f"[最近剧集维护] 标题不一致，已提交元数据和图片刷新 "
-                            f"{comparison_details}"
+                            f"[最近剧集维护] 刷新 {episode_label}："
+                            f"标题不一致，已提交元数据和图片刷新｜文件：{episode_file}"
                         )
                         self._mark_processing_state(
                             processing_state,
@@ -597,7 +595,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                         )
                         for refresh_target in refresh_targets:
                             deferred_reorganize_reasons[refresh_target] = (
-                                f"{refresh_reason}；已提交 Jellyfin 元数据刷新，等待后续确认"
+                                "标题不一致，本轮已提交元数据刷新"
                             )
                     except Exception as err:
                         self._mark_processing_state(
@@ -605,14 +603,14 @@ class RecentEpisodeMaintenance(_PluginBase):
                             episode_history_keys,
                             self._STATE_PENDING_REFRESH,
                         )
-                        result.add_error(f"{episode.display_name}：{err}")
+                        result.add_error(f"{episode_label}：{err}")
                         for refresh_target in refresh_targets:
                             deferred_reorganize_reasons[refresh_target] = (
-                                f"{refresh_reason}；Jellyfin 元数据刷新提交失败"
+                                "标题不一致，元数据刷新提交失败"
                             )
                         logger.error(
-                            f"[最近剧集维护] 标题不一致，提交元数据刷新失败 "
-                            f"{comparison_details}：{err}"
+                            f"[最近剧集维护] 刷新失败 {episode_label}："
+                            f"标题不一致；{err}｜文件：{episode_file}"
                         )
             else:
                 result.add_error("未找到可用的 Jellyfin 媒体服务器")
@@ -663,8 +661,8 @@ class RecentEpisodeMaintenance(_PluginBase):
                             sidecar_attempts=0,
                         )
                         logger.info(
-                            f"[最近剧集维护] 检测到既有重新整理记录附件不完整，"
-                            f"将补充刮削 {label}｜文件：{Path(expected_path).name}"
+                            f"[最近剧集维护] 补充刮削 {label}："
+                            f"既有重新整理记录附件不完整｜文件：{Path(expected_path).name}"
                         )
                 if (
                     target_key in deferred_reorganize_targets
@@ -674,14 +672,14 @@ class RecentEpisodeMaintenance(_PluginBase):
                     )
                 ):
                     result.add_skipped(target_key)
-                    prefix = "试运行：" if self._dry_run else ""
+                    prefix = "试运行" if self._dry_run else ""
                     defer_reason = deferred_reorganize_reasons.get(
                         target_key,
                         "等待后续确认",
                     )
                     logger.info(
-                        f"[最近剧集维护] {prefix}{defer_reason}，暂缓重新整理 "
-                        f"{label}｜文件：{current_file or '未知文件'}"
+                        f"[最近剧集维护] {prefix}暂缓重命名 {label}："
+                        f"{defer_reason}｜文件：{current_file or '未知文件'}"
                     )
                     continue
                 if not expected_path:
@@ -693,8 +691,8 @@ class RecentEpisodeMaintenance(_PluginBase):
                             self._STATE_PENDING_REORGANIZE,
                         )
                     logger.error(
-                        f"[最近剧集维护] 缺少 MP 整理预览，无法安全重新整理 {label}｜"
-                        f"文件：{current_file or '未知文件'}"
+                        f"[最近剧集维护] 重命名失败 {label}："
+                        f"缺少 MP 整理预览｜文件：{current_file or '未知文件'}"
                     )
                     continue
                 try:
@@ -717,7 +715,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                             sidecar_attempts=sidecar_attempts,
                         )
                         logger.info(
-                            f"[最近剧集维护] 重新整理附件已补齐 {label}｜"
+                            f"[最近剧集维护] 刮削完成 {label}：重新整理附件已补齐｜"
                             f"文件：{Path(expected_path).name}"
                         )
                     elif (
@@ -733,8 +731,8 @@ class RecentEpisodeMaintenance(_PluginBase):
                         sidecar_pending = True
                         sidecar_attempts = 0
                         logger.info(
-                            f"[最近剧集维护] 检测到既有重新整理记录附件不完整，"
-                            f"将补充刮削 {label}｜文件：{Path(expected_path).name}"
+                            f"[最近剧集维护] 补充刮削 {label}："
+                            f"既有重新整理记录附件不完整｜文件：{Path(expected_path).name}"
                         )
                     if sidecar_pending and sidecar_attempts >= self._MAX_SIDECAR_ATTEMPTS:
                         message = (
@@ -748,7 +746,11 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 {processing_key},
                                 self._STATE_ATTENTION,
                             )
-                        logger.error(f"[最近剧集维护] {message}")
+                        logger.error(
+                            f"[最近剧集维护] 停止刮削 {label}：连续重试 "
+                            f"{sidecar_attempts} 次仍缺少 NFO 或图片｜"
+                            f"文件：{Path(expected_path).name}"
+                        )
                         continue
 
                     if (
@@ -762,7 +764,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 processing_state,
                                 {processing_key},
                             )
-                        prefix = "试运行：" if self._dry_run else ""
+                        prefix = "试运行" if self._dry_run else ""
                         logger.info(
                             f"[最近剧集维护] {prefix}跳过 {label}：按当前命名规则预览，"
                             f"路径未变化｜{self._file_change_details(current_file, expected_path)}"
@@ -773,8 +775,8 @@ class RecentEpisodeMaintenance(_PluginBase):
                         if result.operations_used >= result.operation_limit:
                             result.add_skipped(target_key)
                             logger.info(
-                                f"[最近剧集维护] 试运行：已达到单次操作上限，"
-                                f"延后重新整理 {label}｜"
+                                f"[最近剧集维护] 试运行暂缓重命名 {label}："
+                                f"已达到单次操作上限｜"
                                 f"{self._file_change_details(current_file, expected_path)}"
                             )
                             continue
@@ -782,12 +784,12 @@ class RecentEpisodeMaintenance(_PluginBase):
                         result.previewed += 1
                         if sidecar_pending:
                             logger.info(
-                                f"[最近剧集维护] 试运行：{label} 将重试重新整理并补齐刮削附件｜"
-                                f"文件：{Path(expected_path).name}"
+                                f"[最近剧集维护] 试运行重命名 {label}："
+                                f"将重试重新整理并补齐刮削附件｜文件：{Path(expected_path).name}"
                             )
                         else:
                             logger.info(
-                                f"[最近剧集维护] 试运行：{label} 预计重新命名，"
+                                f"[最近剧集维护] 试运行重命名 {label}：预计重新命名，"
                                 f"由 MP 同步处理 {related_history_count} 条关联附件记录｜"
                                 f"{self._file_change_details(current_file, expected_path)}"
                             )
@@ -826,7 +828,11 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 self._STATE_ATTENTION,
                             )
                             result.add_error(message)
-                            logger.error(f"[最近剧集维护] {message}")
+                            logger.error(
+                                f"[最近剧集维护] 停止重命名 {label}：连续重新整理 "
+                                f"{rename_attempts} 次后路径仍会变化｜"
+                                f"{self._file_change_details(current_file, preview.target)}"
+                            )
                         else:
                             self._mark_processing_state(
                                 processing_state,
@@ -835,7 +841,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                             )
                             result.add_error(f"{label}：{preview.message}")
                             logger.error(
-                                f"[最近剧集维护] 重新整理预览失败 {label}：{preview.message}｜"
+                                f"[最近剧集维护] 预览失败 {label}：{preview.message}｜"
                                 f"{self._file_change_details(current_file, preview.target)}"
                             )
                         continue
@@ -847,7 +853,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                             self._STATE_PENDING_REORGANIZE,
                         )
                         logger.info(
-                            f"[最近剧集维护] 已达到单次操作上限，延后重新整理 {label}｜"
+                            f"[最近剧集维护] 暂缓重命名 {label}：已达到单次操作上限｜"
                             f"{self._file_change_details(current_file, expected_path)}"
                         )
                         continue
@@ -882,7 +888,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 "attempts": next_sidecar_attempts,
                             })
                             logger.info(
-                                f"[最近剧集维护] 已提交重新整理并等待刮削附件 {label}，"
+                                f"[最近剧集维护] 重命名 {label}：已提交重新整理，等待刮削附件；"
                                 f"由 MP 同步处理 {related_history_count} 条关联附件记录｜"
                                 f"{self._file_change_details(current_file, target)}"
                             )
@@ -906,7 +912,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                             )
                         result.add_error(f"{label}：{operation.message}")
                         logger.error(
-                            f"[最近剧集维护] 重新整理失败 {label}：{operation.message}｜"
+                            f"[最近剧集维护] 重命名失败 {label}：{operation.message}｜"
                             f"{self._file_change_details(current_file, operation.target)}"
                         )
                 except Exception as err:
@@ -918,7 +924,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                         )
                     result.add_error(f"{label}：{err}")
                     logger.error(
-                        f"[最近剧集维护] 重新整理失败 {label}：{err}｜"
+                        f"[最近剧集维护] 重命名失败 {label}：{err}｜"
                         f"文件：{current_file or '未知文件'}"
                     )
 
@@ -937,7 +943,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                 missing = missing_sidecars.get(processing_key)
                 if not missing:
                     result.reorganized += 1
-                    result.add_reorganized_title(self._result_title(label, target))
+                    result.add_reorganized_title(str(target or "未知文件"))
                     self._mark_processing_state(
                         processing_state,
                         {processing_key},
@@ -946,7 +952,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                         sidecar_attempts=attempts,
                     )
                     logger.info(
-                        f"[最近剧集维护] 重新整理及刮削附件已完成 {label}｜"
+                        f"[最近剧集维护] 重命名完成 {label}：刮削附件已补齐｜"
                         f"文件：{Path(target).name if target else '未知文件'}"
                     )
                     continue
@@ -972,7 +978,12 @@ class RecentEpisodeMaintenance(_PluginBase):
                         f"下次运行将重试（{attempts}/{self._MAX_SIDECAR_ATTEMPTS}）"
                     )
                 result.add_error(message)
-                logger.error(f"[最近剧集维护] {message}")
+                action = "停止刮削" if exhausted else "附件缺失"
+                logger.error(
+                    f"[最近剧集维护] {action} {label}：重新整理后缺少{missing_text}，"
+                    f"已尝试 {attempts}/{self._MAX_SIDECAR_ATTEMPTS} 次｜"
+                    f"文件：{Path(target).name if target else '未知文件'}"
+                )
 
         sidecars_complete = (
             bool(reorganized_sidecars) or sidecars_ready_for_scan
@@ -1124,15 +1135,11 @@ class RecentEpisodeMaintenance(_PluginBase):
             return f"文件：{current}"
         return f"原文件：{current}｜新文件：{target}"
 
-    @staticmethod
-    def _result_title(fallback: str, path: Any) -> str:
-        return Path(path).stem if path else fallback
-
     def _select_histories(
         self,
         histories: list[Any],
         reorganizer: MoviePilotReorganizer,
-    ) -> tuple[list[Any], dict[str, dict[str, Any]], dict[str, int]]:
+    ) -> tuple[list[Any], dict[str, dict[str, Any]], dict[str, Any]]:
         state = self._load_processing_state()
         keyed_histories = [
             (history, reorganizer.processing_key(history))
@@ -1167,11 +1174,15 @@ class RecentEpisodeMaintenance(_PluginBase):
             if key not in state
             or (state.get(key) or {}).get("status") not in known_statuses
         ]
-        monitoring = [
+        monitoring_all = [
             (history, key)
             for history, key in keyed_histories
             if (state.get(key) or {}).get("status") == self._STATE_MONITORING
-            and self._timestamp_is_due((state.get(key) or {}).get("next_preview_at"))
+        ]
+        monitoring = [
+            (history, key)
+            for history, key in monitoring_all
+            if self._timestamp_is_due((state.get(key) or {}).get("next_preview_at"))
         ]
         monitoring.sort(
             key=lambda item: str((state.get(item[1]) or {}).get("next_preview_at") or "")
@@ -1194,6 +1205,24 @@ class RecentEpisodeMaintenance(_PluginBase):
         pending_keys = {key for _, key in pending}
         new_keys = {key for _, key in new_items}
         monitoring_keys = {key for _, key in monitoring}
+        attention_items = []
+        for history, key in keyed_histories:
+            state_item = state.get(key) or {}
+            if state_item.get("status") != self._STATE_ATTENTION:
+                continue
+            reason = (
+                "刮削附件多次补齐失败"
+                if state_item.get("sidecar_pending")
+                else "多次重命名后路径仍变化"
+            )
+            target = (
+                state_item.get("expected_path")
+                or reorganizer.target_path(history)
+                or "未知文件"
+            )
+            attention_items.append(
+                f"{reorganizer.display_name(history)}：{reason}｜文件：{target}"
+            )
         return (
             [history for history, _ in selected],
             state,
@@ -1201,16 +1230,14 @@ class RecentEpisodeMaintenance(_PluginBase):
                 "pending": sum(1 for _, key in selected if key in pending_keys),
                 "new": sum(1 for _, key in selected if key in new_keys),
                 "monitoring": sum(1 for _, key in selected if key in monitoring_keys),
+                "monitoring_waiting": len(monitoring_all) - len(monitoring),
                 "complete": sum(
                     1
                     for _, key in keyed_histories
                     if (state.get(key) or {}).get("status") == self._STATE_COMPLETE
                 ),
-                "attention": sum(
-                    1
-                    for _, key in keyed_histories
-                    if (state.get(key) or {}).get("status") == self._STATE_ATTENTION
-                ),
+                "attention": len(attention_items),
+                "attention_items": attention_items,
             },
         )
 

@@ -38,13 +38,17 @@ class EpisodeItem:
         )
 
     @property
-    def display_name(self) -> str:
+    def episode_label(self) -> str:
         season = f"S{int(self.season_number):02d}" if self.season_number is not None else "S??"
         episode = f"E{int(self.episode_number):02d}" if self.episode_number is not None else "E??"
-        title = self.name or "未知标题"
         series = self.series_name or "未知剧集"
+        return f"{series} {season}{episode}"
+
+    @property
+    def display_name(self) -> str:
+        title = self.name or "未知标题"
         media_file = Path(self.path).name if self.path else "未知文件"
-        return f"{series} {season}{episode}｜Jellyfin 标题：{title}｜文件：{media_file}"
+        return f"{self.episode_label}｜Jellyfin 标题：{title}｜文件：{media_file}"
 
     def title_matches_filename(self) -> bool:
         """Check whether Jellyfin's episode title is the title stored in the media filename."""
