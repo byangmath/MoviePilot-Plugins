@@ -44,6 +44,60 @@ def test_summary_lists_bare_full_file_paths():
     assert "MP 预览文件" not in summary
 
 
+def test_summary_includes_queue_counts():
+    result = RunResult(
+        queue_counts={
+            "pending": 50,
+            "new": 0,
+            "monitoring": 1,
+            "monitoring_waiting": 2,
+            "sidecar_waiting": 3,
+            "cleanup_waiting": 4,
+            "complete": 26,
+            "attention": 5,
+        }
+    )
+
+    summary = result.summary()
+
+    assert "队列：" in summary
+    assert "当前状态：" in summary
+    assert "本轮待复查 50 条" in summary
+    assert "新记录 0 条" in summary
+    assert "到期复查 1 条" in summary
+    assert "当前等待复查 2 条" in summary
+    assert "等待附件 3 条" in summary
+    assert "等待清理 4 条" in summary
+    assert "已完成 26 条" in summary
+    assert "需人工检查 5 条" in summary
+
+
+def test_waiting_records_text_spacing():
+    assert RecentEpisodeMaintenance._waiting_records_text({}) == ""
+    assert RecentEpisodeMaintenance._waiting_records_text(
+        {"cleanup_waiting": 1}
+    ) == "，另有 1 条记录等待旧附件清理"
+    assert RecentEpisodeMaintenance._waiting_records_text(
+        {"sidecar_waiting": 2, "cleanup_waiting": 1}
+    ) == "，另有 2 条记录等待附件生成、1 条记录等待旧附件清理"
+    assert RecentEpisodeMaintenance._waiting_records_text(
+        {
+            "sidecar_waiting": 1,
+            "sidecar_waiting_items": [
+                "测试剧 S01E01｜文件：/library/show/new.mkv"
+            ],
+            "cleanup_waiting": 1,
+            "cleanup_waiting_items": [
+                "测试剧 S01E02｜旧文件：/library/show/old.mkv｜旧附件：/library/show/old.nfo"
+            ],
+        }
+    ) == (
+        "，另有 1 条记录等待附件生成：测试剧 S01E01｜文件：/library/show/new.mkv、"
+        "1 条记录等待旧附件清理：测试剧 S01E02｜旧文件：/library/show/old.mkv｜"
+        "旧附件：/library/show/old.nfo"
+    )
+
+
 def test_sidecar_checks_scan_shared_directory_once(tmp_path, monkeypatch):
     first = tmp_path / "Show S01E01.mkv"
     second = tmp_path / "Show S01E02.mkv"

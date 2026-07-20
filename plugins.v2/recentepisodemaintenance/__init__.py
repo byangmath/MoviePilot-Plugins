@@ -105,7 +105,7 @@ class RecentEpisodeMaintenance(_PluginBase):
     plugin_name = "最近剧集维护"
     plugin_desc = "维护 MoviePilot 最近整理入库的 Jellyfin 剧集"
     plugin_icon = "https://raw.githubusercontent.com/byangmath/MoviePilot-Plugins/main/icons/recentepisodemaintenance.png"
-    plugin_version = "0.2.1"
+    plugin_version = "0.2.2"
     plugin_author = "byangmath"
     author_url = "https://github.com/byangmath"
     plugin_config_prefix = "recentepisodemaintenance_"
@@ -369,6 +369,19 @@ class RecentEpisodeMaintenance(_PluginBase):
                 reorganizer=reorganizer,
             )
             result.reorganize_candidates = len(histories)
+            result.queue_counts = {
+                key: int(selection.get(key) or 0)
+                for key in (
+                    "pending",
+                    "new",
+                    "monitoring",
+                    "monitoring_waiting",
+                    "sidecar_waiting",
+                    "cleanup_waiting",
+                    "complete",
+                    "attention",
+                )
+            }
             logger.info(
                 f"[最近剧集维护] 查询 MP 最近 {self._days} 天成功视频整理记录，"
                 f"共 {len(history_pool)} 条；本轮最多执行 {operation_limit} 次操作，"
@@ -392,16 +405,7 @@ class RecentEpisodeMaintenance(_PluginBase):
         if not histories:
             if not self._dry_run:
                 self._save_processing_state(processing_state)
-            waiting_items = []
-            if selection["sidecar_waiting"]:
-                waiting_items.append(
-                    f"{selection['sidecar_waiting']} 条记录等待附件生成"
-                )
-            if selection["cleanup_waiting"]:
-                waiting_items.append(
-                    f"{selection['cleanup_waiting']} 条记录等待旧附件清理"
-                )
-            waiting_text = f"，另有{'、'.join(waiting_items)}" if waiting_items else ""
+            waiting_text = self._waiting_records_text(selection)
             logger.info(
                 "[最近剧集维护] 当前时间范围内没有到期待处理的整理记录"
                 f"{waiting_text}"
@@ -787,7 +791,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                         result.add_skipped(target_key)
                         logger.info(
                             f"[最近剧集维护] 等待附件 {label}：NFO 或图片仍在生成，"
-                            f"冷却期内不重复整理｜文件：{Path(expected_path).name}"
+                            f"冷却期内不重复整理｜文件：{expected_path}"
                         )
                         continue
                     if sidecar_pending and sidecar_attempts >= self._MAX_SIDECAR_ATTEMPTS:
@@ -827,7 +831,8 @@ class RecentEpisodeMaintenance(_PluginBase):
                             result.add_skipped(target_key)
                             logger.info(
                                 f"[最近剧集维护] 等待清理 {label}："
-                                "旧名称附件尚在安全等待期"
+                                "旧名称附件尚在安全等待期｜"
+                                f"{self._cleanup_waiting_file_details(cleanup_old_media_path, old_sidecars)}"
                             )
                             continue
                         elif not old_sidecars or not cleanup_old_media_path:
@@ -1745,6 +1750,24 @@ class RecentEpisodeMaintenance(_PluginBase):
                 "monitoring_waiting": len(monitoring_all) - len(monitoring),
                 "sidecar_waiting": len(sidecar_waiting),
                 "cleanup_waiting": len(cleanup_waiting),
+                "sidecar_waiting_items": [
+                    self._waiting_record_detail(
+                        history,
+                        reorganizer,
+                        state.get(key) or {},
+                        "sidecar",
+                    )
+                    for history, key in sidecar_waiting
+                ],
+                "cleanup_waiting_items": [
+                    self._waiting_record_detail(
+                        history,
+                        reorganizer,
+                        state.get(key) or {},
+                        "cleanup",
+                    )
+                    for history, key in cleanup_waiting
+                ],
                 "complete": sum(
                     1
                     for _, key in keyed_histories
@@ -1754,6 +1777,72 @@ class RecentEpisodeMaintenance(_PluginBase):
                 "attention_items": attention_items,
             },
         )
+
+    @classmethod
+    def _waiting_records_text(cls, selection: dict[str, Any]) -> str:
+        waiting_items = []
+        if selection.get("sidecar_waiting"):
+            text = f"{selection['sidecar_waiting']} 条记录等待附件生成"
+            details = cls._limited_waiting_details(
+                selection.get("sidecar_waiting_items") or []
+            )
+            waiting_items.append(f"{text}：{details}" if details else text)
+        if selection.get("cleanup_waiting"):
+            text = f"{selection['cleanup_waiting']} 条记录等待旧附件清理"
+            details = cls._limited_waiting_details(
+                selection.get("cleanup_waiting_items") or []
+            )
+            waiting_items.append(f"{text}：{details}" if details else text)
+        return f"，另有 {'、'.join(waiting_items)}" if waiting_items else ""
+
+    @classmethod
+    def _limited_waiting_details(cls, items: list[str], limit: int = 3) -> str:
+        details = [str(item).strip() for item in items if str(item).strip()]
+        if not details:
+            return ""
+        text = "；".join(details[:limit])
+        omitted = len(details) - limit
+        if omitted > 0:
+            text += f"；另有 {omitted} 条"
+        return text
+
+    @classmethod
+    def _waiting_record_detail(
+        cls,
+        history: Any,
+        reorganizer: MoviePilotReorganizer,
+        state_item: dict[str, Any],
+        waiting_type: str,
+    ) -> str:
+        label = reorganizer.display_name(history)
+        if waiting_type == "cleanup":
+            details = cls._cleanup_waiting_file_details(
+                state_item.get("cleanup_old_media_path"),
+                state_item.get("old_sidecars") or [],
+            )
+            return f"{label}｜{details}"
+        target = (
+            state_item.get("expected_path")
+            or reorganizer.target_path(history)
+            or "未知文件"
+        )
+        return f"{label}｜文件：{target}"
+
+    @classmethod
+    def _cleanup_waiting_file_details(
+        cls,
+        old_media_path: Any,
+        old_sidecars: list[Any],
+    ) -> str:
+        sidecars = [
+            str(path).strip()
+            for path in old_sidecars
+            if str(path).strip()
+        ]
+        text = f"旧文件：{old_media_path or '未知旧文件'}"
+        if sidecars:
+            text += f"｜旧附件：{cls._limited_waiting_details(sidecars)}"
+        return text
 
     @classmethod
     def _sidecar_recheck_at(cls) -> str:

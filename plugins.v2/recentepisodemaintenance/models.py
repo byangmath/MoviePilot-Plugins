@@ -99,6 +99,7 @@ class RunResult:
     refreshed_titles: list[str] = field(default_factory=list)
     reorganized_titles: list[str] = field(default_factory=list)
     failed_titles: list[str] = field(default_factory=list)
+    queue_counts: dict[str, int] = field(default_factory=dict)
     _skipped_keys: set[str] = field(default_factory=set, repr=False)
 
     def add_error(self, message: str, file_path: str | Path | None = None) -> None:
@@ -128,17 +129,31 @@ class RunResult:
             self.skipped += 1
 
     def summary(self) -> str:
-        lines = [
-            f"本轮检查 MP 视频整理记录 {self.reorganize_candidates} 条",
-            f"刷新和重新整理操作 {self.operations_used}/{self.operation_limit} 次",
-            f"重新整理试运行预览 {self.previewed} 条",
-            f"重新整理成功 {self.reorganized} 集",
-            f"匹配到 Jellyfin 剧集 {self.refresh_candidates} 集",
-            f"元数据刷新试运行预览 {self.refresh_previewed} 集",
-            f"元数据刷新成功 {self.refreshed} 集",
-            f"跳过 {self.skipped} 集",
-            f"失败 {self.failed} 集",
-        ]
+        lines = [f"本轮检查：MP 视频整理记录 {self.reorganize_candidates} 条"]
+        if self.queue_counts:
+            lines[0] += (
+                "；队列："
+                f"本轮待复查 {self.queue_counts.get('pending', 0)} 条，"
+                f"新记录 {self.queue_counts.get('new', 0)} 条，"
+                f"到期复查 {self.queue_counts.get('monitoring', 0)} 条"
+            )
+            lines.append(
+                "当前状态："
+                f"当前等待复查 {self.queue_counts.get('monitoring_waiting', 0)} 条，"
+                f"等待附件 {self.queue_counts.get('sidecar_waiting', 0)} 条，"
+                f"等待清理 {self.queue_counts.get('cleanup_waiting', 0)} 条，"
+                f"已完成 {self.queue_counts.get('complete', 0)} 条，"
+                f"需人工检查 {self.queue_counts.get('attention', 0)} 条"
+            )
+        lines.extend(
+            [
+                f"操作统计：刷新和重新整理 {self.operations_used}/{self.operation_limit} 次；"
+                f"重新整理试运行预览 {self.previewed} 条，成功 {self.reorganized} 集；"
+                f"元数据刷新试运行预览 {self.refresh_previewed} 集，成功 {self.refreshed} 集",
+                f"匹配结果：匹配到 Jellyfin 剧集 {self.refresh_candidates} 集，"
+                f"跳过 {self.skipped} 集，失败 {self.failed} 集",
+            ]
+        )
         if self.refreshed_titles:
             lines.append("元数据刷新成功剧集：")
             lines.extend(f"- {title}" for title in self.refreshed_titles)

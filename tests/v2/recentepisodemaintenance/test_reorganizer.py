@@ -224,6 +224,7 @@ def test_selection_defers_pending_sidecars_until_recheck_time():
             "status": plugin._STATE_PENDING_REORGANIZE,
             "sidecar_pending": True,
             "sidecar_check_after": "2999-01-01T00:00:00",
+            "expected_path": "/library/show/Season 01/测试剧 S01E02 - 新标题.mkv",
         },
     }
 
@@ -235,6 +236,9 @@ def test_selection_defers_pending_sidecars_until_recheck_time():
     assert selected == [due]
     assert selection["pending"] == 1
     assert selection["sidecar_waiting"] == 1
+    assert selection["sidecar_waiting_items"] == [
+        "测试剧 S01E02｜文件：/library/show/Season 01/测试剧 S01E02 - 新标题.mkv"
+    ]
 
 
 def test_clearing_sidecar_pending_also_clears_recheck_time():
@@ -316,6 +320,11 @@ def test_selection_defers_old_sidecar_cleanup_until_due():
             "status": plugin._STATE_PENDING_REORGANIZE,
             "cleanup_pending": True,
             "cleanup_check_after": "2999-01-01T00:00:00",
+            "cleanup_old_media_path": "/library/show/Season 01/测试剧 S01E02 - 旧标题.mkv",
+            "old_sidecars": [
+                "/library/show/Season 01/测试剧 S01E02 - 旧标题.nfo",
+                "/library/show/Season 01/测试剧 S01E02 - 旧标题.jpg",
+            ],
         },
     }
 
@@ -327,6 +336,11 @@ def test_selection_defers_old_sidecar_cleanup_until_due():
     assert selected == [due]
     assert selection["pending"] == 1
     assert selection["cleanup_waiting"] == 1
+    assert selection["cleanup_waiting_items"] == [
+        "测试剧 S01E02｜旧文件：/library/show/Season 01/测试剧 S01E02 - 旧标题.mkv｜"
+        "旧附件：/library/show/Season 01/测试剧 S01E02 - 旧标题.nfo；"
+        "/library/show/Season 01/测试剧 S01E02 - 旧标题.jpg"
+    ]
 
 
 def test_verified_record_remains_pending_until_old_sidecar_cleanup():
