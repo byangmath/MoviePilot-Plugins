@@ -194,3 +194,94 @@ def test_selection_lists_attention_records_with_reason_and_path():
         "测试剧 S01E01：刮削附件多次补齐失败｜"
         "文件：/library/show/Season 01/测试剧 S01E01.mkv"
     ]
+
+def test_selection_defers_pending_sidecars_until_recheck_time():
+    plugin = RecentEpisodeMaintenance()
+    plugin._max_items = 10
+    reorganizer = MoviePilotReorganizer(logger=None)
+    due = history(
+        history_id=1,
+        source="/source/show/due.mkv",
+        dest="/library/show/Season 01/测试剧 S01E01.mkv",
+        date="2026-07-19 12:00:00",
+        download_hash="due-sidecar",
+    )
+    waiting = history(
+        history_id=2,
+        source="/source/show/waiting.mkv",
+        dest="/library/show/Season 01/测试剧 S01E02.mkv",
+        date="2026-07-19 12:01:00",
+        download_hash="waiting-sidecar",
+    )
+    waiting.episodes = "E02"
+    plugin._load_processing_state = lambda: {
+        reorganizer.processing_key(due): {
+            "status": plugin._STATE_PENDING_REORGANIZE,
+            "sidecar_pending": True,
+            "sidecar_check_after": "2000-01-01T00:00:00",
+        },
+        reorganizer.processing_key(waiting): {
+            "status": plugin._STATE_PENDING_REORGANIZE,
+            "sidecar_pending": True,
+            "sidecar_check_after": "2999-01-01T00:00:00",
+        },
+    }
+
+    selected, _, selection = plugin._select_histories(
+        histories=[due, waiting],
+        reorganizer=reorganizer,
+    )
+
+    assert selected == [due]
+    assert selection["pending"] == 1
+    assert selection["sidecar_waiting"] == 1
+
+
+def test_clearing_sidecar_pending_also_clears_recheck_time():
+    plugin = RecentEpisodeMaintenance()
+    state = {
+        "episode": {
+            "status": plugin._STATE_PENDING_REORGANIZE,
+            "sidecar_pending": True,
+            "sidecar_attempts": 1,
+            "sidecar_check_after": "2999-01-01T00:00:00",
+        }
+    }
+
+    plugin._mark_processing_state(
+        state,
+        {"episode"},
+        plugin._STATE_PENDING_REORGANIZE,
+        sidecar_pending=False,
+    )
+
+    assert state["episode"]["sidecar_pending"] is False
+    assert "sidecar_check_after" not in state["episode"]
+
+def test_selection_migrates_pending_sidecars_without_recheck_time():
+    plugin = RecentEpisodeMaintenance()
+    plugin._max_items = 10
+    reorganizer = MoviePilotReorganizer(logger=None)
+    video = history(
+        history_id=1,
+        source="/source/show/episode.mkv",
+        dest="/library/show/Season 01/测试剧 S01E01.mkv",
+        date="2026-07-19 12:00:00",
+    )
+    key = reorganizer.processing_key(video)
+    plugin._load_processing_state = lambda: {
+        key: {
+            "status": plugin._STATE_PENDING_REORGANIZE,
+            "sidecar_pending": True,
+            "sidecar_attempts": 1,
+        }
+    }
+
+    selected, state, selection = plugin._select_histories(
+        histories=[video],
+        reorganizer=reorganizer,
+    )
+
+    assert selected == []
+    assert selection["sidecar_waiting"] == 1
+    assert state[key]["sidecar_check_after"]

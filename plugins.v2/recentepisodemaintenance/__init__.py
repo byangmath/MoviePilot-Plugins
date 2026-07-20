@@ -51,6 +51,7 @@ class RecentEpisodeMaintenance(_PluginBase):
     _MAX_SIDECAR_ATTEMPTS = 2
     _SIDECAR_WAIT_SECONDS = 60
     _SIDECAR_POLL_SECONDS = 5
+    _SIDECAR_RECHECK_MINUTES = 5
     _PREVIEW_CACHE_HOURS = 24
     _INSPECTION_MULTIPLIER = 5
     _CRON_HINT_EXPRESSION = (
@@ -360,7 +361,8 @@ class RecentEpisodeMaintenance(_PluginBase):
                 f"（待复查 {selection['pending']} 条，新记录 {selection['new']} 条，"
                 f"到期复查 {selection['monitoring']} 条）；"
                 f"当前状态：等待复查 {selection['monitoring_waiting']} 条，"
-                f"已完成 {selection['complete']} 条，需人工检查 {selection['attention']} 条"
+                f"等待附件 {selection['sidecar_waiting']} 条，已完成 {selection['complete']} 条，"
+                f"需人工检查 {selection['attention']} 条"
             )
             if selection["attention_items"]:
                 logger.warning(
@@ -374,7 +376,15 @@ class RecentEpisodeMaintenance(_PluginBase):
         if not histories:
             if not self._dry_run:
                 self._save_processing_state(processing_state)
-            logger.info("[最近剧集维护] 当前时间范围内没有待处理的整理记录")
+            waiting_text = (
+                f"，另有 {selection['sidecar_waiting']} 条记录等待附件生成"
+                if selection["sidecar_waiting"]
+                else ""
+            )
+            logger.info(
+                "[最近剧集维护] 当前时间范围内没有到期待处理的整理记录"
+                f"{waiting_text}"
+            )
             return
 
         client: JellyfinServiceClient | None = None
@@ -659,6 +669,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                             self._STATE_PENDING_REORGANIZE,
                             sidecar_pending=True,
                             sidecar_attempts=0,
+                            sidecar_check_after=self._sidecar_recheck_at(),
                         )
                         logger.info(
                             f"[最近剧集维护] 补充刮削 {label}："
@@ -700,6 +711,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                     rename_attempts = int(state_item.get("rename_attempts") or 0)
                     sidecar_pending = bool(state_item.get("sidecar_pending"))
                     sidecar_attempts = int(state_item.get("sidecar_attempts") or 0)
+                    sidecar_check_after = state_item.get("sidecar_check_after")
                     same_path = self._same_path(current_file, expected_path)
                     if sidecar_pending and not self._missing_reorganized_sidecars(
                         expected_path,
@@ -734,6 +746,16 @@ class RecentEpisodeMaintenance(_PluginBase):
                             f"[最近剧集维护] 补充刮削 {label}："
                             f"既有重新整理记录附件不完整｜文件：{Path(expected_path).name}"
                         )
+                    if (
+                        sidecar_pending
+                        and not self._timestamp_is_due(sidecar_check_after)
+                    ):
+                        result.add_skipped(target_key)
+                        logger.info(
+                            f"[最近剧集维护] 等待附件 {label}：NFO 或图片仍在生成，"
+                            f"冷却期内不重复整理｜文件：{Path(expected_path).name}"
+                        )
+                        continue
                     if sidecar_pending and sidecar_attempts >= self._MAX_SIDECAR_ATTEMPTS:
                         message = (
                             f"{label} 已连续触发刮削 {sidecar_attempts} 次，"
@@ -966,24 +988,27 @@ class RecentEpisodeMaintenance(_PluginBase):
                     status,
                     sidecar_pending=True,
                     sidecar_attempts=attempts,
+                    sidecar_check_after=(
+                        None if exhausted else self._sidecar_recheck_at()
+                    ),
                 )
                 if exhausted:
                     message = (
                         f"{label}：重新整理后仍缺少{missing_text}，已连续尝试 {attempts} 次，"
                         "请检查 MoviePilot 刮削日志"
                     )
-                else:
-                    message = (
-                        f"{label}：重新整理后缺少{missing_text}，"
-                        f"下次运行将重试（{attempts}/{self._MAX_SIDECAR_ATTEMPTS}）"
+                    result.add_error(message, target)
+                    logger.error(
+                        f"[最近剧集维护] 停止刮削 {label}：重新整理后缺少{missing_text}，"
+                        f"已尝试 {attempts}/{self._MAX_SIDECAR_ATTEMPTS} 次｜"
+                        f"文件：{Path(target).name if target else '未知文件'}"
                     )
-                result.add_error(message, target)
-                action = "停止刮削" if exhausted else "附件缺失"
-                logger.error(
-                    f"[最近剧集维护] {action} {label}：重新整理后缺少{missing_text}，"
-                    f"已尝试 {attempts}/{self._MAX_SIDECAR_ATTEMPTS} 次｜"
-                    f"文件：{Path(target).name if target else '未知文件'}"
-                )
+                else:
+                    logger.warning(
+                        f"[最近剧集维护] 等待附件 {label}：重新整理后仍缺少{missing_text}，"
+                        f"最早在 {self._SIDECAR_RECHECK_MINUTES} 分钟后的下一轮复查｜"
+                        f"文件：{Path(target).name if target else '未知文件'}"
+                    )
 
         sidecars_complete = (
             bool(reorganized_sidecars) or sidecars_ready_for_scan
@@ -1162,10 +1187,31 @@ class RecentEpisodeMaintenance(_PluginBase):
             self._STATE_COMPLETE,
             self._STATE_ATTENTION,
         }
-        pending = [
+        pending_all = [
             (history, key)
             for history, key in keyed_histories
             if (state.get(key) or {}).get("status") in pending_statuses
+        ]
+        for _, key in pending_all:
+            state_item = dict(state.get(key) or {})
+            if state_item.get("sidecar_pending") and not state_item.get(
+                "sidecar_check_after"
+            ):
+                state_item["sidecar_check_after"] = self._sidecar_recheck_at()
+                state[key] = state_item
+        sidecar_waiting = [
+            (history, key)
+            for history, key in pending_all
+            if (state.get(key) or {}).get("sidecar_pending")
+            and not self._timestamp_is_due(
+                (state.get(key) or {}).get("sidecar_check_after")
+            )
+        ]
+        sidecar_waiting_keys = {key for _, key in sidecar_waiting}
+        pending = [
+            (history, key)
+            for history, key in pending_all
+            if key not in sidecar_waiting_keys
         ]
         pending.sort(key=lambda item: str((state.get(item[1]) or {}).get("updated_at") or ""))
         new_items = [
@@ -1231,6 +1277,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                 "new": sum(1 for _, key in selected if key in new_keys),
                 "monitoring": sum(1 for _, key in selected if key in monitoring_keys),
                 "monitoring_waiting": len(monitoring_all) - len(monitoring),
+                "sidecar_waiting": len(sidecar_waiting),
                 "complete": sum(
                     1
                     for _, key in keyed_histories
@@ -1240,6 +1287,12 @@ class RecentEpisodeMaintenance(_PluginBase):
                 "attention_items": attention_items,
             },
         )
+
+    @classmethod
+    def _sidecar_recheck_at(cls) -> str:
+        return (
+            datetime.now() + timedelta(minutes=cls._SIDECAR_RECHECK_MINUTES)
+        ).isoformat(timespec="seconds")
 
     @staticmethod
     def _timestamp_is_due(value: Any) -> bool:
@@ -1340,6 +1393,7 @@ class RecentEpisodeMaintenance(_PluginBase):
         next_preview_at: str | None = None,
         sidecar_pending: bool | None = None,
         sidecar_attempts: int | None = None,
+        sidecar_check_after: str | None = None,
     ) -> None:
         updated_at = datetime.now().isoformat(timespec="seconds")
         for key in keys:
@@ -1361,12 +1415,19 @@ class RecentEpisodeMaintenance(_PluginBase):
                 item["sidecar_pending"] = sidecar_pending
             if sidecar_attempts is not None:
                 item["sidecar_attempts"] = sidecar_attempts
+            if sidecar_check_after is not None:
+                item["sidecar_check_after"] = sidecar_check_after
+            if sidecar_pending is False:
+                item.pop("sidecar_check_after", None)
             if status in {
                 RecentEpisodeMaintenance._STATE_COMPLETE,
                 RecentEpisodeMaintenance._STATE_MONITORING,
             }:
                 item.pop("sidecar_pending", None)
                 item.pop("sidecar_attempts", None)
+                item.pop("sidecar_check_after", None)
+            elif status == RecentEpisodeMaintenance._STATE_ATTENTION:
+                item.pop("sidecar_check_after", None)
             state[key] = item
 
     def _get_jellyfin_client(self) -> JellyfinServiceClient | None:
