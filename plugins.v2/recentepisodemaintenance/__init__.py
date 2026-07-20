@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from hashlib import sha256
 from os import scandir
 from pathlib import Path
+from shutil import rmtree
 from threading import Lock
 from time import monotonic, sleep
 from typing import Any
@@ -52,8 +54,13 @@ class RecentEpisodeMaintenance(_PluginBase):
     _SIDECAR_WAIT_SECONDS = 60
     _SIDECAR_POLL_SECONDS = 5
     _SIDECAR_RECHECK_MINUTES = 5
+    _OLD_SIDECAR_CLEANUP_MINUTES = 10
+    _OLD_SIDECAR_VERIFY_MINUTES = 10
+    _OLD_SIDECAR_MAX_PASSES = 2
     _PREVIEW_CACHE_HOURS = 24
     _INSPECTION_MULTIPLIER = 5
+    _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".avif"}
+    _SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".sub", ".vtt", ".sup"}
     _CRON_HINT_EXPRESSION = (
         "{{ (() => {"
         "const value = String(cron || '').trim();"
@@ -117,6 +124,7 @@ class RecentEpisodeMaintenance(_PluginBase):
         self._enable_refresh = bool(config.get("enable_refresh", True))
         self._enable_reorganize = bool(config.get("enable_reorganize", False))
         self._scan_after_reorganize = bool(config.get("scan_after_reorganize", True))
+        self._cleanup_old_sidecars = bool(config.get("cleanup_old_sidecars", True))
         self._skip_same_name = bool(config.get("skip_same_name", True))
         self._refresh_mode = str(config.get("refresh_mode") or "all")
         if self._refresh_mode not in {"scan", "missing", "all"}:
@@ -242,6 +250,12 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 "重新整理成功后通知 Jellyfin 扫描媒体库",
                             ),
                             self._switch(
+                                "cleanup_old_sidecars",
+                                "清理旧名称附件",
+                                6,
+                                "确认新视频、NFO 和图片就绪后，延迟清理本次重命名留下的旧名称附件",
+                            ),
+                            self._switch(
                                 "skip_same_name",
                                 "跳过命名未变化的文件",
                                 6,
@@ -297,6 +311,7 @@ class RecentEpisodeMaintenance(_PluginBase):
             "enable_refresh": True,
             "enable_reorganize": False,
             "scan_after_reorganize": True,
+            "cleanup_old_sidecars": True,
             "skip_same_name": True,
             "media_server_name": self._media_server_name or default_media_server,
             "library_ids": self._library_ids_selection(self._library_ids),
@@ -361,8 +376,9 @@ class RecentEpisodeMaintenance(_PluginBase):
                 f"（待复查 {selection['pending']} 条，新记录 {selection['new']} 条，"
                 f"到期复查 {selection['monitoring']} 条）；"
                 f"当前状态：等待复查 {selection['monitoring_waiting']} 条，"
-                f"等待附件 {selection['sidecar_waiting']} 条，已完成 {selection['complete']} 条，"
-                f"需人工检查 {selection['attention']} 条"
+                f"等待附件 {selection['sidecar_waiting']} 条，"
+                f"等待清理 {selection['cleanup_waiting']} 条，"
+                f"已完成 {selection['complete']} 条，需人工检查 {selection['attention']} 条"
             )
             if selection["attention_items"]:
                 logger.warning(
@@ -376,11 +392,16 @@ class RecentEpisodeMaintenance(_PluginBase):
         if not histories:
             if not self._dry_run:
                 self._save_processing_state(processing_state)
-            waiting_text = (
-                f"，另有 {selection['sidecar_waiting']} 条记录等待附件生成"
-                if selection["sidecar_waiting"]
-                else ""
-            )
+            waiting_items = []
+            if selection["sidecar_waiting"]:
+                waiting_items.append(
+                    f"{selection['sidecar_waiting']} 条记录等待附件生成"
+                )
+            if selection["cleanup_waiting"]:
+                waiting_items.append(
+                    f"{selection['cleanup_waiting']} 条记录等待旧附件清理"
+                )
+            waiting_text = f"，另有{'、'.join(waiting_items)}" if waiting_items else ""
             logger.info(
                 "[最近剧集维护] 当前时间范围内没有到期待处理的整理记录"
                 f"{waiting_text}"
@@ -650,6 +671,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                 expected_path = expected_paths.get(processing_key)
                 state_hint = processing_state.get(processing_key) or {}
                 sidecar_pending_hint = bool(state_hint.get("sidecar_pending"))
+                cleanup_pending_hint = bool(state_hint.get("cleanup_pending"))
                 if (
                     not sidecar_pending_hint
                     and expected_path
@@ -678,7 +700,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                 if (
                     target_key in deferred_reorganize_targets
                     and not (
-                        sidecar_pending_hint
+                        (sidecar_pending_hint or cleanup_pending_hint)
                         and target_key not in refresh_first_targets
                     )
                 ):
@@ -706,19 +728,31 @@ class RecentEpisodeMaintenance(_PluginBase):
                         f"缺少 MP 整理预览｜文件：{current_file or '未知文件'}"
                     )
                     continue
+                protected_danmu: list[str] = []
+                danmu_settle_issues: list[str] = []
                 try:
                     state_item = processing_state.get(processing_key) or {}
                     rename_attempts = int(state_item.get("rename_attempts") or 0)
                     sidecar_pending = bool(state_item.get("sidecar_pending"))
                     sidecar_attempts = int(state_item.get("sidecar_attempts") or 0)
                     sidecar_check_after = state_item.get("sidecar_check_after")
+                    cleanup_pending = bool(state_item.get("cleanup_pending"))
+                    old_sidecars = [
+                        str(path)
+                        for path in state_item.get("old_sidecars") or []
+                        if path
+                    ]
+                    cleanup_old_media_path = state_item.get("cleanup_old_media_path")
+                    cleanup_check_after = state_item.get("cleanup_check_after")
+                    cleanup_passes = int(state_item.get("cleanup_passes") or 0)
                     same_path = self._same_path(current_file, expected_path)
                     if sidecar_pending and not self._missing_reorganized_sidecars(
                         expected_path,
                         sidecar_directory_cache,
                     ):
                         sidecar_pending = False
-                        sidecars_ready_for_scan = True
+                        if not cleanup_pending or not self._cleanup_old_sidecars:
+                            sidecars_ready_for_scan = True
                         self._mark_processing_state(
                             processing_state,
                             {processing_key},
@@ -775,6 +809,99 @@ class RecentEpisodeMaintenance(_PluginBase):
                         )
                         continue
 
+                    if cleanup_pending and not sidecar_pending:
+                        if not self._cleanup_old_sidecars:
+                            self._mark_processing_state(
+                                processing_state,
+                                {processing_key},
+                                self._STATE_PENDING_REORGANIZE,
+                                cleanup_pending=False,
+                            )
+                            cleanup_pending = False
+                            sidecars_ready_for_scan = True
+                            logger.info(
+                                f"[最近剧集维护] 跳过旧附件清理 {label}："
+                                "配置已关闭"
+                            )
+                        elif not self._timestamp_is_due(cleanup_check_after):
+                            result.add_skipped(target_key)
+                            logger.info(
+                                f"[最近剧集维护] 等待清理 {label}："
+                                "旧名称附件尚在安全等待期"
+                            )
+                            continue
+                        elif not old_sidecars or not cleanup_old_media_path:
+                            self._mark_processing_state(
+                                processing_state,
+                                {processing_key},
+                                self._STATE_PENDING_REORGANIZE,
+                                cleanup_pending=False,
+                            )
+                            cleanup_pending = False
+                            sidecars_ready_for_scan = True
+                        else:
+                            deleted, renamed, cleanup_issues = self._cleanup_old_sidecar_snapshot(
+                                old_sidecars,
+                                cleanup_old_media_path,
+                                expected_path,
+                            )
+                            next_cleanup_pass = cleanup_passes + 1
+                            if next_cleanup_pass < self._OLD_SIDECAR_MAX_PASSES:
+                                self._mark_processing_state(
+                                    processing_state,
+                                    {processing_key},
+                                    self._STATE_PENDING_REORGANIZE,
+                                    cleanup_pending=True,
+                                    old_sidecars=old_sidecars,
+                                    cleanup_old_media_path=cleanup_old_media_path,
+                                    cleanup_check_after=self._old_sidecar_cleanup_at(
+                                        verify=True
+                                    ),
+                                    cleanup_passes=next_cleanup_pass,
+                                )
+                                issue_text = (
+                                    f"，{len(cleanup_issues)} 个附件待复查"
+                                    if cleanup_issues
+                                    else ""
+                                )
+                                sidecars_ready_for_scan = True
+                                logger.info(
+                                    f"[最近剧集维护] 清理旧附件 {label}："
+                                    f"删除 {len(deleted)} 个、改名 {len(renamed)} 个，"
+                                    f"扫描后复查是否重新生成{issue_text}"
+                                )
+                                continue
+                            if cleanup_issues:
+                                message = (
+                                    f"{label}：旧名称附件清理失败；"
+                                    + "；".join(cleanup_issues)
+                                )
+                                result.add_error(message, expected_path)
+                                self._mark_processing_state(
+                                    processing_state,
+                                    {processing_key},
+                                    self._STATE_ATTENTION,
+                                    cleanup_pending=True,
+                                    old_sidecars=old_sidecars,
+                                    cleanup_old_media_path=cleanup_old_media_path,
+                                    cleanup_passes=next_cleanup_pass,
+                                )
+                                logger.error(
+                                    f"[最近剧集维护] 清理失败 {label}："
+                                    f"{len(cleanup_issues)} 个旧名称附件仍需人工检查"
+                                )
+                                continue
+                            self._mark_processing_state(
+                                processing_state,
+                                {processing_key},
+                                self._STATE_PENDING_REORGANIZE,
+                                cleanup_pending=False,
+                            )
+                            cleanup_pending = False
+                            logger.info(
+                                f"[最近剧集维护] 清理完成 {label}："
+                                f"复查删除 {len(deleted)} 个、改名 {len(renamed)} 个旧名称附件"
+                            )
                     if (
                         self._skip_same_name
                         and not sidecar_pending
@@ -879,11 +1006,79 @@ class RecentEpisodeMaintenance(_PluginBase):
                             f"{self._file_change_details(current_file, expected_path)}"
                         )
                         continue
+                    cleanup_snapshot = []
+                    protected_danmu = []
+                    if (
+                        self._cleanup_old_sidecars
+                        and not sidecar_pending
+                        and not same_path
+                    ):
+                        cleanup_snapshot = self._snapshot_old_sidecars(
+                            current_file,
+                            expected_path,
+                        )
+                    if cleanup_snapshot and not self._dry_run:
+                        protected_danmu, protection_issues = self._protect_danmu_sidecars(
+                            cleanup_snapshot,
+                            current_file,
+                        )
+                        if protection_issues:
+                            _, _, restore_issues = self._cleanup_old_sidecar_snapshot(
+                                protected_danmu,
+                                current_file,
+                                current_file,
+                            )
+                            issue_text = "；".join(protection_issues + restore_issues)
+                            self._mark_processing_state(
+                                processing_state,
+                                {processing_key},
+                                self._STATE_PENDING_REORGANIZE,
+                            )
+                            result.add_error(
+                                f"{label}：弹幕保护失败；{issue_text}",
+                                current_file,
+                            )
+                            logger.error(
+                                f"[最近剧集维护] 重命名失败 {label}："
+                                f"弹幕保护失败；{issue_text}｜"
+                                f"文件：{current_file or '未知文件'}"
+                            )
+                            continue
                     result.operations_used += 1
-                    operation = reorganizer.reorganize(
-                        history=history,
-                        skip_same_name=False if sidecar_pending else self._skip_same_name,
-                    )
+                    operation = None
+                    danmu_settle_issues = []
+                    try:
+                        operation = reorganizer.reorganize(
+                            history=history,
+                            skip_same_name=(
+                                False if sidecar_pending else self._skip_same_name
+                            ),
+                        )
+                    finally:
+                        if protected_danmu:
+                            settle_target = self._danmu_settle_target(
+                                operation,
+                                current_file,
+                                expected_path,
+                            )
+                            if settle_target:
+                                _, _, danmu_settle_issues = (
+                                    self._cleanup_old_sidecar_snapshot(
+                                        protected_danmu,
+                                        current_file,
+                                        settle_target,
+                                    )
+                                )
+                    if danmu_settle_issues:
+                        result.add_error(
+                            f"{label}：弹幕归位失败；"
+                            + "；".join(danmu_settle_issues),
+                            operation.target or expected_path or current_file,
+                        )
+                        logger.error(
+                            f"[最近剧集维护] 弹幕归位失败 {label}："
+                            f"{len(danmu_settle_issues)} 个文件仍需后续复查"
+                        )
                     if operation.success:
                         if self._dry_run:
                             result.previewed += 1
@@ -891,6 +1086,21 @@ class RecentEpisodeMaintenance(_PluginBase):
                             sidecar_directory_cache.clear()
                             target = operation.target or expected_path or current_file
                             next_sidecar_attempts = sidecar_attempts + 1 if sidecar_pending else 1
+                            cleanup_updates = {}
+                            if not sidecar_pending:
+                                cleanup_updates = {
+                                    "cleanup_pending": bool(cleanup_snapshot),
+                                    "old_sidecars": cleanup_snapshot,
+                                    "cleanup_old_media_path": (
+                                        current_file if cleanup_snapshot else None
+                                    ),
+                                    "cleanup_check_after": (
+                                        self._old_sidecar_cleanup_at()
+                                        if cleanup_snapshot
+                                        else None
+                                    ),
+                                    "cleanup_passes": 0,
+                                }
                             self._mark_processing_state(
                                 processing_state,
                                 {processing_key},
@@ -902,6 +1112,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 expected_path=target,
                                 sidecar_pending=True,
                                 sidecar_attempts=next_sidecar_attempts,
+                                **cleanup_updates,
                             )
                             reorganized_sidecars.append({
                                 "key": processing_key,
@@ -917,10 +1128,17 @@ class RecentEpisodeMaintenance(_PluginBase):
                     elif operation.skipped:
                         result.add_skipped(target_key)
                         if not self._dry_run:
-                            self._mark_processing_verified(
-                                processing_state,
-                                {processing_key},
-                            )
+                            if danmu_settle_issues:
+                                self._mark_processing_state(
+                                    processing_state,
+                                    {processing_key},
+                                    self._STATE_PENDING_REORGANIZE,
+                                )
+                            else:
+                                self._mark_processing_verified(
+                                    processing_state,
+                                    {processing_key},
+                                )
                         logger.info(
                             f"[最近剧集维护] 跳过 {label}：{operation.message}｜"
                             f"{self._file_change_details(current_file, operation.target)}"
@@ -944,9 +1162,14 @@ class RecentEpisodeMaintenance(_PluginBase):
                             {processing_key},
                             self._STATE_PENDING_REORGANIZE,
                         )
-                    result.add_error(f"{label}：{err}", current_file)
+                    settle_text = (
+                        "；弹幕恢复失败：" + "；".join(danmu_settle_issues)
+                        if danmu_settle_issues
+                        else ""
+                    )
+                    result.add_error(f"{label}：{err}{settle_text}", current_file)
                     logger.error(
-                        f"[最近剧集维护] 重命名失败 {label}：{err}｜"
+                        f"[最近剧集维护] 重命名失败 {label}：{err}{settle_text}｜"
                         f"文件：{current_file or '未知文件'}"
                     )
 
@@ -1010,9 +1233,14 @@ class RecentEpisodeMaintenance(_PluginBase):
                         f"文件：{Path(target).name if target else '未知文件'}"
                     )
 
+        cleanup_blocks_scan = any(
+            bool(item.get("cleanup_pending"))
+            and int(item.get("cleanup_passes") or 0) < 1
+            for item in processing_state.values()
+        )
         sidecars_complete = (
             bool(reorganized_sidecars) or sidecars_ready_for_scan
-        ) and not missing_sidecars
+        ) and not missing_sidecars and not cleanup_blocks_scan
         if sidecars_complete and self._scan_after_reorganize and not self._dry_run:
             client = client or self._get_jellyfin_client()
             try:
@@ -1027,6 +1255,16 @@ class RecentEpisodeMaintenance(_PluginBase):
             logger.warning(
                 "[最近剧集维护] 部分重新整理文件的 NFO 或图片尚未生成，"
                 "本轮不触发 Jellyfin 媒体库扫描"
+            )
+        elif (
+            cleanup_blocks_scan
+            and (reorganized_sidecars or sidecars_ready_for_scan)
+            and self._scan_after_reorganize
+            and not self._dry_run
+        ):
+            logger.info(
+                "[最近剧集维护] 旧名称附件仍在安全等待或复查，"
+                "完成清理前不触发 Jellyfin 媒体库扫描"
             )
 
         if not self._dry_run:
@@ -1152,6 +1390,213 @@ class RecentEpisodeMaintenance(_PluginBase):
             cache[directory_key] = filenames
         return filenames
 
+    @classmethod
+    def _snapshot_old_sidecars(
+        cls,
+        old_target: Any,
+        new_target: Any,
+    ) -> list[str]:
+        if not old_target or not new_target or cls._same_path(old_target, new_target):
+            return []
+
+        old_media = Path(old_target)
+        try:
+            with scandir(old_media.parent) as entries:
+                candidates = [
+                    Path(entry.path)
+                    for entry in entries
+                    if cls._old_sidecar_kind(Path(entry.path), old_media)
+                    and (
+                        entry.is_file()
+                        or entry.is_dir()
+                        or entry.is_symlink()
+                    )
+                ]
+        except OSError as err:
+            logger.warning(
+                f"[最近剧集维护] 无法记录旧名称附件：{err}｜"
+                f"文件：{old_media.name}"
+            )
+            return []
+
+        protected_danmu = [
+            old_media.with_suffix(".xml"),
+            old_media.parent / f"{old_media.stem}.danmu.ass",
+        ]
+        for candidate in protected_danmu:
+            hold_path = cls._danmu_protection_path(candidate, old_media)
+            if (
+                (hold_path.exists() or hold_path.is_symlink())
+                and candidate not in candidates
+            ):
+                candidates.append(candidate)
+        return sorted(str(path) for path in candidates)
+
+    @classmethod
+    def _old_sidecar_kind(
+        cls,
+        candidate: Path,
+        old_media: Path,
+    ) -> str | None:
+        if JellyfinServiceClient.path_key(candidate.parent) != JellyfinServiceClient.path_key(
+            old_media.parent
+        ):
+            return None
+
+        name = candidate.name
+        old_stem = old_media.stem
+        suffix = candidate.suffix.lower()
+        if name in {f"{old_stem}.trickplay", f"{old_stem}-trickplay"}:
+            return "trickplay"
+        if name == f"{old_stem}.nfo":
+            return "metadata"
+        image_stems = {
+            old_stem,
+            *(f"{old_stem}-{kind}" for kind in (
+                "thumb",
+                "poster",
+                "fanart",
+                "landscape",
+                "banner",
+                "clearlogo",
+                "clearart",
+                "disc",
+                "logo",
+            )),
+        }
+        if suffix in cls._IMAGE_EXTENSIONS and candidate.stem in image_stems:
+            return "image"
+        if name in {f"{old_stem}.xml", f"{old_stem}.danmu.ass"}:
+            return "danmu"
+        if suffix in cls._SUBTITLE_EXTENSIONS and name.startswith(f"{old_stem}."):
+            return "subtitle"
+        return None
+
+    @staticmethod
+    def _danmu_settle_target(
+        operation: Any,
+        current_target: Any,
+        expected_target: Any,
+    ) -> Any:
+        new_target = expected_target or getattr(operation, "target", None)
+        if new_target and Path(new_target).is_file():
+            return new_target
+        if bool(getattr(operation, "success", False)):
+            return None
+        return current_target
+
+    @classmethod
+    def _danmu_protection_path(
+        cls,
+        candidate: Path,
+        old_media: Path,
+    ) -> Path:
+        identity = (
+            f"{JellyfinServiceClient.path_key(old_media)}"
+            f"\0{candidate.name}"
+        )
+        token = sha256(identity.encode("utf-8")).hexdigest()[:16]
+        return candidate.parent / (
+            f".recentepisodemaintenance-{token}.danmu-hold"
+        )
+
+    @classmethod
+    def _protect_danmu_sidecars(
+        cls,
+        paths: list[str],
+        old_target: Any,
+    ) -> tuple[list[str], list[str]]:
+        old_media = Path(old_target)
+        protected: list[str] = []
+        issues: list[str] = []
+
+        for raw_path in paths:
+            candidate = Path(raw_path)
+            if cls._old_sidecar_kind(candidate, old_media) != "danmu":
+                continue
+            hold_path = cls._danmu_protection_path(candidate, old_media)
+            if hold_path.exists() or hold_path.is_symlink():
+                protected.append(str(candidate))
+                if candidate.exists() or candidate.is_symlink():
+                    issues.append(f"{candidate.name} 与保护副本同时存在")
+                continue
+            if not candidate.exists() and not candidate.is_symlink():
+                continue
+            if not candidate.is_file() and not candidate.is_symlink():
+                issues.append(f"{candidate.name} 不是可保护文件")
+                continue
+            try:
+                candidate.rename(hold_path)
+                protected.append(str(candidate))
+            except OSError as err:
+                issues.append(f"{candidate.name} 保护失败：{err}")
+        return protected, issues
+
+    @classmethod
+    def _cleanup_old_sidecar_snapshot(
+        cls,
+        paths: list[str],
+        old_target: Any,
+        new_target: Any,
+    ) -> tuple[list[str], list[str], list[str]]:
+        old_media = Path(old_target)
+        new_media = Path(new_target)
+        deleted: list[str] = []
+        renamed: list[str] = []
+        issues: list[str] = []
+
+        for raw_path in paths:
+            original_candidate = Path(raw_path)
+            kind = cls._old_sidecar_kind(original_candidate, old_media)
+            if kind is None:
+                issues.append(f"{original_candidate.name} 未通过路径校验")
+                continue
+            candidate = original_candidate
+            if kind == "danmu":
+                hold_path = cls._danmu_protection_path(
+                    original_candidate,
+                    old_media,
+                )
+                if hold_path.exists() or hold_path.is_symlink():
+                    candidate = hold_path
+            if not candidate.exists() and not candidate.is_symlink():
+                continue
+            tail = original_candidate.name[len(old_media.stem):]
+            counterpart = new_media.parent / f"{new_media.stem}{tail}"
+            if kind == "subtitle" and not counterpart.is_file():
+                issues.append(f"{candidate.name} 缺少新名称对应文件")
+                continue
+            if kind == "danmu" and not counterpart.is_file():
+                try:
+                    candidate.rename(counterpart)
+                    renamed.append(str(counterpart))
+                except OSError as err:
+                    issues.append(f"{candidate.name} 改名失败：{err}")
+                continue
+            try:
+                if candidate.is_symlink() or not candidate.is_dir():
+                    candidate.unlink()
+                elif kind == "trickplay":
+                    rmtree(candidate)
+                else:
+                    issues.append(f"{candidate.name} 不是可清理附件")
+                    continue
+                deleted.append(str(candidate))
+            except OSError as err:
+                issues.append(f"{candidate.name} 删除失败：{err}")
+        return deleted, renamed, issues
+
+    @classmethod
+    def _old_sidecar_cleanup_at(cls, *, verify: bool = False) -> str:
+        minutes = (
+            cls._OLD_SIDECAR_VERIFY_MINUTES
+            if verify
+            else cls._OLD_SIDECAR_CLEANUP_MINUTES
+        )
+        return (
+            datetime.now() + timedelta(minutes=minutes)
+        ).isoformat(timespec="seconds")
+
     @staticmethod
     def _file_change_details(current_file: Any, new_file: Any) -> str:
         current = str(current_file or "未知文件")
@@ -1192,13 +1637,20 @@ class RecentEpisodeMaintenance(_PluginBase):
             for history, key in keyed_histories
             if (state.get(key) or {}).get("status") in pending_statuses
         ]
+        cleanup_enabled = bool(getattr(self, "_cleanup_old_sidecars", True))
         for _, key in pending_all:
             state_item = dict(state.get(key) or {})
             if state_item.get("sidecar_pending") and not state_item.get(
                 "sidecar_check_after"
             ):
                 state_item["sidecar_check_after"] = self._sidecar_recheck_at()
-                state[key] = state_item
+            if (
+                cleanup_enabled
+                and state_item.get("cleanup_pending")
+                and not state_item.get("cleanup_check_after")
+            ):
+                state_item["cleanup_check_after"] = self._old_sidecar_cleanup_at()
+            state[key] = state_item
         sidecar_waiting = [
             (history, key)
             for history, key in pending_all
@@ -1207,11 +1659,24 @@ class RecentEpisodeMaintenance(_PluginBase):
                 (state.get(key) or {}).get("sidecar_check_after")
             )
         ]
-        sidecar_waiting_keys = {key for _, key in sidecar_waiting}
+        cleanup_waiting = [
+            (history, key)
+            for history, key in pending_all
+            if cleanup_enabled
+            and (state.get(key) or {}).get("cleanup_pending")
+            and not (state.get(key) or {}).get("sidecar_pending")
+            and not self._timestamp_is_due(
+                (state.get(key) or {}).get("cleanup_check_after")
+            )
+        ]
+        waiting_keys = {
+            key
+            for _, key in sidecar_waiting + cleanup_waiting
+        }
         pending = [
             (history, key)
             for history, key in pending_all
-            if key not in sidecar_waiting_keys
+            if key not in waiting_keys
         ]
         pending.sort(key=lambda item: str((state.get(item[1]) or {}).get("updated_at") or ""))
         new_items = [
@@ -1256,11 +1721,12 @@ class RecentEpisodeMaintenance(_PluginBase):
             state_item = state.get(key) or {}
             if state_item.get("status") != self._STATE_ATTENTION:
                 continue
-            reason = (
-                "刮削附件多次补齐失败"
-                if state_item.get("sidecar_pending")
-                else "多次重命名后路径仍变化"
-            )
+            if state_item.get("cleanup_pending"):
+                reason = "旧名称附件清理失败"
+            elif state_item.get("sidecar_pending"):
+                reason = "刮削附件多次补齐失败"
+            else:
+                reason = "多次重命名后路径仍变化"
             target = (
                 state_item.get("expected_path")
                 or reorganizer.target_path(history)
@@ -1278,6 +1744,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                 "monitoring": sum(1 for _, key in selected if key in monitoring_keys),
                 "monitoring_waiting": len(monitoring_all) - len(monitoring),
                 "sidecar_waiting": len(sidecar_waiting),
+                "cleanup_waiting": len(cleanup_waiting),
                 "complete": sum(
                     1
                     for _, key in keyed_histories
@@ -1372,7 +1839,14 @@ class RecentEpisodeMaintenance(_PluginBase):
             datetime.now() + timedelta(hours=self._PREVIEW_CACHE_HOURS)
         ).isoformat(timespec="seconds")
         for key in keys:
-            if bool((state.get(key) or {}).get("had_action")):
+            state_item = state.get(key) or {}
+            if bool(state_item.get("cleanup_pending")):
+                self._mark_processing_state(
+                    state,
+                    {key},
+                    self._STATE_PENDING_REORGANIZE,
+                )
+            elif bool(state_item.get("had_action")):
                 self._mark_processing_state(state, {key}, self._STATE_COMPLETE)
             else:
                 self._mark_processing_state(
@@ -1394,6 +1868,11 @@ class RecentEpisodeMaintenance(_PluginBase):
         sidecar_pending: bool | None = None,
         sidecar_attempts: int | None = None,
         sidecar_check_after: str | None = None,
+        cleanup_pending: bool | None = None,
+        old_sidecars: list[str] | None = None,
+        cleanup_old_media_path: Any = None,
+        cleanup_check_after: str | None = None,
+        cleanup_passes: int | None = None,
     ) -> None:
         updated_at = datetime.now().isoformat(timespec="seconds")
         for key in keys:
@@ -1419,15 +1898,43 @@ class RecentEpisodeMaintenance(_PluginBase):
                 item["sidecar_check_after"] = sidecar_check_after
             if sidecar_pending is False:
                 item.pop("sidecar_check_after", None)
+            if cleanup_pending is True:
+                item["cleanup_pending"] = True
+            if old_sidecars is not None:
+                item["old_sidecars"] = [str(path) for path in old_sidecars]
+            if cleanup_old_media_path is not None:
+                item["cleanup_old_media_path"] = str(cleanup_old_media_path)
+            if cleanup_check_after is not None:
+                item["cleanup_check_after"] = cleanup_check_after
+            if cleanup_passes is not None:
+                item["cleanup_passes"] = cleanup_passes
+            if cleanup_pending is False:
+                for cleanup_key in (
+                    "cleanup_pending",
+                    "old_sidecars",
+                    "cleanup_old_media_path",
+                    "cleanup_check_after",
+                    "cleanup_passes",
+                ):
+                    item.pop(cleanup_key, None)
             if status in {
                 RecentEpisodeMaintenance._STATE_COMPLETE,
                 RecentEpisodeMaintenance._STATE_MONITORING,
             }:
-                item.pop("sidecar_pending", None)
-                item.pop("sidecar_attempts", None)
-                item.pop("sidecar_check_after", None)
+                for finished_key in (
+                    "sidecar_pending",
+                    "sidecar_attempts",
+                    "sidecar_check_after",
+                    "cleanup_pending",
+                    "old_sidecars",
+                    "cleanup_old_media_path",
+                    "cleanup_check_after",
+                    "cleanup_passes",
+                ):
+                    item.pop(finished_key, None)
             elif status == RecentEpisodeMaintenance._STATE_ATTENTION:
                 item.pop("sidecar_check_after", None)
+                item.pop("cleanup_check_after", None)
             state[key] = item
 
     def _get_jellyfin_client(self) -> JellyfinServiceClient | None:

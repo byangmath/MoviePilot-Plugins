@@ -285,3 +285,90 @@ def test_selection_migrates_pending_sidecars_without_recheck_time():
     assert selected == []
     assert selection["sidecar_waiting"] == 1
     assert state[key]["sidecar_check_after"]
+
+def test_selection_defers_old_sidecar_cleanup_until_due():
+    plugin = RecentEpisodeMaintenance()
+    plugin._max_items = 10
+    plugin._cleanup_old_sidecars = True
+    reorganizer = MoviePilotReorganizer(logger=None)
+    due = history(
+        history_id=1,
+        source="/source/show/due.mkv",
+        dest="/library/show/Season 01/测试剧 S01E01.mkv",
+        date="2026-07-19 12:00:00",
+        download_hash="due-cleanup",
+    )
+    waiting = history(
+        history_id=2,
+        source="/source/show/waiting.mkv",
+        dest="/library/show/Season 01/测试剧 S01E02.mkv",
+        date="2026-07-19 12:01:00",
+        download_hash="waiting-cleanup",
+    )
+    waiting.episodes = "E02"
+    plugin._load_processing_state = lambda: {
+        reorganizer.processing_key(due): {
+            "status": plugin._STATE_PENDING_REORGANIZE,
+            "cleanup_pending": True,
+            "cleanup_check_after": "2000-01-01T00:00:00",
+        },
+        reorganizer.processing_key(waiting): {
+            "status": plugin._STATE_PENDING_REORGANIZE,
+            "cleanup_pending": True,
+            "cleanup_check_after": "2999-01-01T00:00:00",
+        },
+    }
+
+    selected, _, selection = plugin._select_histories(
+        histories=[due, waiting],
+        reorganizer=reorganizer,
+    )
+
+    assert selected == [due]
+    assert selection["pending"] == 1
+    assert selection["cleanup_waiting"] == 1
+
+
+def test_verified_record_remains_pending_until_old_sidecar_cleanup():
+    plugin = RecentEpisodeMaintenance()
+    state = {
+        "episode": {
+            "status": plugin._STATE_PENDING_REORGANIZE,
+            "had_action": True,
+            "cleanup_pending": True,
+            "old_sidecars": ["/library/show/old.nfo"],
+        }
+    }
+
+    plugin._mark_processing_verified(state, {"episode"})
+
+    assert state["episode"]["status"] == plugin._STATE_PENDING_REORGANIZE
+    assert state["episode"]["cleanup_pending"] is True
+    assert state["episode"]["old_sidecars"] == ["/library/show/old.nfo"]
+
+
+def test_clearing_cleanup_pending_removes_cleanup_state():
+    plugin = RecentEpisodeMaintenance()
+    state = {
+        "episode": {
+            "status": plugin._STATE_PENDING_REORGANIZE,
+            "cleanup_pending": True,
+            "old_sidecars": ["/library/show/old.nfo"],
+            "cleanup_old_media_path": "/library/show/old.mkv",
+            "cleanup_check_after": "2999-01-01T00:00:00",
+            "cleanup_passes": 1,
+        }
+    }
+
+    plugin._mark_processing_state(
+        state,
+        {"episode"},
+        plugin._STATE_PENDING_REORGANIZE,
+        cleanup_pending=False,
+    )
+
+    assert "cleanup_pending" not in state["episode"]
+    assert "old_sidecars" not in state["episode"]
+    assert "cleanup_old_media_path" not in state["episode"]
+    assert "cleanup_check_after" not in state["episode"]
+    assert "cleanup_passes" not in state["episode"]
