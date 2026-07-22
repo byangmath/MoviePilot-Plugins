@@ -144,6 +144,39 @@ def test_tracked_history_ids_keep_unfinished_records_only():
     assert tracked == {10, 11, 12}
 
 
+def test_selection_removes_queue_state_when_mp_history_is_deleted():
+    plugin = RecentEpisodeMaintenance()
+    plugin._max_items = 10
+    reorganizer = MoviePilotReorganizer(logger=None)
+    remaining = history(
+        history_id=1,
+        source="/source/show/remaining.mkv",
+        dest="/library/show/Season 01/测试剧 S01E01.mkv",
+        date="2026-07-22 12:00:00",
+        download_hash="remaining-transfer",
+    )
+    remaining_key = reorganizer.processing_key(remaining)
+    stored_state = {
+        remaining_key: {
+            "status": plugin._STATE_PENDING_REFRESH,
+            "history_id": 1,
+        },
+        "deleted-history": {
+            "status": plugin._STATE_PENDING_REFRESH,
+            "history_id": 2,
+        },
+    }
+
+    _, state, _ = plugin._select_histories(
+        histories=[remaining],
+        reorganizer=reorganizer,
+        state=stored_state,
+    )
+
+    assert set(state) == {remaining_key}
+    assert state[remaining_key]["history_id"] == 1
+
+
 def test_recent_history_query_includes_tracked_records_outside_date_window():
     class Expression:
         def __init__(self, value):
