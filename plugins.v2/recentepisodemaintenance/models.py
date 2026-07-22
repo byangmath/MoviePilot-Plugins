@@ -87,6 +87,7 @@ class OperationResult:
 class RunResult:
     operation_limit: int = 0
     operations_used: int = 0
+    actions_submitted: int = 0
     reorganize_candidates: int = 0
     refresh_candidates: int = 0
     previewed: int = 0
@@ -139,7 +140,8 @@ class RunResult:
             )
             lines.append(
                 "当前状态："
-                f"当前等待复查 {self.queue_counts.get('monitoring_waiting', 0)} 条，"
+                f"等待刷新确认 {self.queue_counts.get('refresh_waiting', 0)} 条，"
+                f"等待复查 {self.queue_counts.get('monitoring_waiting', 0)} 条，"
                 f"等待附件 {self.queue_counts.get('sidecar_waiting', 0)} 条，"
                 f"等待清理 {self.queue_counts.get('cleanup_waiting', 0)} 条，"
                 f"已完成 {self.queue_counts.get('complete', 0)} 条，"
@@ -169,3 +171,6 @@ class RunResult:
             if len(self.errors) > 10:
                 lines.append(f"- 其余 {len(self.errors) - 10} 条错误已省略，请查看日志")
         return "\n".join(lines)
+
+    def should_notify(self) -> bool:
+        return self.actions_submitted > 0 or self.failed > 0

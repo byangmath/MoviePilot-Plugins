@@ -45,15 +45,30 @@ class MoviePilotReorganizer:
         ])
         self._related_histories: dict[str, list[Any]] = {}
 
-    def recent_histories(self, days: int) -> list[Any]:
-        """Return the latest successful TV transfer record for each episode."""
+    def recent_histories(
+        self,
+        days: int,
+        tracked_history_ids: set[int] | None = None,
+    ) -> list[Any]:
+        """Return recent records plus unfinished records already admitted to the queue."""
         if not self._history_available():
             raise RuntimeError("当前 MoviePilot 未找到兼容的历史重新整理接口")
 
         cutoff = (datetime.now() - timedelta(days=max(int(days), 0))).strftime("%Y-%m-%d %H:%M:%S")
         history_cls = self._transfer_history_cls
         with self._db_session() as db:
-            query = db.query(history_cls).filter(history_cls.date >= cutoff)
+            date_filter = history_cls.date >= cutoff
+            tracked_ids = {
+                int(history_id)
+                for history_id in (tracked_history_ids or set())
+                if history_id
+            }
+            if tracked_ids and getattr(history_cls, "id", None) is not None:
+                query = db.query(history_cls).filter(
+                    date_filter | history_cls.id.in_(tracked_ids)
+                )
+            else:
+                query = db.query(history_cls).filter(date_filter)
             if getattr(history_cls, "status", None) is not None:
                 query = query.filter(history_cls.status.is_(True))
             if getattr(history_cls, "seasons", None) is not None:
@@ -101,7 +116,7 @@ class MoviePilotReorganizer:
         return histories
 
     def related_history_count(self, history: Any) -> int:
-        """Return attachment records that MoviePilot will sync with the selected video."""
+        """Return related attachment histories detected for the same transfer."""
         return len(self._related_histories.get(self.processing_key(history)) or [])
 
     def reorganize(

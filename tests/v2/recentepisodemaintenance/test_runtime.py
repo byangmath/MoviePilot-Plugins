@@ -1,5 +1,15 @@
+from copy import deepcopy
+from pathlib import Path
+from types import SimpleNamespace
+
 from recentepisodemaintenance import RecentEpisodeMaintenance
-from recentepisodemaintenance.models import EpisodeItem, OperationResult, RunResult
+from recentepisodemaintenance.jellyfin_client import JellyfinServiceClient
+from recentepisodemaintenance.models import (
+    EpisodeItem,
+    EpisodeTarget,
+    OperationResult,
+    RunResult,
+)
 import recentepisodemaintenance as plugin_module
 
 
@@ -50,6 +60,7 @@ def test_summary_includes_queue_counts():
             "pending": 50,
             "new": 0,
             "monitoring": 1,
+            "refresh_waiting": 6,
             "monitoring_waiting": 2,
             "sidecar_waiting": 3,
             "cleanup_waiting": 4,
@@ -65,7 +76,8 @@ def test_summary_includes_queue_counts():
     assert "本轮待复查 50 条" in summary
     assert "新记录 0 条" in summary
     assert "到期复查 1 条" in summary
-    assert "当前等待复查 2 条" in summary
+    assert "等待刷新确认 6 条" in summary
+    assert "等待复查 2 条" in summary
     assert "等待附件 3 条" in summary
     assert "等待清理 4 条" in summary
     assert "已完成 26 条" in summary
@@ -80,6 +92,9 @@ def test_waiting_records_text_spacing():
     assert RecentEpisodeMaintenance._waiting_records_text(
         {"sidecar_waiting": 2, "cleanup_waiting": 1}
     ) == "，另有 2 条记录等待附件生成、1 条记录等待旧附件清理"
+    assert RecentEpisodeMaintenance._waiting_records_text(
+        {"refresh_waiting": 1}
+    ) == "，另有 1 条记录等待刷新确认"
     assert RecentEpisodeMaintenance._waiting_records_text(
         {
             "sidecar_waiting": 1,
@@ -96,6 +111,147 @@ def test_waiting_records_text_spacing():
         "1 条记录等待旧附件清理：测试剧 S01E02｜旧文件：/library/show/old.mkv｜"
         "旧附件：/library/show/old.nfo"
     )
+
+
+def test_notification_requires_action_or_failure():
+    assert RunResult().should_notify() is False
+    assert RunResult(actions_submitted=1).should_notify() is True
+    assert RunResult(failed=1).should_notify() is True
+
+
+def test_processing_checkpoint_saves_only_outside_dry_run():
+    plugin = RecentEpisodeMaintenance()
+    saved = []
+    plugin._save_processing_state = saved.append
+
+    plugin._dry_run = False
+    plugin._checkpoint_processing_state({"episode": {"status": "pending"}})
+    plugin._dry_run = True
+    plugin._checkpoint_processing_state({"ignored": {}})
+
+    assert saved == [{"episode": {"status": "pending"}}]
+
+
+def test_reorganized_record_is_rechecked_by_jellyfin_before_completion(
+    tmp_path,
+    monkeypatch,
+):
+    old_media = tmp_path / "Show S01E01 - Old Title.mkv"
+    new_media = tmp_path / "Show S01E01 - New Title.mkv"
+    old_media.write_bytes(b"old")
+    new_media.write_bytes(b"new")
+    new_media.with_suffix(".nfo").write_text("metadata", encoding="utf-8")
+    new_media.with_suffix(".jpg").write_bytes(b"image")
+    history = SimpleNamespace(
+        id=1,
+        date="2026-07-22 00:00:00",
+        dest=str(old_media),
+    )
+
+    class FakeReorganizer:
+        reorganize_calls = 0
+
+        def __init__(self, logger, dry_run):
+            self.dry_run = dry_run
+
+        def recent_histories(self, days, tracked_history_ids=None):
+            return [history]
+
+        @staticmethod
+        def processing_key(_history):
+            return "episode"
+
+        @staticmethod
+        def target_path(item):
+            return Path(item.dest)
+
+        @staticmethod
+        def display_name(_history):
+            return "Show S01E01"
+
+        @staticmethod
+        def episode_target(item):
+            return EpisodeTarget(path=item.dest)
+
+        @staticmethod
+        def preview(_history):
+            return OperationResult(success=True, target=new_media)
+
+        @staticmethod
+        def related_history_count(_history):
+            return 0
+
+        def reorganize(self, history, skip_same_name=True, preview_only=False):
+            type(self).reorganize_calls += 1
+            return OperationResult(success=True, target=new_media)
+
+    episode = EpisodeItem(
+        item_id="jf-1",
+        name="New Title",
+        series_name="Show",
+        season_number=1,
+        episode_number=1,
+        path=str(old_media),
+    )
+
+    class FakeClient:
+        refresh_calls = 0
+
+        @staticmethod
+        def path_key(path):
+            return JellyfinServiceClient.path_key(path)
+
+        def match_recent_episodes(self, targets, days, library_ids):
+            return {self.path_key(target.path): [episode] for target in targets}
+
+        def refresh_episode(self, **_kwargs):
+            type(self).refresh_calls += 1
+
+    plugin = RecentEpisodeMaintenance()
+    plugin._enable_refresh = True
+    plugin._enable_reorganize = True
+    plugin._max_items = 10
+    plugin._days = 15
+    plugin._dry_run = False
+    plugin._notify = False
+    plugin._library_ids = []
+    plugin._refresh_mode = "all"
+    plugin._replace_images = True
+    plugin._scan_after_reorganize = False
+    plugin._cleanup_old_sidecars = False
+    plugin._skip_same_name = True
+    saved = []
+    plugin._load_processing_state = lambda: deepcopy(saved[-1]) if saved else {
+        "episode": {
+            "status": plugin._STATE_PENDING_REFRESH,
+            "history_id": 1,
+            "history_date": history.date,
+            "expected_path": str(new_media),
+            "had_action": True,
+            "refresh_check_after": "2000-01-01T00:00:00",
+        }
+    }
+    plugin._save_processing_state = lambda state: saved.append(deepcopy(state))
+    client = FakeClient()
+    plugin._get_jellyfin_client = lambda: client
+    monkeypatch.setattr(plugin_module, "MoviePilotReorganizer", FakeReorganizer)
+
+    plugin._run_once()
+
+    assert FakeReorganizer.reorganize_calls == 1
+    assert FakeClient.refresh_calls == 0
+    assert saved[-1]["episode"]["status"] == plugin._STATE_PENDING_REORGANIZE
+    assert saved[-1]["episode"]["sidecar_pending"] is False
+
+    history.dest = str(new_media)
+    episode.path = str(new_media)
+    episode.name = "Wrong Title"
+    plugin._run_once()
+
+    assert FakeClient.refresh_calls == 1
+    assert FakeReorganizer.reorganize_calls == 1
+    assert saved[-1]["episode"]["status"] == plugin._STATE_PENDING_REFRESH
+    assert saved[-1]["episode"]["refresh_check_after"] > "2000-01-01T00:00:00"
 
 
 def test_sidecar_checks_scan_shared_directory_once(tmp_path, monkeypatch):

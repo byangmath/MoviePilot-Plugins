@@ -1,3 +1,4 @@
+from datetime import datetime
 from types import SimpleNamespace
 
 from recentepisodemaintenance.reorganizer import MoviePilotReorganizer
@@ -116,7 +117,7 @@ def test_attachment_histories_do_not_consume_video_inspection_limit():
         candidates.append(video)
 
     video_pool = reorganizer._select_primary_histories(candidates)
-    selected, _, _ = plugin._select_histories(
+    selected, state, _ = plugin._select_histories(
         histories=video_pool,
         reorganizer=reorganizer,
     )
@@ -124,6 +125,161 @@ def test_attachment_histories_do_not_consume_video_inspection_limit():
     assert len(video_pool) == 6
     assert len(selected) == 5
     assert all(reorganizer._is_video_history(item) for item in selected)
+    assert {item["history_id"] for item in state.values()} == set(range(1, 7))
+
+
+def test_tracked_history_ids_keep_unfinished_records_only():
+    plugin = RecentEpisodeMaintenance()
+
+    tracked = plugin._tracked_history_ids(
+        {
+            "pending": {"status": plugin._STATE_PENDING_REFRESH, "history_id": 10},
+            "monitoring": {"status": plugin._STATE_MONITORING, "history_id": "11"},
+            "attention": {"status": plugin._STATE_ATTENTION, "history_id": 12},
+            "complete": {"status": plugin._STATE_COMPLETE, "history_id": 13},
+            "invalid": {"status": plugin._STATE_PENDING_REFRESH, "history_id": "x"},
+        }
+    )
+
+    assert tracked == {10, 11, 12}
+
+
+def test_recent_history_query_includes_tracked_records_outside_date_window():
+    class Expression:
+        def __init__(self, value):
+            self.value = value
+
+        def __or__(self, other):
+            return Expression(("or", self.value, other.value))
+
+    class Column:
+        def __init__(self, name):
+            self.name = name
+
+        def __ge__(self, value):
+            return Expression(("ge", self.name, value))
+
+        def in_(self, values):
+            return Expression(("in", self.name, set(values)))
+
+        def is_(self, value):
+            return Expression(("is", self.name, value))
+
+        def isnot(self, value):
+            return Expression(("isnot", self.name, value))
+
+        def desc(self):
+            return Expression(("desc", self.name))
+
+    class HistoryModel:
+        date = Column("date")
+        id = Column("id")
+        status = Column("status")
+        seasons = Column("seasons")
+        episodes = Column("episodes")
+
+    class Query:
+        def __init__(self):
+            self.filters = []
+
+        def filter(self, expression):
+            self.filters.append(expression.value)
+            return self
+
+        def order_by(self, _expression):
+            return self
+
+        def all(self):
+            return []
+
+    query = Query()
+
+    class Database:
+        def query(self, model):
+            assert model is HistoryModel
+            return query
+
+    class Session:
+        def __enter__(self):
+            return Database()
+
+        def __exit__(self, *_args):
+            return False
+
+    reorganizer = MoviePilotReorganizer(logger=None)
+    reorganizer._transfer_history_cls = HistoryModel
+    reorganizer._get_db = object()
+    reorganizer._db_session = Session
+
+    assert reorganizer.recent_histories(15, tracked_history_ids={7, 8}) == []
+    assert query.filters[0][0] == "or"
+    assert query.filters[0][2] == ("in", "id", {7, 8})
+
+
+def test_verified_monitoring_uses_adaptive_intervals():
+    plugin = RecentEpisodeMaintenance()
+    state = {"episode": {}}
+    observed_hours = []
+
+    for _ in range(4):
+        before = datetime.now()
+        plugin._mark_processing_verified(state, {"episode"})
+        due = datetime.fromisoformat(state["episode"]["next_preview_at"])
+        observed_hours.append(round((due - before).total_seconds() / 3600))
+
+    assert observed_hours == [24, 48, 72, 72]
+    assert state["episode"]["monitoring_checks"] == 4
+
+
+def test_expired_healthy_record_completes_only_after_it_is_checked():
+    plugin = RecentEpisodeMaintenance()
+    plugin._days = 15
+    state = {
+        "episode": {
+            "status": plugin._STATE_MONITORING,
+            "history_id": 1,
+            "history_date": "2026-01-01 00:00:00",
+            "monitoring_checks": 3,
+        }
+    }
+
+    assert plugin._tracked_history_ids(state) == {1}
+
+    plugin._mark_processing_verified(state, {"episode"})
+
+    assert state["episode"]["status"] == plugin._STATE_COMPLETE
+    assert "monitoring_checks" not in state["episode"]
+    assert plugin._tracked_history_ids(state) == set()
+
+
+def test_refresh_cooldown_defers_record_without_dropping_it():
+    plugin = RecentEpisodeMaintenance()
+    plugin._max_items = 10
+    reorganizer = MoviePilotReorganizer(logger=None)
+    video = history(
+        history_id=1,
+        source="/source/show/episode.mkv",
+        dest="/library/show/Season 01/测试剧 S01E01.mkv",
+        date="2026-07-01 12:00:00",
+    )
+    key = reorganizer.processing_key(video)
+    stored_state = {
+        key: {
+            "status": plugin._STATE_PENDING_REFRESH,
+            "history_id": 1,
+            "refresh_check_after": "2999-01-01T00:00:00",
+        }
+    }
+
+    selected, state, selection = plugin._select_histories(
+        histories=[video],
+        reorganizer=reorganizer,
+        state=stored_state,
+    )
+
+    assert selected == []
+    assert selection["refresh_waiting"] == 1
+    assert state[key]["history_id"] == 1
 
 def test_selection_counts_due_and_waiting_monitoring_records():
     plugin = RecentEpisodeMaintenance()

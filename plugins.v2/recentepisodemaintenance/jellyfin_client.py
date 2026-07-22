@@ -82,7 +82,10 @@ class JellyfinServiceClient:
                 return self._json(method(url))
             except Exception as err:
                 last_error = err
-                if attempt >= request_attempts:
+                if (
+                    attempt >= request_attempts
+                    or not self._is_retryable_error(err)
+                ):
                     break
                 logger.warning(
                     "[最近剧集维护] Jellyfin 请求失败，%s 秒后重试（%s/%s）：%s",
@@ -95,6 +98,32 @@ class JellyfinServiceClient:
         if last_error:
             raise last_error
         raise RuntimeError("媒体服务器无响应")
+
+    @staticmethod
+    def _is_retryable_error(error: Exception) -> bool:
+        response = getattr(error, "response", None)
+        status_code = getattr(response, "status_code", None)
+        if status_code is None:
+            status_code = getattr(error, "status_code", None)
+        try:
+            status = int(status_code) if status_code is not None else None
+        except (TypeError, ValueError):
+            status = None
+        if status is not None:
+            return status == 429 or 500 <= status < 600
+
+        error_name = type(error).__name__.casefold()
+        if any(
+            marker in error_name
+            for marker in (
+                "timeout",
+                "connectionerror",
+                "proxyerror",
+                "sslerror",
+            )
+        ):
+            return True
+        return isinstance(error, RuntimeError) and "无响应" in str(error)
 
     def recent_added_episodes(
         self,
