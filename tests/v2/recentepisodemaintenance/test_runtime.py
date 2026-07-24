@@ -119,17 +119,459 @@ def test_notification_requires_action_or_failure():
     assert RunResult(failed=1).should_notify() is True
 
 
+def test_final_queue_counts_use_mutually_exclusive_current_states():
+    plugin = RecentEpisodeMaintenance()
+    result = RunResult(queue_counts={"pending": 4, "new": 2, "monitoring": 1})
+    state = {
+        "ready": {"status": plugin._STATE_PENDING_REORGANIZE},
+        "new": {},
+        "scan": {
+            "status": plugin._STATE_PENDING_REORGANIZE,
+            "scan_pending": True,
+        },
+        "sidecar": {
+            "status": plugin._STATE_PENDING_REORGANIZE,
+            "sidecar_pending": True,
+        },
+        "cleanup": {
+            "status": plugin._STATE_PENDING_REORGANIZE,
+            "cleanup_pending": True,
+        },
+        "refresh": {
+            "status": plugin._STATE_PENDING_REFRESH,
+            "refresh_check_after": "2999-01-01T00:00:00",
+        },
+        "monitoring_due": {
+            "status": plugin._STATE_MONITORING,
+            "next_preview_at": "2000-01-01T00:00:00",
+        },
+        "monitoring_waiting": {
+            "status": plugin._STATE_MONITORING,
+            "next_preview_at": "2999-01-01T00:00:00",
+        },
+        "complete": {"status": plugin._STATE_COMPLETE},
+        "attention": {
+            "status": plugin._STATE_ATTENTION,
+            "cleanup_pending": True,
+        },
+    }
+
+    plugin._refresh_result_queue_counts(result, state)
+
+    assert result.queue_counts["pending_queued"] == 1
+    assert result.queue_counts["new_queued"] == 1
+    assert result.queue_counts["monitoring_queued"] == 1
+    assert result.queue_counts["scan_waiting"] == 1
+    assert result.queue_counts["sidecar_waiting"] == 1
+    assert result.queue_counts["cleanup_waiting"] == 1
+    assert result.queue_counts["refresh_waiting"] == 1
+    assert result.queue_counts["monitoring_waiting"] == 1
+    assert result.queue_counts["complete"] == 1
+    assert result.queue_counts["attention"] == 1
+
+
 def test_processing_checkpoint_saves_only_outside_dry_run():
     plugin = RecentEpisodeMaintenance()
     saved = []
-    plugin._save_processing_state = saved.append
+
+    def save_state(state):
+        saved.append(state)
+        return True
+
+    plugin._save_processing_state = save_state
 
     plugin._dry_run = False
-    plugin._checkpoint_processing_state({"episode": {"status": "pending"}})
+    assert plugin._checkpoint_processing_state(
+        {"episode": {"status": "pending"}}
+    ) is True
     plugin._dry_run = True
-    plugin._checkpoint_processing_state({"ignored": {}})
+    assert plugin._checkpoint_processing_state({"ignored": {}}) is True
 
     assert saved == [{"episode": {"status": "pending"}}]
+
+
+def test_processing_state_save_retries_and_reports_failure(monkeypatch):
+    plugin = RecentEpisodeMaintenance()
+    plugin._STATE_SAVE_RETRY_SECONDS = 0
+    attempts = 0
+
+    def flaky_save(_key, _state):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise RuntimeError("temporary failure")
+
+    plugin.save_data = flaky_save
+    monkeypatch.setattr(plugin_module, "sleep", lambda _seconds: None)
+
+    assert plugin._save_processing_state({"episode": {}}) is True
+    assert attempts == 3
+
+    def failed_save(_key, _state):
+        raise RuntimeError("persistent failure")
+
+    plugin.save_data = failed_save
+    attempts = 0
+
+    def count_sleep(_seconds):
+        nonlocal attempts
+        attempts += 1
+
+    monkeypatch.setattr(plugin_module, "sleep", count_sleep)
+
+    assert plugin._save_processing_state({"episode": {}}) is False
+    assert attempts == plugin._STATE_SAVE_ATTEMPTS - 1
+
+
+def test_processing_state_load_rejects_unreadable_or_malformed_data():
+    plugin = RecentEpisodeMaintenance()
+    plugin.get_data = lambda _key: None
+    assert plugin._load_processing_state() == {}
+
+    plugin.get_data = lambda _key: []
+    try:
+        plugin._load_processing_state()
+    except RuntimeError as err:
+        assert "数据格式应为对象" in str(err)
+    else:
+        raise AssertionError("malformed processing state must stop the run")
+
+    def failed_load(_key):
+        raise RuntimeError("database unavailable")
+
+    plugin.get_data = failed_load
+    try:
+        plugin._load_processing_state()
+    except RuntimeError as err:
+        assert "已停止本轮运行" in str(err)
+    else:
+        raise AssertionError("unreadable processing state must stop the run")
+
+
+def test_operation_intents_are_recovered_by_operation_stage():
+    plugin = RecentEpisodeMaintenance()
+    state = {
+        "refresh": {
+            "operation_intent": {
+                "operation": "refresh",
+                "prepared_at": "2026-07-24T12:00:00",
+            }
+        },
+        "reorganize": {
+            "operation_intent": {
+                "operation": "reorganize",
+                "expected_path": "/library/show/new.mkv",
+                "sidecar_attempts": 2,
+                "cleanup_old_media_path": "/library/show/old.mkv",
+                "old_sidecars": ["/library/show/old.nfo"],
+            }
+        },
+        "cleanup": {
+            "operation_intent": {"operation": "cleanup"},
+        },
+        "scan": {
+            "operation_intent": {"operation": "scan"},
+        },
+    }
+
+    assert plugin._recover_operation_intents(state) == 4
+    assert state["refresh"]["status"] == plugin._STATE_PENDING_REFRESH
+    assert state["refresh"]["had_action"] is True
+    assert state["refresh"]["refresh_check_after"] == "2026-07-24T12:30:00"
+    assert state["reorganize"]["status"] == plugin._STATE_PENDING_REORGANIZE
+    assert state["reorganize"]["sidecar_pending"] is True
+    assert state["reorganize"]["cleanup_pending"] is True
+    assert state["reorganize"]["sidecar_attempts"] == 2
+    assert state["cleanup"]["cleanup_pending"] is True
+    assert state["scan"]["scan_pending"] is True
+    assert all("operation_intent" not in item for item in state.values())
+    assert plugin._recover_operation_intents(state) == 0
+
+
+def test_retry_attention_records_resets_the_failed_stage():
+    plugin = RecentEpisodeMaintenance()
+    plugin._enable_refresh = True
+    stored = {
+        "cleanup": {
+            "status": plugin._STATE_ATTENTION,
+            "cleanup_pending": True,
+            "cleanup_passes": 3,
+            "cleanup_check_after": "2999-01-01T00:00:00",
+        },
+        "sidecar": {
+            "status": plugin._STATE_ATTENTION,
+            "sidecar_pending": True,
+            "sidecar_attempts": 3,
+            "sidecar_check_after": "2999-01-01T00:00:00",
+            "cleanup_pending": True,
+            "cleanup_passes": 2,
+        },
+        "rename": {
+            "status": plugin._STATE_ATTENTION,
+            "rename_attempts": 3,
+        },
+        "complete": {
+            "status": plugin._STATE_COMPLETE,
+        },
+    }
+    saved = []
+    plugin._load_processing_state = lambda: deepcopy(stored)
+
+    def save_state(state):
+        saved.append(deepcopy(state))
+        return True
+
+    plugin._save_processing_state = save_state
+
+    assert plugin._retry_attention_records() == 3
+    state = saved[-1]
+    assert state["cleanup"]["status"] == plugin._STATE_PENDING_REORGANIZE
+    assert state["cleanup"]["cleanup_passes"] == 0
+    assert "cleanup_check_after" not in state["cleanup"]
+    assert state["sidecar"]["status"] == plugin._STATE_PENDING_REORGANIZE
+    assert state["sidecar"]["sidecar_attempts"] == 0
+    assert state["sidecar"]["cleanup_passes"] == 2
+    assert "sidecar_check_after" not in state["sidecar"]
+    assert state["rename"]["status"] == plugin._STATE_PENDING_REFRESH
+    assert state["rename"]["rename_attempts"] == 0
+    assert state["complete"]["status"] == plugin._STATE_COMPLETE
+
+
+def test_pending_library_scan_is_retried_before_episode_processing(monkeypatch):
+    history = SimpleNamespace(
+        id=1,
+        date="2026-07-24 12:00:00",
+        dest="/library/show/Show S01E01.mkv",
+    )
+
+    class FakeReorganizer:
+        preview_calls = 0
+
+        def __init__(self, logger, dry_run):
+            pass
+
+        @staticmethod
+        def compatibility_error():
+            return ""
+
+        def recent_histories(
+            self,
+            days,
+            tracked_history_ids=None,
+            preferred_history_ids=None,
+        ):
+            return [history]
+
+        @staticmethod
+        def processing_key(_history):
+            return "episode"
+
+        @staticmethod
+        def target_path(item):
+            return Path(item.dest)
+
+        @staticmethod
+        def display_name(_history):
+            return "Show S01E01"
+
+        def preview(self, _history):
+            type(self).preview_calls += 1
+            raise AssertionError("scan retry must run before preview")
+
+    class FakeClient:
+        scan_calls = 0
+
+        @staticmethod
+        def libraries():
+            return []
+
+        def scan_library(self):
+            type(self).scan_calls += 1
+            if type(self).scan_calls == 1:
+                raise RuntimeError("Jellyfin unavailable")
+
+    plugin = RecentEpisodeMaintenance()
+    plugin._enable_refresh = False
+    plugin._enable_reorganize = True
+    plugin._scan_after_reorganize = True
+    plugin._cleanup_old_sidecars = False
+    plugin._max_items = 10
+    plugin._days = 15
+    plugin._dry_run = False
+    plugin._notify = False
+    plugin._library_ids = []
+    saved = []
+    initial_state = {
+        "episode": {
+            "status": plugin._STATE_PENDING_REORGANIZE,
+            "history_id": 1,
+            "history_date": history.date,
+            "scan_pending": True,
+        }
+    }
+    plugin._load_processing_state = lambda: deepcopy(
+        saved[-1] if saved else initial_state
+    )
+
+    def save_state(state):
+        saved.append(deepcopy(state))
+        return True
+
+    plugin._save_processing_state = save_state
+    plugin._get_jellyfin_client = FakeClient
+    monkeypatch.setattr(plugin_module, "MoviePilotReorganizer", FakeReorganizer)
+
+    plugin._run_once()
+
+    assert FakeClient.scan_calls == 1
+    assert saved[-1]["episode"]["scan_pending"] is True
+    assert "operation_intent" not in saved[-1]["episode"]
+
+    plugin._run_once()
+
+    assert FakeClient.scan_calls == 2
+    assert "scan_pending" not in saved[-1]["episode"]
+    assert "operation_intent" not in saved[-1]["episode"]
+    assert FakeReorganizer.preview_calls == 0
+
+
+def test_failed_intent_checkpoint_prevents_external_operations(monkeypatch):
+    history = SimpleNamespace(
+        id=1,
+        date="2026-07-24 12:00:00",
+        dest="/library/show/Show S01E01 - Old Title.mkv",
+    )
+    expected_path = Path("/library/show/Show S01E01 - New Title.mkv")
+
+    class FakeReorganizer:
+        reorganize_calls = 0
+
+        def __init__(self, logger, dry_run):
+            pass
+
+        @staticmethod
+        def compatibility_error():
+            return ""
+
+        def recent_histories(
+            self,
+            days,
+            tracked_history_ids=None,
+            preferred_history_ids=None,
+        ):
+            return [history]
+
+        @staticmethod
+        def processing_key(_history):
+            return "episode"
+
+        @staticmethod
+        def target_path(item):
+            return Path(item.dest)
+
+        @staticmethod
+        def display_name(_history):
+            return "Show S01E01"
+
+        @staticmethod
+        def episode_target(item):
+            return EpisodeTarget(path=item.dest)
+
+        @staticmethod
+        def preview(_history):
+            return OperationResult(success=True, target=expected_path)
+
+        @staticmethod
+        def related_history_count(_history):
+            return 0
+
+        def reorganize(self, **_kwargs):
+            type(self).reorganize_calls += 1
+            return OperationResult(success=True, target=expected_path)
+
+    episode = EpisodeItem(
+        item_id="jf-1",
+        name="Old Title",
+        series_name="Show",
+        season_number=1,
+        episode_number=1,
+        path=history.dest,
+    )
+
+    class FakeClient:
+        refresh_calls = 0
+
+        @staticmethod
+        def libraries():
+            return []
+
+        @staticmethod
+        def path_key(path):
+            return JellyfinServiceClient.path_key(path)
+
+        def match_recent_episodes(self, targets, days, library_ids):
+            return {
+                self.path_key(target.path): [episode]
+                for target in targets
+            }
+
+        def refresh_episode(self, **_kwargs):
+            type(self).refresh_calls += 1
+
+    plugin = RecentEpisodeMaintenance()
+    plugin._enable_refresh = True
+    plugin._enable_reorganize = True
+    plugin._scan_after_reorganize = True
+    plugin._cleanup_old_sidecars = True
+    plugin._skip_same_name = True
+    plugin._refresh_mode = "all"
+    plugin._replace_images = True
+    plugin._max_items = 10
+    plugin._days = 15
+    plugin._dry_run = False
+    plugin._notify = False
+    plugin._library_ids = []
+    plugin._load_processing_state = lambda: {}
+    plugin._save_processing_state = lambda _state: False
+    plugin._get_jellyfin_client = FakeClient
+    monkeypatch.setattr(plugin_module, "MoviePilotReorganizer", FakeReorganizer)
+
+    plugin._run_once()
+
+    assert FakeClient.refresh_calls == 0
+    assert FakeReorganizer.reorganize_calls == 0
+
+
+def test_moviepilot_compatibility_failure_stops_before_history_query(monkeypatch):
+    class IncompatibleReorganizer:
+        history_calls = 0
+
+        def __init__(self, logger, dry_run):
+            pass
+
+        @staticmethod
+        def compatibility_error():
+            return "preview unsupported"
+
+        def recent_histories(self, **_kwargs):
+            type(self).history_calls += 1
+            return []
+
+    plugin = RecentEpisodeMaintenance()
+    plugin._enable_refresh = True
+    plugin._enable_reorganize = True
+    plugin._max_items = 10
+    plugin._dry_run = False
+    plugin._notify = False
+    monkeypatch.setattr(
+        plugin_module,
+        "MoviePilotReorganizer",
+        IncompatibleReorganizer,
+    )
+
+    plugin._run_once()
+
+    assert IncompatibleReorganizer.history_calls == 0
 
 
 def test_reorganized_record_is_rechecked_by_jellyfin_before_completion(
@@ -154,7 +596,12 @@ def test_reorganized_record_is_rechecked_by_jellyfin_before_completion(
         def __init__(self, logger, dry_run):
             self.dry_run = dry_run
 
-        def recent_histories(self, days, tracked_history_ids=None):
+        def recent_histories(
+            self,
+            days,
+            tracked_history_ids=None,
+            preferred_history_ids=None,
+        ):
             return [history]
 
         @staticmethod
@@ -204,6 +651,9 @@ def test_reorganized_record_is_rechecked_by_jellyfin_before_completion(
         def match_recent_episodes(self, targets, days, library_ids):
             return {self.path_key(target.path): [episode] for target in targets}
 
+        def libraries(self):
+            return []
+
         def refresh_episode(self, **_kwargs):
             type(self).refresh_calls += 1
 
@@ -231,7 +681,11 @@ def test_reorganized_record_is_rechecked_by_jellyfin_before_completion(
             "refresh_check_after": "2000-01-01T00:00:00",
         }
     }
-    plugin._save_processing_state = lambda state: saved.append(deepcopy(state))
+    def save_state(state):
+        saved.append(deepcopy(state))
+        return True
+
+    plugin._save_processing_state = save_state
     client = FakeClient()
     plugin._get_jellyfin_client = lambda: client
     monkeypatch.setattr(plugin_module, "MoviePilotReorganizer", FakeReorganizer)

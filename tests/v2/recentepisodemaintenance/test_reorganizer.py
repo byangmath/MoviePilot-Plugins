@@ -78,6 +78,31 @@ def test_does_not_attach_history_from_another_download():
     assert reorganizer.related_history_count(video) == 0
 
 
+def test_preferred_tracked_video_finishes_before_newer_replacement():
+    reorganizer = MoviePilotReorganizer(logger=None)
+    older = history(
+        history_id=1,
+        source="/source/show/older.mkv",
+        dest="/library/show/Season 01/测试剧 S01E01 - 旧文件.mkv",
+        date="2026-07-20 12:00:00",
+        download_hash="older-transfer",
+    )
+    newer = history(
+        history_id=2,
+        source="/source/show/newer.mkv",
+        dest="/library/show/Season 01/测试剧 S01E01 - 新文件.mkv",
+        date="2026-07-21 12:00:00",
+        download_hash="newer-transfer",
+    )
+
+    selected = reorganizer._select_primary_histories(
+        [newer, older],
+        preferred_history_ids={1},
+    )
+
+    assert selected == [older]
+
+
 def test_ignores_episode_group_without_video_history():
     reorganizer = MoviePilotReorganizer(logger=None)
     subtitle = history(
@@ -313,6 +338,88 @@ def test_refresh_cooldown_defers_record_without_dropping_it():
     assert selected == []
     assert selection["refresh_waiting"] == 1
     assert state[key]["history_id"] == 1
+
+
+def test_due_monitoring_records_are_not_starved_by_new_records():
+    plugin = RecentEpisodeMaintenance()
+    plugin._max_items = 1
+    reorganizer = MoviePilotReorganizer(logger=None)
+    due_items = []
+    stored_state = {}
+    for index in range(8):
+        item = history(
+            history_id=100 + index,
+            source=f"/source/show/due-{index}.mkv",
+            dest=f"/library/show/Season 01/测试剧 S01E{index + 1:02d}.mkv",
+            date=f"2026-07-20 12:0{index}:00",
+            download_hash=f"due-{index}",
+        )
+        item.episodes = f"E{index + 1:02d}"
+        due_items.append(item)
+        stored_state[reorganizer.processing_key(item)] = {
+            "status": plugin._STATE_MONITORING,
+            "history_id": item.id,
+            "next_preview_at": "2000-01-01T00:00:00",
+        }
+    new_items = []
+    for index in range(10):
+        item = history(
+            history_id=index + 1,
+            source=f"/source/show/new-{index}.mkv",
+            dest=f"/library/show/Season 01/测试剧 S02E{index + 1:02d}.mkv",
+            date=f"2026-07-22 12:{index:02d}:00",
+            download_hash=f"new-{index}",
+        )
+        item.seasons = "S02"
+        item.episodes = f"E{index + 1:02d}"
+        new_items.append(item)
+
+    selected, _, selection = plugin._select_histories(
+        histories=new_items + due_items,
+        reorganizer=reorganizer,
+        state=stored_state,
+    )
+
+    assert any(item in selected for item in due_items)
+    assert any(item in selected for item in new_items)
+    assert selection["monitoring"] > 0
+    assert selection["monitoring_queued"] > 0
+    assert selection["new_queued"] > 0
+
+
+def test_pending_library_scan_has_priority_over_regular_pending_records():
+    plugin = RecentEpisodeMaintenance()
+    plugin._max_items = 1
+    reorganizer = MoviePilotReorganizer(logger=None)
+    histories = []
+    stored_state = {}
+    for index in range(6):
+        item = history(
+            history_id=index + 1,
+            source=f"/source/show/pending-{index}.mkv",
+            dest=f"/library/show/Season 01/测试剧 S01E{index + 1:02d}.mkv",
+            date=f"2026-07-24 12:0{index}:00",
+            download_hash=f"pending-{index}",
+        )
+        item.episodes = f"E{index + 1:02d}"
+        histories.append(item)
+        stored_state[reorganizer.processing_key(item)] = {
+            "status": plugin._STATE_PENDING_REORGANIZE,
+            "history_id": item.id,
+            "updated_at": f"2026-07-24T12:0{index}:00",
+            "scan_pending": index == 5,
+        }
+
+    selected, _, selection = plugin._select_histories(
+        histories=histories,
+        reorganizer=reorganizer,
+        state=stored_state,
+    )
+
+    assert histories[-1] in selected
+    assert selection["scan_waiting"] == 1
+    assert selection["pending_queued"] == 1
+
 
 def test_selection_counts_due_and_waiting_monitoring_records():
     plugin = RecentEpisodeMaintenance()

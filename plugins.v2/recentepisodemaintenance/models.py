@@ -140,6 +140,9 @@ class RunResult:
             )
             lines.append(
                 "当前状态："
+                f"待后续检查 "
+                f"{self.queue_counts.get('pending_queued', 0) + self.queue_counts.get('new_queued', 0) + self.queue_counts.get('monitoring_queued', 0)} 条，"
+                f"等待扫描 {self.queue_counts.get('scan_waiting', 0)} 条，"
                 f"等待刷新确认 {self.queue_counts.get('refresh_waiting', 0)} 条，"
                 f"等待复查 {self.queue_counts.get('monitoring_waiting', 0)} 条，"
                 f"等待附件 {self.queue_counts.get('sidecar_waiting', 0)} 条，"

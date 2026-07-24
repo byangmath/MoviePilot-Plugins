@@ -49,6 +49,7 @@ class MoviePilotReorganizer:
         self,
         days: int,
         tracked_history_ids: set[int] | None = None,
+        preferred_history_ids: set[int] | None = None,
     ) -> list[Any]:
         """Return recent records plus unfinished records already admitted to the queue."""
         if not self._history_available():
@@ -81,18 +82,42 @@ class MoviePilotReorganizer:
                 query = query.order_by(history_cls.id.desc())
             candidates = query.all()
 
-        return self._select_primary_histories(candidates)
+        return self._select_primary_histories(
+            candidates,
+            preferred_history_ids=preferred_history_ids,
+        )
 
-    def _select_primary_histories(self, candidates: list[Any]) -> list[Any]:
+    def _select_primary_histories(
+        self,
+        candidates: list[Any],
+        preferred_history_ids: set[int] | None = None,
+    ) -> list[Any]:
         grouped: dict[tuple[str, str, str], list[Any]] = {}
         for history in candidates:
             grouped.setdefault(self._episode_key(history), []).append(history)
 
+        preferred_ids = {
+            int(history_id)
+            for history_id in (preferred_history_ids or set())
+            if history_id
+        }
         histories: list[Any] = []
         self._related_histories = {}
         for episode_histories in grouped.values():
+            video_histories = [
+                history
+                for history in episode_histories
+                if self._is_video_history(history)
+            ]
             primary = next(
-                (history for history in episode_histories if self._is_video_history(history)),
+                (
+                    history
+                    for history in video_histories
+                    if int(getattr(history, "id", None) or 0) in preferred_ids
+                ),
+                None,
+            ) or next(
+                iter(video_histories),
                 None,
             )
             if primary is None:
@@ -289,6 +314,15 @@ class MoviePilotReorganizer:
             self._transfer_history_cls,
             self._get_db,
         ])
+
+    def compatibility_error(self) -> str:
+        if not self._history_available():
+            return "当前 MoviePilot 未找到兼容的整理历史接口"
+        if not self._reorganize_available():
+            return "当前 MoviePilot 未找到兼容的历史重新整理接口"
+        if not self._supports_preview():
+            return "当前 MoviePilot 版本不支持整理预览"
+        return ""
 
     def _reorganize_available(self) -> bool:
         return all([

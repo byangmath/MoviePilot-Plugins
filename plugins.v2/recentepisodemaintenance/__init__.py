@@ -60,6 +60,8 @@ class RecentEpisodeMaintenance(_PluginBase):
     _REFRESH_RECHECK_MINUTES = 30
     _MONITOR_INTERVAL_HOURS = (24, 48, 72)
     _INSPECTION_MULTIPLIER = 5
+    _STATE_SAVE_ATTEMPTS = 3
+    _STATE_SAVE_RETRY_SECONDS = 2
     _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".avif"}
     _SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".sub", ".vtt", ".sup"}
     _CRON_HINT_EXPRESSION = (
@@ -160,9 +162,16 @@ class RecentEpisodeMaintenance(_PluginBase):
         if run_once:
             config["run_once"] = False
             config_changed = True
+        retry_attention = bool(config.get("retry_attention", False))
+        if retry_attention:
+            config["retry_attention"] = False
+            config_changed = True
 
         if config_changed:
             self.__update_config(config)
+
+        if retry_attention:
+            run_once = self._retry_attention_records() > 0 or run_once
 
         if run_once:
             self.run_once()
@@ -201,6 +210,12 @@ class RecentEpisodeMaintenance(_PluginBase):
                         "content": [
                             self._switch("enabled", "启用插件", 6, "开启后按执行周期自动运行"),
                             self._switch("run_once", "立即运行一次", 6, "保存配置后执行一次，随后自动关闭"),
+                            self._switch(
+                                "retry_attention",
+                                "重新处理需人工检查记录",
+                                6,
+                                "重置全部人工检查记录的对应重试次数并立即重新入队，保存后自动关闭",
+                            ),
                             self._text(
                                 "cron",
                                 "执行周期",
@@ -304,6 +319,7 @@ class RecentEpisodeMaintenance(_PluginBase):
         ], {
             "enabled": False,
             "run_once": False,
+            "retry_attention": False,
             "cron": "0 4 * * *",
             "days": 7,
             "max_items": 20,
@@ -363,11 +379,26 @@ class RecentEpisodeMaintenance(_PluginBase):
         operation_limit = max(int(self._max_items), 1)
         result = RunResult(operation_limit=operation_limit)
         reorganizer = MoviePilotReorganizer(logger=logger, dry_run=self._dry_run)
+        compatibility_check = getattr(reorganizer, "compatibility_error", None)
+        compatibility_error = (
+            str(compatibility_check() or "")
+            if callable(compatibility_check)
+            else ""
+        )
+        if compatibility_error:
+            result.add_error(f"MoviePilot 兼容性检查失败：{compatibility_error}")
+            logger.error(
+                f"[最近剧集维护] MoviePilot 兼容性检查失败："
+                f"{compatibility_error}"
+            )
+            self._finish_run(result)
+            return
         try:
             stored_state = self._load_processing_state()
             history_pool = reorganizer.recent_histories(
                 days=self._days,
                 tracked_history_ids=self._tracked_history_ids(stored_state),
+                preferred_history_ids=self._protected_history_ids(stored_state),
             )
             histories, processing_state, selection = self._select_histories(
                 histories=history_pool,
@@ -381,6 +412,10 @@ class RecentEpisodeMaintenance(_PluginBase):
                     "pending",
                     "new",
                     "monitoring",
+                    "pending_queued",
+                    "new_queued",
+                    "monitoring_queued",
+                    "scan_waiting",
                     "refresh_waiting",
                     "monitoring_waiting",
                     "sidecar_waiting",
@@ -395,7 +430,10 @@ class RecentEpisodeMaintenance(_PluginBase):
                 f"检查 {len(histories)} 条视频记录"
                 f"（待复查 {selection['pending']} 条，新记录 {selection['new']} 条，"
                 f"到期复查 {selection['monitoring']} 条）；"
-                f"当前状态：等待刷新确认 {selection['refresh_waiting']} 条，"
+                f"当前状态：待后续检查 "
+                f"{selection['pending_queued'] + selection['new_queued'] + selection['monitoring_queued']} 条，"
+                f"等待扫描 {selection['scan_waiting']} 条，"
+                f"等待刷新确认 {selection['refresh_waiting']} 条，"
                 f"等待复查 {selection['monitoring_waiting']} 条，"
                 f"等待附件 {selection['sidecar_waiting']} 条，"
                 f"等待清理 {selection['cleanup_waiting']} 条，"
@@ -407,26 +445,122 @@ class RecentEpisodeMaintenance(_PluginBase):
                     + "\n".join(f"- {item}" for item in selection["attention_items"])
                 )
         except Exception as err:
-            logger.error(f"[最近剧集维护] 查询 MP 整理历史失败：{err}")
+            result.add_error(f"读取队列或查询 MP 整理历史失败：{err}")
+            logger.error(f"[最近剧集维护] 读取队列或查询 MP 整理历史失败：{err}")
+            self._finish_run(result)
             return
 
         if not histories:
-            if not self._dry_run:
-                self._save_processing_state(processing_state)
             waiting_text = self._waiting_records_text(selection)
             logger.info(
                 "[最近剧集维护] 当前时间范围内没有到期待处理的整理记录"
                 f"{waiting_text}"
             )
+            self._finish_run(result, processing_state)
             return
 
         client: JellyfinServiceClient | None = None
+        needs_jellyfin = self._enable_refresh or (
+            self._enable_reorganize and self._scan_after_reorganize
+        )
+        if needs_jellyfin:
+            client = self._get_jellyfin_client()
+            if client:
+                try:
+                    libraries = client.libraries()
+                    available_library_ids = {
+                        str(item.get("value") or "")
+                        for item in libraries
+                        if item.get("value")
+                    }
+                    missing_library_ids = set(self._library_ids) - available_library_ids
+                    if missing_library_ids:
+                        raise RuntimeError(
+                            "配置的 Jellyfin 媒体库已不存在："
+                            + "、".join(sorted(missing_library_ids))
+                        )
+                except Exception as err:
+                    result.add_error(f"Jellyfin 兼容性检查失败：{err}")
+                    logger.error(
+                        f"[最近剧集维护] Jellyfin 兼容性检查失败：{err}"
+                    )
+                    self._finish_run(result, processing_state)
+                    return
+            else:
+                result.add_error("Jellyfin 兼容性检查失败：未找到可用服务")
+                self._finish_run(result, processing_state)
+                return
+
+        scan_pending_keys = {
+            reorganizer.processing_key(history)
+            for history in histories
+            if bool(
+                (processing_state.get(reorganizer.processing_key(history)) or {}).get(
+                    "scan_pending"
+                )
+            )
+        }
+        if scan_pending_keys and client:
+            snapshots = self._state_item_snapshots(
+                processing_state,
+                scan_pending_keys,
+            )
+            self._set_operation_intent(
+                processing_state,
+                scan_pending_keys,
+                "scan",
+            )
+            if not self._checkpoint_processing_state(processing_state):
+                self._restore_state_items(processing_state, snapshots)
+                result.add_error("保存媒体库扫描意图失败，本轮未执行扫描")
+                self._finish_run(result, processing_state)
+                return
+            try:
+                client.scan_library()
+                for key in scan_pending_keys:
+                    item = dict(processing_state.get(key) or {})
+                    item.pop("scan_pending", None)
+                    processing_state[key] = item
+                self._clear_operation_intent(
+                    processing_state,
+                    scan_pending_keys,
+                )
+                if not self._checkpoint_processing_state(processing_state):
+                    result.add_error("媒体库扫描已提交，但结果状态保存失败")
+                    self._finish_run(result, processing_state)
+                    return
+                logger.info(
+                    f"[最近剧集维护] 已重试 Jellyfin 媒体库扫描，"
+                    f"涉及 {len(scan_pending_keys)} 条记录"
+                )
+                histories = [
+                    history
+                    for history in histories
+                    if reorganizer.processing_key(history) not in scan_pending_keys
+                ]
+            except Exception as err:
+                self._clear_operation_intent(
+                    processing_state,
+                    scan_pending_keys,
+                )
+                if not self._checkpoint_processing_state(processing_state):
+                    result.add_error(
+                        "媒体库扫描重试失败且待重试状态保存失败"
+                    )
+                result.add_error(f"媒体库扫描重试失败：{err}")
+                self._finish_run(result, processing_state)
+                return
+            if not histories:
+                self._finish_run(result, processing_state)
+                return
+
         deferred_reorganize_targets: set[str] = set()
         deferred_reorganize_reasons: dict[str, str] = {}
         refresh_first_targets: set[str] = set()
         history_keys_by_target: dict[str, set[str]] = {}
         expected_paths: dict[str, Path] = {}
         preview_failed_keys: set[str] = set()
+        state_persistence_failed = False
         for history in histories:
             processing_key = reorganizer.processing_key(history)
             target_key = JellyfinServiceClient.path_key(reorganizer.target_path(history))
@@ -472,7 +606,6 @@ class RecentEpisodeMaintenance(_PluginBase):
                 )
 
         if self._enable_refresh:
-            client = self._get_jellyfin_client()
             if client:
                 targets = [
                     target
@@ -604,8 +737,8 @@ class RecentEpisodeMaintenance(_PluginBase):
                             f"已达到单次操作上限｜文件：{episode_file}"
                         )
                         continue
-                    result.operations_used += 1
                     if self._dry_run:
+                        result.operations_used += 1
                         result.refresh_previewed += 1
                         for refresh_target in refresh_targets:
                             deferred_reorganize_reasons[refresh_target] = (
@@ -616,6 +749,28 @@ class RecentEpisodeMaintenance(_PluginBase):
                             f"标题不一致，将完整刷新元数据和图片｜文件：{episode_file}"
                         )
                         continue
+                    refresh_state_snapshot = self._state_item_snapshots(
+                        processing_state,
+                        episode_history_keys,
+                    )
+                    self._set_operation_intent(
+                        processing_state,
+                        episode_history_keys,
+                        "refresh",
+                        jellyfin_item_id=episode.item_id,
+                    )
+                    if not self._checkpoint_processing_state(processing_state):
+                        self._restore_state_items(
+                            processing_state,
+                            refresh_state_snapshot,
+                        )
+                        result.add_error(
+                            f"{episode_label}：保存刷新意图失败，本轮未提交刷新",
+                            episode_file,
+                        )
+                        state_persistence_failed = True
+                        break
+                    result.operations_used += 1
                     try:
                         client.refresh_episode(
                             item_id=episode.item_id,
@@ -638,17 +793,42 @@ class RecentEpisodeMaintenance(_PluginBase):
                             had_action=True,
                             refresh_check_after=self._refresh_recheck_at(),
                         )
-                        self._checkpoint_processing_state(processing_state)
+                        self._clear_operation_intent(
+                            processing_state,
+                            episode_history_keys,
+                        )
+                        if not self._checkpoint_processing_state(processing_state):
+                            result.add_error(
+                                f"{episode_label}：刷新已提交，但结果状态保存失败",
+                                episode_file,
+                            )
+                            state_persistence_failed = True
                         for refresh_target in refresh_targets:
                             deferred_reorganize_reasons[refresh_target] = (
                                 "标题不一致，本轮已提交元数据刷新，等待确认"
                             )
+                        if state_persistence_failed:
+                            break
                     except Exception as err:
+                        self._restore_state_items(
+                            processing_state,
+                            refresh_state_snapshot,
+                        )
                         self._mark_processing_state(
                             processing_state,
                             episode_history_keys,
                             self._STATE_PENDING_REFRESH,
                         )
+                        self._clear_operation_intent(
+                            processing_state,
+                            episode_history_keys,
+                        )
+                        if not self._checkpoint_processing_state(processing_state):
+                            result.add_error(
+                                f"{episode_label}：刷新失败且状态保存失败",
+                                episode_file,
+                            )
+                            state_persistence_failed = True
                         result.add_error(f"{episode_label}：{err}", episode_file)
                         for refresh_target in refresh_targets:
                             deferred_reorganize_reasons[refresh_target] = (
@@ -658,6 +838,8 @@ class RecentEpisodeMaintenance(_PluginBase):
                             f"[最近剧集维护] 刷新失败 {episode_label}："
                             f"标题不一致；{err}｜文件：{episode_file}"
                         )
+                        if state_persistence_failed:
+                            break
             else:
                 result.add_error("未找到可用的 Jellyfin 媒体服务器")
                 for history in histories:
@@ -674,9 +856,9 @@ class RecentEpisodeMaintenance(_PluginBase):
                         )
 
         reorganized_sidecars: list[dict[str, Any]] = []
-        sidecars_ready_for_scan = False
+        sidecars_ready_for_scan: set[str] = set()
         sidecar_directory_cache: dict[str, set[str] | None] = {}
-        if self._enable_reorganize:
+        if self._enable_reorganize and not state_persistence_failed:
             for history in histories:
                 label = reorganizer.display_name(history)
                 processing_key = reorganizer.processing_key(history)
@@ -745,6 +927,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                     continue
                 protected_danmu: list[str] = []
                 danmu_settle_issues: list[str] = []
+                reorganization_state_snapshot = None
                 try:
                     state_item = processing_state.get(processing_key) or {}
                     rename_attempts = int(state_item.get("rename_attempts") or 0)
@@ -767,7 +950,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                     ):
                         sidecar_pending = False
                         if not cleanup_pending or not self._cleanup_old_sidecars:
-                            sidecars_ready_for_scan = True
+                            sidecars_ready_for_scan.add(processing_key)
                         self._mark_processing_state(
                             processing_state,
                             {processing_key},
@@ -816,6 +999,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 processing_state,
                                 {processing_key},
                                 self._STATE_ATTENTION,
+                                attention_stage="sidecar",
                             )
                         logger.error(
                             f"[最近剧集维护] 停止刮削 {label}：连续重试 "
@@ -833,7 +1017,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 cleanup_pending=False,
                             )
                             cleanup_pending = False
-                            sidecars_ready_for_scan = True
+                            sidecars_ready_for_scan.add(processing_key)
                             logger.info(
                                 f"[最近剧集维护] 跳过旧附件清理 {label}："
                                 "配置已关闭"
@@ -854,8 +1038,30 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 cleanup_pending=False,
                             )
                             cleanup_pending = False
-                            sidecars_ready_for_scan = True
+                            sidecars_ready_for_scan.add(processing_key)
                         else:
+                            cleanup_state_snapshot = self._state_item_snapshots(
+                                processing_state,
+                                {processing_key},
+                            )
+                            self._set_operation_intent(
+                                processing_state,
+                                {processing_key},
+                                "cleanup",
+                            )
+                            if not self._checkpoint_processing_state(
+                                processing_state
+                            ):
+                                self._restore_state_items(
+                                    processing_state,
+                                    cleanup_state_snapshot,
+                                )
+                                result.add_error(
+                                    f"{label}：保存旧附件清理意图失败，本轮未执行清理",
+                                    expected_path,
+                                )
+                                state_persistence_failed = True
+                                break
                             deleted, renamed, cleanup_issues = self._cleanup_old_sidecar_snapshot(
                                 old_sidecars,
                                 cleanup_old_media_path,
@@ -875,13 +1081,25 @@ class RecentEpisodeMaintenance(_PluginBase):
                                     ),
                                     cleanup_passes=next_cleanup_pass,
                                 )
-                                self._checkpoint_processing_state(processing_state)
+                                self._clear_operation_intent(
+                                    processing_state,
+                                    {processing_key},
+                                )
+                                if not self._checkpoint_processing_state(
+                                    processing_state
+                                ):
+                                    result.add_error(
+                                        f"{label}：旧附件已清理，但结果状态保存失败",
+                                        expected_path,
+                                    )
+                                    state_persistence_failed = True
+                                    break
                                 issue_text = (
                                     f"，{len(cleanup_issues)} 个附件待复查"
                                     if cleanup_issues
                                     else ""
                                 )
-                                sidecars_ready_for_scan = True
+                                sidecars_ready_for_scan.add(processing_key)
                                 logger.info(
                                     f"[最近剧集维护] 清理旧附件 {label}："
                                     f"删除 {len(deleted)} 个、改名 {len(renamed)} 个，"
@@ -902,8 +1120,21 @@ class RecentEpisodeMaintenance(_PluginBase):
                                     old_sidecars=old_sidecars,
                                     cleanup_old_media_path=cleanup_old_media_path,
                                     cleanup_passes=next_cleanup_pass,
+                                    attention_stage="cleanup",
                                 )
-                                self._checkpoint_processing_state(processing_state)
+                                self._clear_operation_intent(
+                                    processing_state,
+                                    {processing_key},
+                                )
+                                if not self._checkpoint_processing_state(
+                                    processing_state
+                                ):
+                                    result.add_error(
+                                        f"{label}：附件清理结果状态保存失败",
+                                        expected_path,
+                                    )
+                                    state_persistence_failed = True
+                                    break
                                 logger.error(
                                     f"[最近剧集维护] 清理失败 {label}："
                                     f"{len(cleanup_issues)} 个旧名称附件仍需人工检查"
@@ -915,7 +1146,19 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 self._STATE_PENDING_REORGANIZE,
                                 cleanup_pending=False,
                             )
-                            self._checkpoint_processing_state(processing_state)
+                            self._clear_operation_intent(
+                                processing_state,
+                                {processing_key},
+                            )
+                            if not self._checkpoint_processing_state(
+                                processing_state
+                            ):
+                                result.add_error(
+                                    f"{label}：旧附件已清理，但完成状态保存失败",
+                                    expected_path,
+                                )
+                                state_persistence_failed = True
+                                break
                             cleanup_pending = False
                             logger.info(
                                 f"[最近剧集维护] 清理完成 {label}："
@@ -928,10 +1171,20 @@ class RecentEpisodeMaintenance(_PluginBase):
                     ):
                         result.add_skipped(target_key)
                         if not self._dry_run:
-                            self._mark_processing_verified(
-                                processing_state,
-                                {processing_key},
-                            )
+                            if (
+                                self._scan_after_reorganize
+                                and processing_key in sidecars_ready_for_scan
+                            ):
+                                self._mark_processing_state(
+                                    processing_state,
+                                    {processing_key},
+                                    self._STATE_PENDING_REORGANIZE,
+                                )
+                            else:
+                                self._mark_processing_verified(
+                                    processing_state,
+                                    {processing_key},
+                                )
                         prefix = "试运行" if self._dry_run else ""
                         logger.info(
                             f"[最近剧集维护] {prefix}跳过 {label}：按当前命名规则预览，"
@@ -994,6 +1247,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 processing_state,
                                 {processing_key},
                                 self._STATE_ATTENTION,
+                                attention_stage="rename",
                             )
                             result.add_error(message, preview.target or current_file)
                             logger.error(
@@ -1036,6 +1290,36 @@ class RecentEpisodeMaintenance(_PluginBase):
                             current_file,
                             expected_path,
                         )
+                    next_sidecar_attempts = (
+                        sidecar_attempts + 1 if sidecar_pending else 1
+                    )
+                    reorganization_state_snapshot = self._state_item_snapshots(
+                        processing_state,
+                        {processing_key},
+                    )
+                    self._set_operation_intent(
+                        processing_state,
+                        {processing_key},
+                        "reorganize",
+                        expected_path=str(expected_path),
+                        sidecar_attempts=next_sidecar_attempts,
+                        old_sidecars=cleanup_snapshot,
+                        cleanup_old_media_path=(
+                            str(current_file) if cleanup_snapshot else None
+                        ),
+                        cleanup_passes=0,
+                    )
+                    if not self._checkpoint_processing_state(processing_state):
+                        self._restore_state_items(
+                            processing_state,
+                            reorganization_state_snapshot,
+                        )
+                        result.add_error(
+                            f"{label}：保存重新整理意图失败，本轮未执行整理",
+                            current_file,
+                        )
+                        state_persistence_failed = True
+                        break
                     if cleanup_snapshot and not self._dry_run:
                         protected_danmu, protection_issues = self._protect_danmu_sidecars(
                             cleanup_snapshot,
@@ -1048,11 +1332,27 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 current_file,
                             )
                             issue_text = "；".join(protection_issues + restore_issues)
+                            self._restore_state_items(
+                                processing_state,
+                                reorganization_state_snapshot,
+                            )
                             self._mark_processing_state(
                                 processing_state,
                                 {processing_key},
                                 self._STATE_PENDING_REORGANIZE,
                             )
+                            self._clear_operation_intent(
+                                processing_state,
+                                {processing_key},
+                            )
+                            if not self._checkpoint_processing_state(
+                                processing_state
+                            ):
+                                result.add_error(
+                                    f"{label}：弹幕保护失败且状态保存失败",
+                                    current_file,
+                                )
+                                state_persistence_failed = True
                             result.add_error(
                                 f"{label}：弹幕保护失败；{issue_text}",
                                 current_file,
@@ -1062,6 +1362,8 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 f"弹幕保护失败；{issue_text}｜"
                                 f"文件：{current_file or '未知文件'}"
                             )
+                            if state_persistence_failed:
+                                break
                             continue
                     result.operations_used += 1
                     operation = None
@@ -1104,7 +1406,6 @@ class RecentEpisodeMaintenance(_PluginBase):
                         else:
                             sidecar_directory_cache.clear()
                             target = operation.target or expected_path or current_file
-                            next_sidecar_attempts = sidecar_attempts + 1 if sidecar_pending else 1
                             cleanup_updates = {}
                             if not sidecar_pending:
                                 cleanup_updates = {
@@ -1133,19 +1434,32 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 sidecar_attempts=next_sidecar_attempts,
                                 **cleanup_updates,
                             )
+                            self._clear_operation_intent(
+                                processing_state,
+                                {processing_key},
+                            )
                             result.actions_submitted += 1
-                            self._checkpoint_processing_state(processing_state)
                             reorganized_sidecars.append({
                                 "key": processing_key,
                                 "label": label,
                                 "target": Path(target) if target else None,
                                 "attempts": next_sidecar_attempts,
                             })
+                            if not self._checkpoint_processing_state(
+                                processing_state
+                            ):
+                                result.add_error(
+                                    f"{label}：重新整理已提交，但结果状态保存失败",
+                                    target,
+                                )
+                                state_persistence_failed = True
                             logger.info(
                                 f"[最近剧集维护] 重命名 {label}：已提交重新整理，等待刮削附件；"
                                 f"检测到同批 {related_history_count} 条附件历史记录｜"
                                 f"{self._file_change_details(current_file, target)}"
                             )
+                            if state_persistence_failed:
+                                break
                     elif operation.skipped:
                         result.add_skipped(target_key)
                         if not self._dry_run:
@@ -1160,29 +1474,78 @@ class RecentEpisodeMaintenance(_PluginBase):
                                     processing_state,
                                     {processing_key},
                                 )
+                            self._clear_operation_intent(
+                                processing_state,
+                                {processing_key},
+                            )
+                            if not self._checkpoint_processing_state(
+                                processing_state
+                            ):
+                                result.add_error(
+                                    f"{label}：整理跳过结果状态保存失败",
+                                    operation.target or current_file,
+                                )
+                                state_persistence_failed = True
                         logger.info(
                             f"[最近剧集维护] 跳过 {label}：{operation.message}｜"
                             f"{self._file_change_details(current_file, operation.target)}"
                         )
+                        if state_persistence_failed:
+                            break
                     else:
                         if not self._dry_run:
+                            self._restore_state_items(
+                                processing_state,
+                                reorganization_state_snapshot,
+                            )
                             self._mark_processing_state(
                                 processing_state,
                                 {processing_key},
                                 self._STATE_PENDING_REORGANIZE,
                             )
+                            self._clear_operation_intent(
+                                processing_state,
+                                {processing_key},
+                            )
+                            if not self._checkpoint_processing_state(
+                                processing_state
+                            ):
+                                result.add_error(
+                                    f"{label}：整理失败且状态保存失败",
+                                    operation.target or current_file,
+                                )
+                                state_persistence_failed = True
                         result.add_error(f"{label}：{operation.message}", operation.target or current_file)
                         logger.error(
                             f"[最近剧集维护] 重命名失败 {label}：{operation.message}｜"
                             f"{self._file_change_details(current_file, operation.target)}"
                         )
+                        if state_persistence_failed:
+                            break
                 except Exception as err:
                     if not self._dry_run:
+                        if reorganization_state_snapshot is not None:
+                            self._restore_state_items(
+                                processing_state,
+                                reorganization_state_snapshot,
+                            )
                         self._mark_processing_state(
                             processing_state,
                             {processing_key},
                             self._STATE_PENDING_REORGANIZE,
                         )
+                        self._clear_operation_intent(
+                            processing_state,
+                            {processing_key},
+                        )
+                        if not self._checkpoint_processing_state(
+                            processing_state
+                        ):
+                            result.add_error(
+                                f"{label}：整理异常且状态保存失败",
+                                current_file,
+                            )
+                            state_persistence_failed = True
                     settle_text = (
                         "；弹幕恢复失败：" + "；".join(danmu_settle_issues)
                         if danmu_settle_issues
@@ -1193,6 +1556,8 @@ class RecentEpisodeMaintenance(_PluginBase):
                         f"[最近剧集维护] 重命名失败 {label}：{err}{settle_text}｜"
                         f"文件：{current_file or '未知文件'}"
                     )
+                    if state_persistence_failed:
+                        break
 
         missing_sidecars: dict[str, list[str]] = {}
         if reorganized_sidecars and not self._dry_run:
@@ -1217,6 +1582,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                         sidecar_pending=False,
                         sidecar_attempts=attempts,
                     )
+                    sidecars_ready_for_scan.add(processing_key)
                     logger.info(
                         f"[最近剧集维护] 重命名完成 {label}：刮削附件已补齐｜"
                         f"文件：{Path(target).name if target else '未知文件'}"
@@ -1235,6 +1601,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                     sidecar_check_after=(
                         None if exhausted else self._sidecar_recheck_at()
                     ),
+                    attention_stage="sidecar" if exhausted else None,
                 )
                 if exhausted:
                     message = (
@@ -1262,15 +1629,63 @@ class RecentEpisodeMaintenance(_PluginBase):
         sidecars_complete = (
             bool(reorganized_sidecars) or sidecars_ready_for_scan
         ) and not missing_sidecars and not cleanup_blocks_scan
-        if sidecars_complete and self._scan_after_reorganize and not self._dry_run:
-            client = client or self._get_jellyfin_client()
+        scan_keys = set(sidecars_ready_for_scan)
+        if (
+            sidecars_complete
+            and scan_keys
+            and self._scan_after_reorganize
+            and not self._dry_run
+            and not state_persistence_failed
+        ):
+            scan_state_snapshot = self._state_item_snapshots(
+                processing_state,
+                scan_keys,
+            )
+            for key in scan_keys:
+                item = dict(processing_state.get(key) or {})
+                item["scan_pending"] = True
+                processing_state[key] = item
+            self._set_operation_intent(
+                processing_state,
+                scan_keys,
+                "scan",
+            )
+            if not self._checkpoint_processing_state(processing_state):
+                self._restore_state_items(
+                    processing_state,
+                    scan_state_snapshot,
+                )
+                result.add_error("保存媒体库扫描意图失败，本轮未执行扫描")
+                state_persistence_failed = True
+            else:
+                client = client or self._get_jellyfin_client()
             try:
-                if client:
+                if client and not state_persistence_failed:
                     client.scan_library()
+                    for key in scan_keys:
+                        item = dict(processing_state.get(key) or {})
+                        item.pop("scan_pending", None)
+                        processing_state[key] = item
+                    self._clear_operation_intent(
+                        processing_state,
+                        scan_keys,
+                    )
+                    if not self._checkpoint_processing_state(processing_state):
+                        result.add_error(
+                            "Jellyfin 媒体库扫描已提交，但结果状态保存失败"
+                        )
+                        state_persistence_failed = True
                     logger.info("[最近剧集维护] 已触发 Jellyfin 媒体库扫描")
-                else:
+                elif not state_persistence_failed:
                     result.add_error("重新整理后无法触发 Jellyfin 媒体库扫描")
             except Exception as err:
+                self._clear_operation_intent(
+                    processing_state,
+                    scan_keys,
+                )
+                if not self._checkpoint_processing_state(processing_state):
+                    result.add_error("媒体库扫描失败且待重试状态保存失败")
+                    state_persistence_failed = True
                 result.add_error(f"媒体库扫描失败：{err}")
         elif missing_sidecars and self._scan_after_reorganize and not self._dry_run:
             logger.warning(
@@ -1288,12 +1703,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                 "完成清理前不触发 Jellyfin 媒体库扫描"
             )
 
-        if not self._dry_run:
-            self._save_processing_state(processing_state)
-
-        logger.info("[最近剧集维护] 运行完成\n" + result.summary())
-        if self._notify and result.should_notify():
-            self._post_message("最近剧集维护完成", result.summary())
+        self._finish_run(result, processing_state)
 
     def _post_message(self, title: str, text: str) -> None:
         post_message = getattr(self, "post_message", None)
@@ -1652,6 +2062,12 @@ class RecentEpisodeMaintenance(_PluginBase):
             if history_date:
                 state_item["history_date"] = str(history_date)
             state[key] = state_item
+        recovered_intents = self._recover_operation_intents(state)
+        if recovered_intents:
+            logger.warning(
+                f"[最近剧集维护] 检测到 {recovered_intents} 条上次运行未确认的"
+                "外部操作，已按实际状态重新排队"
+            )
 
         pending_statuses = {
             self._STATE_PENDING_REFRESH,
@@ -1717,7 +2133,12 @@ class RecentEpisodeMaintenance(_PluginBase):
             for history, key in pending_all
             if key not in waiting_keys
         ]
-        pending.sort(key=lambda item: str((state.get(item[1]) or {}).get("updated_at") or ""))
+        pending.sort(
+            key=lambda item: (
+                not bool((state.get(item[1]) or {}).get("scan_pending")),
+                str((state.get(item[1]) or {}).get("updated_at") or ""),
+            )
+        )
         new_items = [
             (history, key)
             for history, key in keyed_histories
@@ -1741,7 +2162,7 @@ class RecentEpisodeMaintenance(_PluginBase):
         operation_limit = max(int(self._max_items), 1)
         limit = max(operation_limit, operation_limit * self._INSPECTION_MULTIPLIER)
         selected: list[tuple[Any, str]] = []
-        other_items = new_items + monitoring
+        other_items = self._interleave_queue_items(monitoring, new_items)
         if pending and other_items:
             other_reserve = min(len(other_items), max(1, limit // 4)) if limit > 1 else 0
             selected.extend(pending[:max(limit - other_reserve, 0)])
@@ -1755,14 +2176,16 @@ class RecentEpisodeMaintenance(_PluginBase):
         pending_keys = {key for _, key in pending}
         new_keys = {key for _, key in new_items}
         monitoring_keys = {key for _, key in monitoring}
+        selected_keys = {key for _, key in selected}
         attention_items = []
         for history, key in keyed_histories:
             state_item = state.get(key) or {}
             if state_item.get("status") != self._STATE_ATTENTION:
                 continue
-            if state_item.get("cleanup_pending"):
+            attention_stage = self._attention_stage(state_item)
+            if attention_stage == "cleanup":
                 reason = "旧名称附件清理失败"
-            elif state_item.get("sidecar_pending"):
+            elif attention_stage == "sidecar":
                 reason = "刮削附件多次补齐失败"
             else:
                 reason = "多次重命名后路径仍变化"
@@ -1781,6 +2204,20 @@ class RecentEpisodeMaintenance(_PluginBase):
                 "pending": sum(1 for _, key in selected if key in pending_keys),
                 "new": sum(1 for _, key in selected if key in new_keys),
                 "monitoring": sum(1 for _, key in selected if key in monitoring_keys),
+                "pending_queued": sum(
+                    1 for _, key in pending if key not in selected_keys
+                ),
+                "new_queued": sum(
+                    1 for _, key in new_items if key not in selected_keys
+                ),
+                "monitoring_queued": sum(
+                    1 for _, key in monitoring if key not in selected_keys
+                ),
+                "scan_waiting": sum(
+                    1
+                    for _, key in keyed_histories
+                    if bool((state.get(key) or {}).get("scan_pending"))
+                ),
                 "refresh_waiting": len(refresh_waiting),
                 "monitoring_waiting": len(monitoring_all) - len(monitoring),
                 "sidecar_waiting": len(sidecar_waiting),
@@ -1867,6 +2304,86 @@ class RecentEpisodeMaintenance(_PluginBase):
         )
         return f"{label}｜文件：{target}"
 
+    @staticmethod
+    def _interleave_queue_items(
+        first: list[tuple[Any, str]],
+        second: list[tuple[Any, str]],
+    ) -> list[tuple[Any, str]]:
+        interleaved: list[tuple[Any, str]] = []
+        length = max(len(first), len(second))
+        for index in range(length):
+            if index < len(first):
+                interleaved.append(first[index])
+            if index < len(second):
+                interleaved.append(second[index])
+        return interleaved
+
+    def _recover_operation_intents(
+        self,
+        state: dict[str, dict[str, Any]],
+    ) -> int:
+        recovered = 0
+        for key, value in list(state.items()):
+            item = dict(value) if isinstance(value, dict) else {}
+            intent = item.get("operation_intent")
+            if not isinstance(intent, dict):
+                continue
+            operation = str(intent.get("operation") or "")
+            if operation == "refresh":
+                item["status"] = self._STATE_PENDING_REFRESH
+                item["had_action"] = True
+                item["refresh_check_after"] = self._intent_refresh_check_after(
+                    intent.get("prepared_at")
+                )
+            elif operation == "reorganize":
+                item["status"] = self._STATE_PENDING_REORGANIZE
+                item["had_action"] = True
+                if intent.get("expected_path"):
+                    item["expected_path"] = str(intent["expected_path"])
+                item["sidecar_pending"] = True
+                item["sidecar_attempts"] = int(
+                    intent.get("sidecar_attempts") or 1
+                )
+                item.pop("sidecar_check_after", None)
+                if intent.get("cleanup_old_media_path"):
+                    item["cleanup_pending"] = True
+                    item["cleanup_old_media_path"] = str(
+                        intent["cleanup_old_media_path"]
+                    )
+                    item["old_sidecars"] = [
+                        str(path)
+                        for path in intent.get("old_sidecars") or []
+                    ]
+                    item["cleanup_passes"] = int(
+                        intent.get("cleanup_passes") or 0
+                    )
+            elif operation == "cleanup":
+                item["status"] = self._STATE_PENDING_REORGANIZE
+                item["cleanup_pending"] = True
+                item.pop("cleanup_check_after", None)
+            elif operation == "scan":
+                item["status"] = self._STATE_PENDING_REORGANIZE
+                item["scan_pending"] = True
+            else:
+                item.pop("operation_intent", None)
+                state[key] = item
+                continue
+            item.pop("operation_intent", None)
+            item["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            state[key] = item
+            recovered += 1
+        return recovered
+
+    @classmethod
+    def _intent_refresh_check_after(cls, prepared_at: Any) -> str:
+        try:
+            prepared = datetime.fromisoformat(str(prepared_at))
+        except (TypeError, ValueError):
+            prepared = datetime.now()
+        return (
+            prepared + timedelta(minutes=cls._REFRESH_RECHECK_MINUTES)
+        ).isoformat(timespec="seconds")
+
     @classmethod
     def _cleanup_waiting_file_details(
         cls,
@@ -1911,9 +2428,14 @@ class RecentEpisodeMaintenance(_PluginBase):
         try:
             value = get_data(self._PROCESSING_STATE_KEY)
         except Exception as err:
-            logger.warning(f"[最近剧集维护] 读取处理状态失败，将重新建立队列：{err}")
+            raise RuntimeError(f"读取处理状态失败，已停止本轮运行：{err}") from err
+        if value is None:
             return {}
-        return value if isinstance(value, dict) else {}
+        if not isinstance(value, dict):
+            raise RuntimeError(
+                f"读取处理状态失败，数据格式应为对象，实际为 {type(value).__name__}"
+            )
+        return value
 
     @classmethod
     def _tracked_history_ids(
@@ -1932,22 +2454,237 @@ class RecentEpisodeMaintenance(_PluginBase):
                 tracked.add(history_id)
         return tracked
 
-    def _save_processing_state(self, state: dict[str, dict[str, Any]]) -> None:
+    def _save_processing_state(self, state: dict[str, dict[str, Any]]) -> bool:
         save_data = getattr(self, "save_data", None)
         if not callable(save_data):
             logger.warning("[最近剧集维护] 当前环境不支持保存处理状态")
-            return
-        try:
-            save_data(self._PROCESSING_STATE_KEY, state)
-        except Exception as err:
-            logger.error(f"[最近剧集维护] 保存处理状态失败：{err}")
+            return False
+        last_error: Exception | None = None
+        for attempt in range(1, self._STATE_SAVE_ATTEMPTS + 1):
+            try:
+                save_data(self._PROCESSING_STATE_KEY, state)
+                return True
+            except Exception as err:
+                last_error = err
+                if attempt >= self._STATE_SAVE_ATTEMPTS:
+                    break
+                logger.warning(
+                    f"[最近剧集维护] 保存处理状态失败，"
+                    f"{self._STATE_SAVE_RETRY_SECONDS} 秒后重试"
+                    f"（{attempt}/{self._STATE_SAVE_ATTEMPTS}）：{err}"
+                )
+                sleep(self._STATE_SAVE_RETRY_SECONDS)
+        logger.error(f"[最近剧集维护] 保存处理状态失败：{last_error}")
+        return False
 
     def _checkpoint_processing_state(
         self,
         state: dict[str, dict[str, Any]],
+    ) -> bool:
+        return self._dry_run or self._save_processing_state(state)
+
+    @staticmethod
+    def _state_item_snapshots(
+        state: dict[str, dict[str, Any]],
+        keys: set[str],
+    ) -> dict[str, dict[str, Any] | None]:
+        return {
+            key: dict(state[key]) if isinstance(state.get(key), dict) else None
+            for key in keys
+        }
+
+    @staticmethod
+    def _restore_state_items(
+        state: dict[str, dict[str, Any]],
+        snapshots: dict[str, dict[str, Any] | None],
     ) -> None:
-        if not self._dry_run:
-            self._save_processing_state(state)
+        for key, item in snapshots.items():
+            if item is None:
+                state.pop(key, None)
+            else:
+                state[key] = dict(item)
+
+    @staticmethod
+    def _set_operation_intent(
+        state: dict[str, dict[str, Any]],
+        keys: set[str],
+        operation: str,
+        **details: Any,
+    ) -> None:
+        prepared_at = datetime.now().isoformat(timespec="seconds")
+        for key in keys:
+            item = dict(state.get(key) or {})
+            item["operation_intent"] = {
+                "operation": operation,
+                "prepared_at": prepared_at,
+                **{
+                    name: value
+                    for name, value in details.items()
+                    if value is not None
+                },
+            }
+            state[key] = item
+
+    @staticmethod
+    def _clear_operation_intent(
+        state: dict[str, dict[str, Any]],
+        keys: set[str],
+    ) -> None:
+        for key in keys:
+            item = dict(state.get(key) or {})
+            item.pop("operation_intent", None)
+            state[key] = item
+
+    @classmethod
+    def _protected_history_ids(
+        cls,
+        state: dict[str, dict[str, Any]],
+    ) -> set[int]:
+        protected: set[int] = set()
+        for item in state.values():
+            if not isinstance(item, dict):
+                continue
+            if not any(
+                (
+                    item.get("sidecar_pending"),
+                    item.get("cleanup_pending"),
+                    item.get("scan_pending"),
+                    item.get("operation_intent"),
+                )
+            ):
+                continue
+            try:
+                history_id = int(item.get("history_id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if history_id > 0:
+                protected.add(history_id)
+        return protected
+
+    def _retry_attention_records(self) -> int:
+        try:
+            state = self._load_processing_state()
+        except Exception as err:
+            logger.error(f"[最近剧集维护] 无法重新处理人工检查记录：{err}")
+            return 0
+        retried = 0
+        for key, value in list(state.items()):
+            item = dict(value) if isinstance(value, dict) else {}
+            if item.get("status") != self._STATE_ATTENTION:
+                continue
+            attention_stage = self._attention_stage(item)
+            if attention_stage == "cleanup":
+                item["status"] = self._STATE_PENDING_REORGANIZE
+                item["cleanup_passes"] = 0
+                item.pop("cleanup_check_after", None)
+            elif attention_stage == "sidecar":
+                item["status"] = self._STATE_PENDING_REORGANIZE
+                item["sidecar_attempts"] = 0
+                item.pop("sidecar_check_after", None)
+            else:
+                item["status"] = (
+                    self._STATE_PENDING_REFRESH
+                    if self._enable_refresh
+                    else self._STATE_PENDING_REORGANIZE
+                )
+                item["rename_attempts"] = 0
+            item["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            item.pop("operation_intent", None)
+            item.pop("attention_stage", None)
+            state[key] = item
+            retried += 1
+        if not retried:
+            logger.info("[最近剧集维护] 当前没有需人工检查的记录")
+            return 0
+        if not self._save_processing_state(state):
+            logger.error("[最近剧集维护] 人工检查记录重新入队失败，未执行立即运行")
+            return 0
+        logger.info(
+            f"[最近剧集维护] 已将 {retried} 条需人工检查记录重新加入处理队列"
+        )
+        return retried
+
+    @staticmethod
+    def _attention_stage(item: dict[str, Any]) -> str:
+        stage = str(item.get("attention_stage") or "")
+        if stage in {"sidecar", "cleanup", "rename"}:
+            return stage
+        if item.get("sidecar_pending"):
+            return "sidecar"
+        if item.get("cleanup_pending"):
+            return "cleanup"
+        return "rename"
+
+    def _finish_run(
+        self,
+        result: RunResult,
+        processing_state: dict[str, dict[str, Any]] | None = None,
+    ) -> None:
+        if processing_state is not None:
+            self._refresh_result_queue_counts(result, processing_state)
+        if (
+            processing_state is not None
+            and not self._dry_run
+            and not self._save_processing_state(processing_state)
+        ):
+            result.add_error("保存处理状态失败，本轮后续运行可能需要恢复")
+        logger.info("[最近剧集维护] 运行完成\n" + result.summary())
+        if self._notify and result.should_notify():
+            self._post_message("最近剧集维护完成", result.summary())
+
+    def _refresh_result_queue_counts(
+        self,
+        result: RunResult,
+        state: dict[str, dict[str, Any]],
+    ) -> None:
+        if not result.queue_counts:
+            return
+        counts = {
+            "pending_queued": 0,
+            "new_queued": 0,
+            "monitoring_queued": 0,
+            "scan_waiting": 0,
+            "refresh_waiting": 0,
+            "monitoring_waiting": 0,
+            "sidecar_waiting": 0,
+            "cleanup_waiting": 0,
+            "complete": 0,
+            "attention": 0,
+        }
+        pending_statuses = {
+            self._STATE_PENDING_REFRESH,
+            self._STATE_PENDING_REORGANIZE,
+        }
+        for value in state.values():
+            item = value if isinstance(value, dict) else {}
+            status = item.get("status")
+            if status == self._STATE_COMPLETE:
+                counts["complete"] += 1
+            elif status == self._STATE_ATTENTION:
+                counts["attention"] += 1
+            elif item.get("scan_pending"):
+                counts["scan_waiting"] += 1
+            elif item.get("sidecar_pending"):
+                counts["sidecar_waiting"] += 1
+            elif item.get("cleanup_pending"):
+                counts["cleanup_waiting"] += 1
+            elif (
+                status == self._STATE_PENDING_REFRESH
+                and not self._timestamp_is_due(item.get("refresh_check_after"))
+            ):
+                counts["refresh_waiting"] += 1
+            elif (
+                status == self._STATE_MONITORING
+                and not self._timestamp_is_due(item.get("next_preview_at"))
+            ):
+                counts["monitoring_waiting"] += 1
+            elif status in pending_statuses:
+                counts["pending_queued"] += 1
+            elif status == self._STATE_MONITORING:
+                counts["monitoring_queued"] += 1
+            else:
+                counts["new_queued"] += 1
+        result.queue_counts.update(counts)
 
     @staticmethod
     def _history_keys_for_episode(
@@ -1995,7 +2732,13 @@ class RecentEpisodeMaintenance(_PluginBase):
     ) -> None:
         for key in keys:
             state_item = state.get(key) or {}
-            if bool(state_item.get("cleanup_pending")):
+            if bool(state_item.get("scan_pending")):
+                self._mark_processing_state(
+                    state,
+                    {key},
+                    self._STATE_PENDING_REORGANIZE,
+                )
+            elif bool(state_item.get("cleanup_pending")):
                 self._mark_processing_state(
                     state,
                     {key},
@@ -2053,6 +2796,7 @@ class RecentEpisodeMaintenance(_PluginBase):
         cleanup_old_media_path: Any = None,
         cleanup_check_after: str | None = None,
         cleanup_passes: int | None = None,
+        attention_stage: str | None = None,
     ) -> None:
         updated_at = datetime.now().isoformat(timespec="seconds")
         for key in keys:
@@ -2096,6 +2840,13 @@ class RecentEpisodeMaintenance(_PluginBase):
                 item["cleanup_check_after"] = cleanup_check_after
             if cleanup_passes is not None:
                 item["cleanup_passes"] = cleanup_passes
+            if status == RecentEpisodeMaintenance._STATE_ATTENTION:
+                item["attention_stage"] = (
+                    attention_stage
+                    or RecentEpisodeMaintenance._attention_stage(item)
+                )
+            else:
+                item.pop("attention_stage", None)
             if cleanup_pending is False:
                 for cleanup_key in (
                     "cleanup_pending",
@@ -2103,6 +2854,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                     "cleanup_old_media_path",
                     "cleanup_check_after",
                     "cleanup_passes",
+                    "scan_pending",
                 ):
                     item.pop(cleanup_key, None)
             if status in {
