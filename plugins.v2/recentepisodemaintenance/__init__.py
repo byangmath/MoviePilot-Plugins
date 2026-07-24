@@ -108,7 +108,7 @@ class RecentEpisodeMaintenance(_PluginBase):
     plugin_name = "最近剧集维护"
     plugin_desc = "维护 MoviePilot 最近整理入库的 Jellyfin 剧集"
     plugin_icon = "https://raw.githubusercontent.com/byangmath/MoviePilot-Plugins/main/icons/recentepisodemaintenance.png"
-    plugin_version = "0.2.3"
+    plugin_version = "0.2.4"
     plugin_author = "byangmath"
     author_url = "https://github.com/byangmath"
     plugin_config_prefix = "recentepisodemaintenance_"
