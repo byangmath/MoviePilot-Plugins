@@ -36,6 +36,39 @@ def test_episode_label_excludes_jellyfin_title_and_file():
     assert episode.episode_label == "搞笑一家人3 S01E83"
 
 
+def test_placeholder_preview_preserves_only_usable_jellyfin_title():
+    usable = EpisodeItem(item_id="usable", name="黑夜女神")
+    placeholder = EpisodeItem(item_id="placeholder", name="第 7 集")
+    unknown = EpisodeItem(item_id="unknown", name="未知标题")
+    series_name = EpisodeItem(
+        item_id="series",
+        name="Show",
+        series_name="Show",
+    )
+    filename = EpisodeItem(
+        item_id="filename",
+        name="Show S02E07 - 1080p 第 7 集",
+        path="/library/Show S02E07 - 1080p 第 7 集.mp4",
+    )
+
+    assert usable.should_preserve_jellyfin_title(
+        "/library/Show S02E07 - 1080p 第 7 集.mp4"
+    ) is True
+    assert usable.should_preserve_jellyfin_title(
+        "/library/Show S02E07 - 1080p Episode 7.mp4"
+    ) is True
+    assert usable.should_preserve_jellyfin_title(
+        "/library/Show S02E07 - 1080p 黑夜女神.mp4"
+    ) is False
+    assert placeholder.should_preserve_jellyfin_title(
+        "/library/Show S02E07 - 1080p 第 7 集.mp4"
+    ) is False
+    assert unknown.title_is_unreliable() is True
+    assert series_name.title_is_unreliable() is True
+    assert filename.title_is_unreliable() is True
+    assert usable.title_is_unreliable() is False
+
+
 def test_summary_lists_bare_full_file_paths():
     result = RunResult(refreshed=1, reorganized=1)
     result.add_refreshed_title("/media/搞笑一家人3 S01E83.mkv")
@@ -346,6 +379,7 @@ def test_pending_library_scan_is_retried_before_episode_processing(monkeypatch):
 
     class FakeReorganizer:
         preview_calls = 0
+        reorganize_calls = 0
 
         def __init__(self, logger, dry_run):
             pass
@@ -540,6 +574,190 @@ def test_failed_intent_checkpoint_prevents_external_operations(monkeypatch):
 
     assert FakeClient.refresh_calls == 0
     assert FakeReorganizer.reorganize_calls == 0
+
+
+def test_formal_jellyfin_title_waits_for_fresh_moviepilot_preview(monkeypatch):
+    history = SimpleNamespace(
+        id=1,
+        date="2026-07-24 12:00:00",
+        dest="/library/show/Show S02E07 - 1080p 第 7 集.mp4",
+    )
+    expected_path = Path(history.dest)
+
+    class FakeReorganizer:
+        preview_calls = 0
+
+        def __init__(self, logger, dry_run):
+            pass
+
+        @staticmethod
+        def compatibility_error():
+            return ""
+
+        def recent_histories(
+            self,
+            days,
+            tracked_history_ids=None,
+            preferred_history_ids=None,
+        ):
+            return [history]
+
+        @staticmethod
+        def processing_key(_history):
+            return "episode"
+
+        @staticmethod
+        def target_path(item):
+            return Path(item.dest)
+
+        @staticmethod
+        def display_name(_history):
+            return "Show S02E07"
+
+        @staticmethod
+        def episode_target(item):
+            return EpisodeTarget(path=item.dest)
+
+        def preview(self, _history):
+            type(self).preview_calls += 1
+            return OperationResult(success=True, target=expected_path)
+
+        @staticmethod
+        def related_history_count(_history):
+            return 0
+
+        def reorganize(self, **_kwargs):
+            type(self).reorganize_calls += 1
+            return OperationResult(success=True, target=expected_path)
+
+    episode = EpisodeItem(
+        item_id="jf-1",
+        name="黑夜女神",
+        series_name="Show",
+        season_number=2,
+        episode_number=7,
+        path=history.dest,
+    )
+
+    class FakeClient:
+        refresh_calls = 0
+
+        @staticmethod
+        def libraries():
+            return []
+
+        @staticmethod
+        def path_key(path):
+            return JellyfinServiceClient.path_key(path)
+
+        def match_recent_episodes(self, targets, days, library_ids):
+            return {
+                self.path_key(target.path): [episode]
+                for target in targets
+            }
+
+        def refresh_episode(self, **_kwargs):
+            type(self).refresh_calls += 1
+
+    plugin = RecentEpisodeMaintenance()
+    plugin._enable_refresh = True
+    plugin._enable_reorganize = False
+    plugin._scan_after_reorganize = False
+    plugin._cleanup_old_sidecars = True
+    plugin._refresh_mode = "all"
+    plugin._replace_images = True
+    plugin._max_items = 10
+    plugin._days = 15
+    plugin._dry_run = False
+    plugin._notify = False
+    plugin._library_ids = []
+    saved = []
+    initial_state = {
+        "episode": {
+            "status": plugin._STATE_PENDING_REFRESH,
+            "history_id": history.id,
+            "history_date": history.date,
+            "expected_path": str(expected_path),
+            "had_action": True,
+            "refresh_check_after": "2000-01-01T00:00:00",
+        }
+    }
+    plugin._load_processing_state = lambda: deepcopy(
+        saved[-1] if saved else initial_state
+    )
+
+    def save_state(state):
+        saved.append(deepcopy(state))
+        return True
+
+    plugin._save_processing_state = save_state
+    plugin._get_jellyfin_client = FakeClient
+    monkeypatch.setattr(plugin_module, "MoviePilotReorganizer", FakeReorganizer)
+
+    plugin._run_once()
+
+    assert FakeClient.refresh_calls == 0
+    assert FakeReorganizer.preview_calls == 0
+    assert saved[-1]["episode"]["status"] == plugin._STATE_MONITORING
+    assert saved[-1]["episode"]["monitoring_checks"] == 1
+    assert saved[-1]["episode"]["expected_path"] == str(expected_path)
+    assert saved[-1]["episode"]["had_action"] is True
+    assert saved[-1]["episode"]["placeholder_refresh_done"] is True
+
+    saved[-1]["episode"]["next_preview_at"] = "2000-01-01T00:00:00"
+    plugin._run_once()
+
+    assert FakeClient.refresh_calls == 0
+    assert FakeReorganizer.preview_calls == 1
+    assert saved[-1]["episode"]["status"] == plugin._STATE_MONITORING
+    assert saved[-1]["episode"]["monitoring_checks"] == 2
+
+    episode.name = "未知标题"
+    FakeClient.refresh_calls = 0
+    FakeReorganizer.preview_calls = 0
+    saved.clear()
+    initial_state = {}
+
+    plugin._run_once()
+
+    assert FakeClient.refresh_calls == 1
+    assert FakeReorganizer.preview_calls == 1
+    assert saved[-1]["episode"]["status"] == plugin._STATE_PENDING_REFRESH
+    assert saved[-1]["episode"]["placeholder_refresh_done"] is True
+
+    saved[-1]["episode"]["refresh_check_after"] = "2000-01-01T00:00:00"
+    plugin._run_once()
+
+    assert FakeClient.refresh_calls == 1
+    assert FakeReorganizer.preview_calls == 1
+    assert saved[-1]["episode"]["status"] == plugin._STATE_MONITORING
+
+    history.date = "2000-01-01 00:00:00"
+    saved[-1]["episode"]["next_preview_at"] = "2000-01-01T00:00:00"
+    plugin._run_once()
+
+    assert FakeClient.refresh_calls == 1
+    assert FakeReorganizer.preview_calls == 2
+    assert saved[-1]["episode"]["status"] == plugin._STATE_COMPLETE
+    assert (
+        saved[-1]["episode"]["completion_reason"]
+        == "placeholder_title_expired"
+    )
+
+    history.date = "2026-07-24 12:00:00"
+    saved.clear()
+    initial_state = {}
+    plugin._enable_refresh = False
+    plugin._enable_reorganize = True
+    plugin._skip_same_name = True
+    FakeReorganizer.preview_calls = 0
+    FakeReorganizer.reorganize_calls = 0
+
+    plugin._run_once()
+
+    assert FakeReorganizer.preview_calls == 1
+    assert FakeReorganizer.reorganize_calls == 0
+    assert saved[-1]["episode"]["status"] == plugin._STATE_MONITORING
 
 
 def test_moviepilot_compatibility_failure_stops_before_history_query(monkeypatch):

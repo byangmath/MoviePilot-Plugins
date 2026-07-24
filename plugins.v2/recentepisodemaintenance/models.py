@@ -6,6 +6,25 @@ import unicodedata
 
 
 _EPISODE_MARKER = re.compile(r"s\d{1,3}e\d{1,4}(?:[\s._-]*e\d{1,4})?", re.IGNORECASE)
+_PLACEHOLDER_EPISODE_TITLE = re.compile(
+    r"(?:"
+    r"第\s*(?:\d+|[零〇一二三四五六七八九十百千两]+)\s*[集话]"
+    r"|(?:episode|ep)\s*\.?\s*\d+"
+    r"|e\s*\d+"
+    r")\s*$",
+    re.IGNORECASE,
+)
+_UNRELIABLE_TITLE_KEYS = {
+    "unknown",
+    "unknowntitle",
+    "untitled",
+    "notitle",
+    "未知",
+    "未知标题",
+    "未命名",
+    "暂无标题",
+    "无标题",
+}
 
 
 def _title_key(value: str) -> str:
@@ -67,6 +86,48 @@ class EpisodeItem:
 
         filename_title_key = _title_key(filename_stem[marker.end():])
         return bool(filename_title_key) and filename_title_key.endswith(title_key)
+
+    @staticmethod
+    def title_is_placeholder(value: str | None) -> bool:
+        title = str(value or "").strip()
+        return not title or bool(_PLACEHOLDER_EPISODE_TITLE.fullmatch(title))
+
+    def title_is_unreliable(self) -> bool:
+        title = str(self.name or "").strip()
+        title_key = _title_key(title)
+        if (
+            not title_key
+            or title_key in _UNRELIABLE_TITLE_KEYS
+            or _PLACEHOLDER_EPISODE_TITLE.search(title)
+            or _EPISODE_MARKER.search(title)
+            or any(marker in title for marker in ("�", "锟斤拷"))
+        ):
+            return True
+        if self.series_name and title_key == _title_key(self.series_name):
+            return True
+        if self.path and title_key == _title_key(Path(self.path).stem):
+            return True
+        return False
+
+    @staticmethod
+    def path_title_is_placeholder(path: str | Path | None) -> bool:
+        if not path:
+            return False
+        filename_stem = Path(path).stem
+        marker = _EPISODE_MARKER.search(filename_stem)
+        if not marker:
+            return False
+        trailing_title = filename_stem[marker.end():].strip(" ._-")
+        return bool(_PLACEHOLDER_EPISODE_TITLE.search(trailing_title))
+
+    def should_preserve_jellyfin_title(
+        self,
+        expected_path: str | Path | None,
+    ) -> bool:
+        return (
+            self.path_title_is_placeholder(expected_path)
+            and not self.title_is_unreliable()
+        )
 
 
 @dataclass(frozen=True)

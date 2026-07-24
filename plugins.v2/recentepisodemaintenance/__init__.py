@@ -33,7 +33,7 @@ except Exception:
     MediaServerHelper = None
 
 from .jellyfin_client import JellyfinServiceClient
-from .models import RunResult
+from .models import EpisodeItem, RunResult
 from .reorganizer import MoviePilotReorganizer
 
 
@@ -569,10 +569,19 @@ class RecentEpisodeMaintenance(_PluginBase):
             state_item = processing_state.get(processing_key) or {}
             status = state_item.get("status")
             cached_path = state_item.get("expected_path")
-            if cached_path and status in {
-                self._STATE_PENDING_REFRESH,
-                self._STATE_PENDING_REORGANIZE,
-            }:
+            placeholder_cache_expired = (
+                status == self._STATE_PENDING_REFRESH
+                and EpisodeItem.path_title_is_placeholder(cached_path)
+                and self._history_window_expired(state_item)
+            )
+            if (
+                cached_path
+                and not placeholder_cache_expired
+                and status in {
+                    self._STATE_PENDING_REFRESH,
+                    self._STATE_PENDING_REORGANIZE,
+                }
+            ):
                 expected_paths[processing_key] = Path(str(cached_path))
                 continue
 
@@ -603,6 +612,38 @@ class RecentEpisodeMaintenance(_PluginBase):
                     self._STATE_PENDING_REFRESH
                     if self._enable_refresh
                     else self._STATE_PENDING_REORGANIZE,
+                )
+
+        if not self._enable_refresh:
+            for history in histories:
+                processing_key = reorganizer.processing_key(history)
+                expected_path = expected_paths.get(processing_key)
+                if not EpisodeItem.path_title_is_placeholder(expected_path):
+                    continue
+                target_key = JellyfinServiceClient.path_key(
+                    reorganizer.target_path(history)
+                )
+                placeholder_completed = self._history_window_expired(
+                    processing_state.get(processing_key) or {}
+                )
+                if not self._dry_run:
+                    placeholder_completed = (
+                        self._mark_processing_waiting_for_preview_title(
+                            processing_state,
+                            {processing_key},
+                            placeholder_refresh_done=(
+                                self._placeholder_refresh_completed(
+                                    processing_state,
+                                    {processing_key},
+                                )
+                            ),
+                        )
+                    )
+                deferred_reorganize_targets.add(target_key)
+                deferred_reorganize_reasons[target_key] = (
+                    "MP 在最近 N 天内始终为占位标题，记录已完成"
+                    if placeholder_completed
+                    else "MP 整理预览仍为占位标题，等待 MP 数据更新"
                 )
 
         if self._enable_refresh:
@@ -698,7 +739,83 @@ class RecentEpisodeMaintenance(_PluginBase):
                         )
                         continue
 
-                    if episode.title_matches_path(expected_path):
+                    placeholder_preview = EpisodeItem.path_title_is_placeholder(
+                        expected_path
+                    )
+                    placeholder_refresh_done = (
+                        self._placeholder_refresh_completed(
+                            processing_state,
+                            episode_history_keys,
+                        )
+                    )
+                    placeholder_refresh_needed = (
+                        placeholder_preview
+                        and episode.title_is_unreliable()
+                        and not placeholder_refresh_done
+                    )
+                    if placeholder_preview and not placeholder_refresh_needed:
+                        placeholder_targets = (
+                            episode_target_keys.get(episode.item_id)
+                            or {episode.item_id}
+                        )
+                        result.add_skipped(*placeholder_targets)
+                        deferred_reorganize_targets.update(placeholder_targets)
+                        placeholder_completed = all(
+                            self._history_window_expired(
+                                processing_state.get(key) or {}
+                            )
+                            for key in episode_history_keys
+                        )
+                        if not self._dry_run:
+                            placeholder_completed = (
+                                self._mark_processing_waiting_for_preview_title(
+                                    processing_state,
+                                    episode_history_keys,
+                                    placeholder_refresh_done=(
+                                        placeholder_refresh_done
+                                    ),
+                                )
+                            )
+                        if placeholder_completed:
+                            placeholder_reason = (
+                                "MP 在最近 N 天内始终为占位标题，记录已完成"
+                            )
+                        elif episode.title_is_unreliable():
+                            placeholder_reason = (
+                                "MP 仍为占位标题，Jellyfin 刷新后标题仍不可靠，"
+                                "等待 MP 数据更新"
+                            )
+                        else:
+                            placeholder_reason = (
+                                "MP 仍为占位标题，暂时保留 Jellyfin 当前标题，"
+                                "等待 MP 数据更新"
+                            )
+                        for placeholder_target in placeholder_targets:
+                            deferred_reorganize_reasons[placeholder_target] = (
+                                placeholder_reason
+                            )
+                        prefix = "试运行" if self._dry_run else ""
+                        if placeholder_completed:
+                            logger.info(
+                                f"[最近剧集维护] {prefix}完成占位标题监测 "
+                                f"{episode_label}：MP 在最近 {self._days} 天内"
+                                "始终未取得非占位标题，保留 Jellyfin 当前标题，"
+                                f"不再刷新或重新整理｜文件：{episode_file}"
+                            )
+                        else:
+                            current_title = episode.name or "空标题"
+                            logger.info(
+                                f"[最近剧集维护] {prefix}等待 MP 标题更新 "
+                                f"{episode_label}：Jellyfin 当前标题"
+                                f"“{current_title}”，MP 预览仍为占位标题｜"
+                                f"预览文件：{Path(expected_path).name}"
+                            )
+                        continue
+
+                    if (
+                        not placeholder_refresh_needed
+                        and episode.title_matches_path(expected_path)
+                    ):
                         result.add_skipped(
                             *(episode_target_keys.get(episode.item_id) or {episode.item_id})
                         )
@@ -713,12 +830,15 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 episode_history_keys,
                             )
                         continue
+
                     refresh_targets = episode_target_keys.get(episode.item_id) or set()
                     deferred_reorganize_targets.update(refresh_targets)
                     refresh_first_targets.update(refresh_targets)
                     for refresh_target in refresh_targets:
                         deferred_reorganize_reasons[refresh_target] = (
-                            "标题不一致，本轮先刷新元数据"
+                            "MP 和 Jellyfin 标题均不可靠，本轮尝试一次元数据刷新"
+                            if placeholder_refresh_needed
+                            else "标题不一致，本轮先刷新元数据"
                         )
                     if result.operations_used >= result.operation_limit:
                         result.add_skipped(*refresh_targets)
@@ -746,7 +866,12 @@ class RecentEpisodeMaintenance(_PluginBase):
                             )
                         logger.info(
                             f"[最近剧集维护] 试运行刷新 {episode_label}："
-                            f"标题不一致，将完整刷新元数据和图片｜文件：{episode_file}"
+                            + (
+                                "MP 和 Jellyfin 标题均不可靠，将尝试一次完整刷新"
+                                if placeholder_refresh_needed
+                                else "标题不一致，将完整刷新元数据和图片"
+                            )
+                            + f"｜文件：{episode_file}"
                         )
                         continue
                     refresh_state_snapshot = self._state_item_snapshots(
@@ -782,9 +907,15 @@ class RecentEpisodeMaintenance(_PluginBase):
                         result.actions_submitted += 1
                         result.refreshed += 1
                         result.add_refreshed_title(str(episode_file))
+                        refresh_reason = (
+                            "MP 和 Jellyfin 标题均不可靠，已提交唯一一次"
+                            "元数据和图片刷新"
+                            if placeholder_refresh_needed
+                            else "标题不一致，已提交元数据和图片刷新"
+                        )
                         logger.info(
                             f"[最近剧集维护] 刷新 {episode_label}："
-                            f"标题不一致，已提交元数据和图片刷新｜文件：{episode_file}"
+                            f"{refresh_reason}｜文件：{episode_file}"
                         )
                         self._mark_processing_state(
                             processing_state,
@@ -792,6 +923,9 @@ class RecentEpisodeMaintenance(_PluginBase):
                             self._STATE_PENDING_REFRESH,
                             had_action=True,
                             refresh_check_after=self._refresh_recheck_at(),
+                            placeholder_refresh_done=(
+                                True if placeholder_refresh_needed else None
+                            ),
                         )
                         self._clear_operation_intent(
                             processing_state,
@@ -805,7 +939,9 @@ class RecentEpisodeMaintenance(_PluginBase):
                             state_persistence_failed = True
                         for refresh_target in refresh_targets:
                             deferred_reorganize_reasons[refresh_target] = (
-                                "标题不一致，本轮已提交元数据刷新，等待确认"
+                                "占位标题已提交唯一一次元数据刷新，等待确认"
+                                if placeholder_refresh_needed
+                                else "标题不一致，本轮已提交元数据刷新，等待确认"
                             )
                         if state_persistence_failed:
                             break
@@ -2723,7 +2859,29 @@ class RecentEpisodeMaintenance(_PluginBase):
             item = dict(state.get(key) or {})
             item["expected_path"] = str(expected_path)
             item["previewed_at"] = previewed_at
+            if not EpisodeItem.path_title_is_placeholder(expected_path):
+                item.pop("placeholder_refresh_done", None)
             state[key] = item
+
+    @classmethod
+    def _placeholder_refresh_completed(
+        cls,
+        state: dict[str, dict[str, Any]],
+        keys: set[str],
+    ) -> bool:
+        for key in keys:
+            item = state.get(key) or {}
+            if item.get("placeholder_refresh_done"):
+                return True
+            if (
+                item.get("status") == cls._STATE_PENDING_REFRESH
+                and item.get("had_action")
+                and EpisodeItem.path_title_is_placeholder(
+                    item.get("expected_path")
+                )
+            ):
+                return True
+        return False
 
     def _mark_processing_verified(
         self,
@@ -2766,6 +2924,45 @@ class RecentEpisodeMaintenance(_PluginBase):
                     monitoring_checks=monitoring_checks,
                 )
 
+    def _mark_processing_waiting_for_preview_title(
+        self,
+        state: dict[str, dict[str, Any]],
+        keys: set[str],
+        *,
+        placeholder_refresh_done: bool,
+    ) -> bool:
+        completed = bool(keys)
+        for key in keys:
+            state_item = state.get(key) or {}
+            if self._history_window_expired(state_item):
+                self._mark_processing_state(
+                    state,
+                    {key},
+                    self._STATE_COMPLETE,
+                    placeholder_refresh_done=placeholder_refresh_done,
+                    completion_reason="placeholder_title_expired",
+                )
+                continue
+            completed = False
+            monitoring_checks = int(state_item.get("monitoring_checks") or 0) + 1
+            interval_index = min(
+                monitoring_checks - 1,
+                len(self._MONITOR_INTERVAL_HOURS) - 1,
+            )
+            next_preview_at = (
+                datetime.now()
+                + timedelta(hours=self._MONITOR_INTERVAL_HOURS[interval_index])
+            ).isoformat(timespec="seconds")
+            self._mark_processing_state(
+                state,
+                {key},
+                self._STATE_MONITORING,
+                next_preview_at=next_preview_at,
+                monitoring_checks=monitoring_checks,
+                placeholder_refresh_done=placeholder_refresh_done,
+            )
+        return completed
+
     def _history_window_expired(self, state_item: dict[str, Any]) -> bool:
         history_date = state_item.get("history_date")
         if not history_date:
@@ -2797,6 +2994,8 @@ class RecentEpisodeMaintenance(_PluginBase):
         cleanup_check_after: str | None = None,
         cleanup_passes: int | None = None,
         attention_stage: str | None = None,
+        placeholder_refresh_done: bool | None = None,
+        completion_reason: str | None = None,
     ) -> None:
         updated_at = datetime.now().isoformat(timespec="seconds")
         for key in keys:
@@ -2840,6 +3039,15 @@ class RecentEpisodeMaintenance(_PluginBase):
                 item["cleanup_check_after"] = cleanup_check_after
             if cleanup_passes is not None:
                 item["cleanup_passes"] = cleanup_passes
+            if placeholder_refresh_done is not None:
+                item["placeholder_refresh_done"] = placeholder_refresh_done
+            if status == RecentEpisodeMaintenance._STATE_COMPLETE:
+                if completion_reason:
+                    item["completion_reason"] = completion_reason
+                else:
+                    item.pop("completion_reason", None)
+            else:
+                item.pop("completion_reason", None)
             if status == RecentEpisodeMaintenance._STATE_ATTENTION:
                 item["attention_stage"] = (
                     attention_stage
