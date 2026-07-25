@@ -69,6 +69,21 @@ def test_placeholder_preview_preserves_only_usable_jellyfin_title():
     assert usable.title_is_unreliable() is False
 
 
+def test_equivalent_placeholder_titles_match_the_same_episode():
+    episode = EpisodeItem(
+        item_id="episode",
+        name="第七集",
+        episode_number=7,
+    )
+
+    assert episode.placeholder_title_matches_path(
+        "/library/Show S01E07 - 1080p Episode 7.mkv"
+    )
+    assert not episode.placeholder_title_matches_path(
+        "/library/Show S01E07 - 1080p Episode 8.mkv"
+    )
+
+
 def test_summary_lists_bare_full_file_paths():
     result = RunResult(refreshed=1, reorganized=1)
     result.add_refreshed_title("/media/搞笑一家人3 S01E83.mkv")
@@ -711,6 +726,19 @@ def test_formal_jellyfin_title_waits_for_fresh_moviepilot_preview(monkeypatch):
     assert FakeReorganizer.preview_calls == 1
     assert saved[-1]["episode"]["status"] == plugin._STATE_MONITORING
     assert saved[-1]["episode"]["monitoring_checks"] == 2
+
+    episode.name = "第7集"
+    FakeClient.refresh_calls = 0
+    FakeReorganizer.preview_calls = 0
+    saved.clear()
+    initial_state = {}
+
+    plugin._run_once()
+
+    assert FakeClient.refresh_calls == 0
+    assert FakeReorganizer.preview_calls == 1
+    assert saved[-1]["episode"]["status"] == plugin._STATE_MONITORING
+    assert saved[-1]["episode"]["placeholder_refresh_done"] is False
 
     episode.name = "未知标题"
     FakeClient.refresh_calls = 0

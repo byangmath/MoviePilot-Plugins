@@ -14,6 +14,14 @@ _PLACEHOLDER_EPISODE_TITLE = re.compile(
     r")\s*$",
     re.IGNORECASE,
 )
+_PLACEHOLDER_EPISODE_NUMBER = re.compile(
+    r"(?:"
+    r"第\s*(?P<chinese>\d+|[零〇一二三四五六七八九十百千两]+)\s*[集话]"
+    r"|(?:episode|ep)\s*\.?\s*(?P<latin>\d+)"
+    r"|e\s*(?P<short>\d+)"
+    r")\s*$",
+    re.IGNORECASE,
+)
 _UNRELIABLE_TITLE_KEYS = {
     "unknown",
     "unknowntitle",
@@ -30,6 +38,51 @@ _UNRELIABLE_TITLE_KEYS = {
 def _title_key(value: str) -> str:
     normalized = unicodedata.normalize("NFKC", value or "").casefold()
     return "".join(character for character in normalized if character.isalnum())
+
+
+def _chinese_number(value: str) -> int | None:
+    if value.isdigit():
+        return int(value)
+
+    digits = {
+        "零": 0,
+        "〇": 0,
+        "一": 1,
+        "二": 2,
+        "两": 2,
+        "三": 3,
+        "四": 4,
+        "五": 5,
+        "六": 6,
+        "七": 7,
+        "八": 8,
+        "九": 9,
+    }
+    units = {"十": 10, "百": 100, "千": 1000}
+    if not value or any(character not in digits | units for character in value):
+        return None
+    if not any(character in units for character in value):
+        return int("".join(str(digits[character]) for character in value))
+
+    total = 0
+    current = 0
+    for character in value:
+        if character in digits:
+            current = digits[character]
+        else:
+            total += (current or 1) * units[character]
+            current = 0
+    return total + current
+
+
+def _placeholder_episode_number(value: str) -> int | None:
+    match = _PLACEHOLDER_EPISODE_NUMBER.search(str(value or "").strip())
+    if not match:
+        return None
+    number = match.group("latin") or match.group("short")
+    if number:
+        return int(number)
+    return _chinese_number(match.group("chinese") or "")
 
 
 @dataclass
@@ -119,6 +172,22 @@ class EpisodeItem:
             return False
         trailing_title = filename_stem[marker.end():].strip(" ._-")
         return bool(_PLACEHOLDER_EPISODE_TITLE.search(trailing_title))
+
+    def placeholder_title_matches_path(self, path: str | Path | None) -> bool:
+        """Check whether Jellyfin and MP use equivalent placeholders for this episode."""
+        if not self.title_is_placeholder(self.name) or not self.path_title_is_placeholder(path):
+            return False
+
+        jellyfin_number = _placeholder_episode_number(self.name)
+        expected_number = _placeholder_episode_number(Path(path).stem if path else "")
+        if jellyfin_number is None or expected_number is None:
+            return False
+        if (
+            self.episode_number is not None
+            and jellyfin_number != int(self.episode_number)
+        ):
+            return False
+        return jellyfin_number == expected_number
 
     def should_preserve_jellyfin_title(
         self,

@@ -108,7 +108,7 @@ class RecentEpisodeMaintenance(_PluginBase):
     plugin_name = "最近剧集维护"
     plugin_desc = "维护 MoviePilot 最近整理入库的 Jellyfin 剧集"
     plugin_icon = "https://raw.githubusercontent.com/byangmath/MoviePilot-Plugins/main/icons/recentepisodemaintenance.png"
-    plugin_version = "0.2.4"
+    plugin_version = "0.2.5"
     plugin_author = "byangmath"
     author_url = "https://github.com/byangmath"
     plugin_config_prefix = "recentepisodemaintenance_"
@@ -751,6 +751,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                     placeholder_refresh_needed = (
                         placeholder_preview
                         and episode.title_is_unreliable()
+                        and not episode.placeholder_title_matches_path(expected_path)
                         and not placeholder_refresh_done
                     )
                     if placeholder_preview and not placeholder_refresh_needed:
@@ -779,6 +780,11 @@ class RecentEpisodeMaintenance(_PluginBase):
                         if placeholder_completed:
                             placeholder_reason = (
                                 "MP 在最近 N 天内始终为占位标题，记录已完成"
+                            )
+                        elif episode.placeholder_title_matches_path(expected_path):
+                            placeholder_reason = (
+                                "MP 与 Jellyfin 使用同一集的占位标题，"
+                                "等待 MP 数据更新"
                             )
                         elif episode.title_is_unreliable():
                             placeholder_reason = (
