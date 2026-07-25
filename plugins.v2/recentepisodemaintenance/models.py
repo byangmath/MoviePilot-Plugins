@@ -277,7 +277,7 @@ class RunResult:
                 f"等待复查 {self.queue_counts.get('monitoring_waiting', 0)} 条，"
                 f"等待附件 {self.queue_counts.get('sidecar_waiting', 0)} 条，"
                 f"等待清理 {self.queue_counts.get('cleanup_waiting', 0)} 条，"
-                f"已完成 {self.queue_counts.get('complete', 0)} 条，"
+                f"当前范围内已完成 {self.queue_counts.get('complete', 0)} 条，"
                 f"需人工检查 {self.queue_counts.get('attention', 0)} 条"
             )
         lines.extend(

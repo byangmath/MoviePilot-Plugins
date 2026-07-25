@@ -128,7 +128,7 @@ def test_summary_includes_queue_counts():
     assert "等待复查 2 条" in summary
     assert "等待附件 3 条" in summary
     assert "等待清理 4 条" in summary
-    assert "已完成 26 条" in summary
+    assert "当前范围内已完成 26 条" in summary
     assert "需人工检查 5 条" in summary
 
 

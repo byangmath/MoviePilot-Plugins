@@ -437,7 +437,8 @@ class RecentEpisodeMaintenance(_PluginBase):
                 f"等待复查 {selection['monitoring_waiting']} 条，"
                 f"等待附件 {selection['sidecar_waiting']} 条，"
                 f"等待清理 {selection['cleanup_waiting']} 条，"
-                f"已完成 {selection['complete']} 条，需人工检查 {selection['attention']} 条"
+                f"当前范围内已完成 {selection['complete']} 条，"
+                f"需人工检查 {selection['attention']} 条"
             )
             if selection["attention_items"]:
                 logger.warning(
