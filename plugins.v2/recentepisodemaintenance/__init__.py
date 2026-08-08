@@ -108,7 +108,7 @@ class RecentEpisodeMaintenance(_PluginBase):
     plugin_name = "最近剧集维护"
     plugin_desc = "维护 MoviePilot 最近整理入库的 Jellyfin 剧集"
     plugin_icon = "https://raw.githubusercontent.com/byangmath/MoviePilot-Plugins/main/icons/recentepisodemaintenance.png"
-    plugin_version = "0.2.5"
+    plugin_version = "0.2.6"
     plugin_author = "byangmath"
     author_url = "https://github.com/byangmath"
     plugin_config_prefix = "recentepisodemaintenance_"
@@ -522,6 +522,10 @@ class RecentEpisodeMaintenance(_PluginBase):
                     item = dict(processing_state.get(key) or {})
                     item.pop("scan_pending", None)
                     processing_state[key] = item
+                refresh_waiting_count = self._schedule_post_scan_refresh(
+                    processing_state,
+                    scan_pending_keys,
+                )
                 self._clear_operation_intent(
                     processing_state,
                     scan_pending_keys,
@@ -533,6 +537,12 @@ class RecentEpisodeMaintenance(_PluginBase):
                 logger.info(
                     f"[最近剧集维护] 已重试 Jellyfin 媒体库扫描，"
                     f"涉及 {len(scan_pending_keys)} 条记录"
+                    + (
+                        f"；{refresh_waiting_count} 条记录将在 "
+                        f"{self._REFRESH_RECHECK_MINUTES} 分钟后确认元数据"
+                        if refresh_waiting_count
+                        else ""
+                    )
                 )
                 histories = [
                     history
@@ -737,6 +747,32 @@ class RecentEpisodeMaintenance(_PluginBase):
                         logger.error(
                             f"[最近剧集维护] 刷新失败 {episode_label}："
                             f"缺少 MP 整理预览｜文件：{episode_file}"
+                        )
+                        continue
+
+                    post_reorganize_wait_reason = ""
+                    if self._scan_after_reorganize:
+                        state_items = [
+                            processing_state.get(key) or {}
+                            for key in episode_history_keys
+                        ]
+                        if any(item.get("sidecar_pending") for item in state_items):
+                            post_reorganize_wait_reason = (
+                                "等待重新整理附件生成和 Jellyfin 扫描"
+                            )
+                        elif any(item.get("cleanup_pending") for item in state_items):
+                            post_reorganize_wait_reason = (
+                                "等待旧附件清理和 Jellyfin 扫描"
+                            )
+                        elif any(item.get("scan_pending") for item in state_items):
+                            post_reorganize_wait_reason = "等待 Jellyfin 扫描完成"
+                    if post_reorganize_wait_reason:
+                        result.add_skipped(
+                            *(episode_target_keys.get(episode.item_id) or {episode.item_id})
+                        )
+                        logger.info(
+                            f"[最近剧集维护] 暂缓元数据检查 {episode_label}："
+                            f"{post_reorganize_wait_reason}｜文件：{episode_file}"
                         )
                         continue
 
@@ -1303,6 +1339,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 state_persistence_failed = True
                                 break
                             cleanup_pending = False
+                            sidecars_ready_for_scan.add(processing_key)
                             logger.info(
                                 f"[最近剧集维护] 清理完成 {label}："
                                 f"复查删除 {len(deleted)} 个、改名 {len(renamed)} 个旧名称附件"
@@ -1809,6 +1846,10 @@ class RecentEpisodeMaintenance(_PluginBase):
                         item = dict(processing_state.get(key) or {})
                         item.pop("scan_pending", None)
                         processing_state[key] = item
+                    refresh_waiting_count = self._schedule_post_scan_refresh(
+                        processing_state,
+                        scan_keys,
+                    )
                     self._clear_operation_intent(
                         processing_state,
                         scan_keys,
@@ -1818,7 +1859,15 @@ class RecentEpisodeMaintenance(_PluginBase):
                             "Jellyfin 媒体库扫描已提交，但结果状态保存失败"
                         )
                         state_persistence_failed = True
-                    logger.info("[最近剧集维护] 已触发 Jellyfin 媒体库扫描")
+                    logger.info(
+                        "[最近剧集维护] 已触发 Jellyfin 媒体库扫描"
+                        + (
+                            f"；{refresh_waiting_count} 条记录将在 "
+                            f"{self._REFRESH_RECHECK_MINUTES} 分钟后确认元数据"
+                            if refresh_waiting_count
+                            else ""
+                        )
+                    )
                 elif not state_persistence_failed:
                     result.add_error("重新整理后无法触发 Jellyfin 媒体库扫描")
             except Exception as err:
@@ -2365,6 +2414,15 @@ class RecentEpisodeMaintenance(_PluginBase):
                 "monitoring_waiting": len(monitoring_all) - len(monitoring),
                 "sidecar_waiting": len(sidecar_waiting),
                 "cleanup_waiting": len(cleanup_waiting),
+                "refresh_waiting_items": [
+                    self._waiting_record_detail(
+                        history,
+                        reorganizer,
+                        state.get(key) or {},
+                        "refresh",
+                    )
+                    for history, key in refresh_waiting
+                ],
                 "sidecar_waiting_items": [
                     self._waiting_record_detail(
                         history,
@@ -2395,34 +2453,65 @@ class RecentEpisodeMaintenance(_PluginBase):
 
     @classmethod
     def _waiting_records_text(cls, selection: dict[str, Any]) -> str:
-        waiting_items = []
+        waiting_groups = []
         if selection.get("refresh_waiting"):
-            waiting_items.append(
-                f"{selection['refresh_waiting']} 条记录等待刷新确认"
+            waiting_groups.append(
+                cls._waiting_group_text(
+                    "等待刷新确认",
+                    selection["refresh_waiting"],
+                    selection.get("refresh_waiting_items") or [],
+                )
             )
         if selection.get("sidecar_waiting"):
-            text = f"{selection['sidecar_waiting']} 条记录等待附件生成"
-            details = cls._limited_waiting_details(
-                selection.get("sidecar_waiting_items") or []
+            waiting_groups.append(
+                cls._waiting_group_text(
+                    "等待附件生成",
+                    selection["sidecar_waiting"],
+                    selection.get("sidecar_waiting_items") or [],
+                )
             )
-            waiting_items.append(f"{text}：{details}" if details else text)
         if selection.get("cleanup_waiting"):
-            text = f"{selection['cleanup_waiting']} 条记录等待旧附件清理"
-            details = cls._limited_waiting_details(
-                selection.get("cleanup_waiting_items") or []
+            waiting_groups.append(
+                cls._waiting_group_text(
+                    "等待旧附件清理",
+                    selection["cleanup_waiting"],
+                    selection.get("cleanup_waiting_items") or [],
+                )
             )
-            waiting_items.append(f"{text}：{details}" if details else text)
-        return f"，另有 {'、'.join(waiting_items)}" if waiting_items else ""
+        return "\n" + "\n".join(waiting_groups) if waiting_groups else ""
+
+    @staticmethod
+    def _waiting_group_text(
+        label: str,
+        count: int,
+        items: list[str],
+        limit: int = 3,
+    ) -> str:
+        details = [str(item).strip() for item in items if str(item).strip()]
+        heading = f"{label}（{count} 条）"
+        if not details:
+            return heading
+        lines = [f"{heading}："]
+        lines.extend(f"- {item}" for item in details[:limit])
+        omitted = max(int(count) - min(len(details), limit), 0)
+        if omitted > 0:
+            lines.append(f"- 另有 {omitted} 条记录未列出")
+        return "\n".join(lines)
 
     @classmethod
-    def _limited_waiting_details(cls, items: list[str], limit: int = 3) -> str:
+    def _limited_waiting_details(
+        cls,
+        items: list[str],
+        limit: int = 3,
+        omitted_description: str = "项",
+    ) -> str:
         details = [str(item).strip() for item in items if str(item).strip()]
         if not details:
             return ""
         text = "；".join(details[:limit])
         omitted = len(details) - limit
         if omitted > 0:
-            text += f"；另有 {omitted} 条"
+            text += f"；另有 {omitted} {omitted_description}未列出"
         return text
 
     @classmethod
@@ -2540,7 +2629,10 @@ class RecentEpisodeMaintenance(_PluginBase):
         ]
         text = f"旧文件：{old_media_path or '未知旧文件'}"
         if sidecars:
-            text += f"｜旧附件：{cls._limited_waiting_details(sidecars)}"
+            text += (
+                f"｜旧附件（{len(sidecars)} 个）："
+                f"{cls._limited_waiting_details(sidecars, omitted_description='个旧附件')}"
+            )
         return text
 
     @classmethod
@@ -2554,6 +2646,29 @@ class RecentEpisodeMaintenance(_PluginBase):
         return (
             datetime.now() + timedelta(minutes=cls._REFRESH_RECHECK_MINUTES)
         ).isoformat(timespec="seconds")
+
+    def _schedule_post_scan_refresh(
+        self,
+        state: dict[str, dict[str, Any]],
+        keys: set[str],
+    ) -> int:
+        if not self._enable_refresh:
+            return 0
+        eligible_keys = {
+            key
+            for key in keys
+            if not (state.get(key) or {}).get("sidecar_pending")
+            and not (state.get(key) or {}).get("cleanup_pending")
+        }
+        if not eligible_keys:
+            return 0
+        self._mark_processing_state(
+            state,
+            eligible_keys,
+            self._STATE_PENDING_REFRESH,
+            refresh_check_after=self._refresh_recheck_at(),
+        )
+        return len(eligible_keys)
 
     @staticmethod
     def _timestamp_is_due(value: Any) -> bool:

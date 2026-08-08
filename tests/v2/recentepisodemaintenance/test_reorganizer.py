@@ -337,6 +337,9 @@ def test_refresh_cooldown_defers_record_without_dropping_it():
 
     assert selected == []
     assert selection["refresh_waiting"] == 1
+    assert selection["refresh_waiting_items"] == [
+        f"测试剧 S01E01｜文件：{reorganizer.target_path(video)}"
+    ]
     assert state[key]["history_id"] == 1
 
 
@@ -634,7 +637,7 @@ def test_selection_defers_old_sidecar_cleanup_until_due():
     assert selection["cleanup_waiting"] == 1
     assert selection["cleanup_waiting_items"] == [
         "测试剧 S01E02｜旧文件：/library/show/Season 01/测试剧 S01E02 - 旧标题.mkv｜"
-        "旧附件：/library/show/Season 01/测试剧 S01E02 - 旧标题.nfo；"
+        "旧附件（2 个）：/library/show/Season 01/测试剧 S01E02 - 旧标题.nfo；"
         "/library/show/Season 01/测试剧 S01E02 - 旧标题.jpg"
     ]
 

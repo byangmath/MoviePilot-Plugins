@@ -136,15 +136,19 @@ def test_waiting_records_text_spacing():
     assert RecentEpisodeMaintenance._waiting_records_text({}) == ""
     assert RecentEpisodeMaintenance._waiting_records_text(
         {"cleanup_waiting": 1}
-    ) == "，另有 1 条记录等待旧附件清理"
+    ) == "\n等待旧附件清理（1 条）"
     assert RecentEpisodeMaintenance._waiting_records_text(
         {"sidecar_waiting": 2, "cleanup_waiting": 1}
-    ) == "，另有 2 条记录等待附件生成、1 条记录等待旧附件清理"
+    ) == "\n等待附件生成（2 条）\n等待旧附件清理（1 条）"
     assert RecentEpisodeMaintenance._waiting_records_text(
         {"refresh_waiting": 1}
-    ) == "，另有 1 条记录等待刷新确认"
+    ) == "\n等待刷新确认（1 条）"
     assert RecentEpisodeMaintenance._waiting_records_text(
         {
+            "refresh_waiting": 1,
+            "refresh_waiting_items": [
+                "测试剧 S01E00｜文件：/library/show/refreshed.mkv"
+            ],
             "sidecar_waiting": 1,
             "sidecar_waiting_items": [
                 "测试剧 S01E01｜文件：/library/show/new.mkv"
@@ -155,9 +159,27 @@ def test_waiting_records_text_spacing():
             ],
         }
     ) == (
-        "，另有 1 条记录等待附件生成：测试剧 S01E01｜文件：/library/show/new.mkv、"
-        "1 条记录等待旧附件清理：测试剧 S01E02｜旧文件：/library/show/old.mkv｜"
-        "旧附件：/library/show/old.nfo"
+        "\n等待刷新确认（1 条）：\n"
+        "- 测试剧 S01E00｜文件：/library/show/refreshed.mkv\n"
+        "等待附件生成（1 条）：\n"
+        "- 测试剧 S01E01｜文件：/library/show/new.mkv\n"
+        "等待旧附件清理（1 条）：\n"
+        "- 测试剧 S01E02｜旧文件：/library/show/old.mkv｜旧附件：/library/show/old.nfo"
+    )
+
+
+def test_cleanup_waiting_details_name_omitted_old_sidecars():
+    assert RecentEpisodeMaintenance._cleanup_waiting_file_details(
+        "/library/show/old.mkv",
+        [
+            "/library/show/old.nfo",
+            "/library/show/old.jpg",
+            "/library/show/old-thumb.jpg",
+            "/library/show/old-trickplay",
+        ],
+    ) == (
+        "旧文件：/library/show/old.mkv｜旧附件（4 个）：/library/show/old.nfo；"
+        "/library/show/old.jpg；/library/show/old-thumb.jpg；另有 1 个旧附件未列出"
     )
 
 
@@ -594,7 +616,7 @@ def test_failed_intent_checkpoint_prevents_external_operations(monkeypatch):
 def test_formal_jellyfin_title_waits_for_fresh_moviepilot_preview(monkeypatch):
     history = SimpleNamespace(
         id=1,
-        date="2026-07-24 12:00:00",
+        date="2999-07-24 12:00:00",
         dest="/library/show/Show S02E07 - 1080p 第 7 集.mp4",
     )
     expected_path = Path(history.dest)
@@ -772,7 +794,7 @@ def test_formal_jellyfin_title_waits_for_fresh_moviepilot_preview(monkeypatch):
         == "placeholder_title_expired"
     )
 
-    history.date = "2026-07-24 12:00:00"
+    history.date = "2999-07-24 12:00:00"
     saved.clear()
     initial_state = {}
     plugin._enable_refresh = False
@@ -952,6 +974,168 @@ def test_reorganized_record_is_rechecked_by_jellyfin_before_completion(
     assert FakeReorganizer.reorganize_calls == 1
     assert saved[-1]["episode"]["status"] == plugin._STATE_PENDING_REFRESH
     assert saved[-1]["episode"]["refresh_check_after"] > "2000-01-01T00:00:00"
+
+
+def test_cleanup_and_scan_finish_before_post_reorganize_metadata_check(
+    tmp_path,
+    monkeypatch,
+):
+    old_media = tmp_path / "Show S01E01 - Old Title.mkv"
+    old_nfo = old_media.with_suffix(".nfo")
+    new_media = tmp_path / "Show S01E01 - New Title.mkv"
+    old_nfo.write_text("old metadata", encoding="utf-8")
+    new_media.write_bytes(b"new")
+    new_media.with_suffix(".nfo").write_text("new metadata", encoding="utf-8")
+    new_media.with_suffix(".jpg").write_bytes(b"image")
+    history = SimpleNamespace(
+        id=1,
+        date="2999-08-09 00:00:00",
+        dest=str(new_media),
+    )
+
+    class FakeReorganizer:
+        reorganize_calls = 0
+
+        def __init__(self, logger, dry_run):
+            pass
+
+        @staticmethod
+        def compatibility_error():
+            return ""
+
+        def recent_histories(
+            self,
+            days,
+            tracked_history_ids=None,
+            preferred_history_ids=None,
+        ):
+            return [history]
+
+        @staticmethod
+        def processing_key(_history):
+            return "episode"
+
+        @staticmethod
+        def target_path(item):
+            return Path(item.dest)
+
+        @staticmethod
+        def display_name(_history):
+            return "Show S01E01"
+
+        @staticmethod
+        def episode_target(item):
+            return EpisodeTarget(path=item.dest)
+
+        @staticmethod
+        def related_history_count(_history):
+            return 0
+
+        def reorganize(self, **_kwargs):
+            type(self).reorganize_calls += 1
+            raise AssertionError("metadata confirmation must not reorganize the file")
+
+    episode = EpisodeItem(
+        item_id="jf-1",
+        name="Wrong Title",
+        series_name="Show",
+        season_number=1,
+        episode_number=1,
+        path=str(new_media),
+    )
+
+    class FakeClient:
+        refresh_calls = 0
+        scan_calls = 0
+
+        @staticmethod
+        def path_key(path):
+            return JellyfinServiceClient.path_key(path)
+
+        @staticmethod
+        def libraries():
+            return []
+
+        def match_recent_episodes(self, targets, days, library_ids):
+            return {self.path_key(target.path): [episode] for target in targets}
+
+        def refresh_episode(self, **_kwargs):
+            type(self).refresh_calls += 1
+
+        def scan_library(self):
+            type(self).scan_calls += 1
+
+    plugin = RecentEpisodeMaintenance()
+    plugin._enable_refresh = True
+    plugin._enable_reorganize = True
+    plugin._scan_after_reorganize = True
+    plugin._cleanup_old_sidecars = True
+    plugin._skip_same_name = True
+    plugin._refresh_mode = "all"
+    plugin._replace_images = True
+    plugin._max_items = 10
+    plugin._days = 15
+    plugin._dry_run = False
+    plugin._notify = False
+    plugin._library_ids = []
+    saved = []
+    initial_state = {
+        "episode": {
+            "status": plugin._STATE_PENDING_REORGANIZE,
+            "history_id": history.id,
+            "history_date": history.date,
+            "expected_path": str(new_media),
+            "had_action": True,
+            "cleanup_pending": True,
+            "cleanup_old_media_path": str(old_media),
+            "old_sidecars": [str(old_nfo)],
+            "cleanup_check_after": "2000-01-01T00:00:00",
+            "cleanup_passes": 0,
+        }
+    }
+    plugin._load_processing_state = lambda: deepcopy(
+        saved[-1] if saved else initial_state
+    )
+
+    def save_state(state):
+        saved.append(deepcopy(state))
+        return True
+
+    plugin._save_processing_state = save_state
+    plugin._get_jellyfin_client = FakeClient
+    monkeypatch.setattr(plugin_module, "MoviePilotReorganizer", FakeReorganizer)
+
+    plugin._run_once()
+
+    assert FakeClient.refresh_calls == 0
+    assert FakeClient.scan_calls == 1
+    assert not old_nfo.exists()
+    assert saved[-1]["episode"]["cleanup_pending"] is True
+    assert saved[-1]["episode"]["status"] == plugin._STATE_PENDING_REORGANIZE
+    assert "refresh_check_after" not in saved[-1]["episode"]
+
+    saved[-1]["episode"]["cleanup_check_after"] = "2000-01-01T00:00:00"
+    plugin._run_once()
+
+    assert FakeClient.refresh_calls == 0
+    assert FakeClient.scan_calls == 2
+    assert not saved[-1]["episode"].get("cleanup_pending")
+    assert saved[-1]["episode"]["status"] == plugin._STATE_PENDING_REFRESH
+    assert saved[-1]["episode"]["refresh_check_after"] > "2000-01-01T00:00:00"
+
+    plugin._run_once()
+
+    assert FakeClient.refresh_calls == 0
+    assert FakeClient.scan_calls == 2
+
+    episode.name = "New Title"
+    saved[-1]["episode"]["refresh_check_after"] = "2000-01-01T00:00:00"
+    plugin._run_once()
+
+    assert FakeClient.refresh_calls == 0
+    assert FakeClient.scan_calls == 2
+    assert FakeReorganizer.reorganize_calls == 0
+    assert saved[-1]["episode"]["status"] == plugin._STATE_COMPLETE
 
 
 def test_sidecar_checks_scan_shared_directory_once(tmp_path, monkeypatch):
