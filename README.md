@@ -7,7 +7,7 @@ MoviePilot 官方插件市场：[https://github.com/jxxghp/MoviePilot-Plugins](h
 MoviePilot 环境变量 `PLUGIN_MARKET` 添加本项目地址，多个插件市场地址使用英文逗号分隔。
 
 ```text
-https://github.com/byangmath/RecentEpisodeMaintenance
+https://github.com/byangmath/MoviePilot-Plugins
 ```
 
 MoviePilot V2 也可以在插件页面右上角的插件市场设置中添加上述地址。
