@@ -318,6 +318,51 @@ def test_processing_state_load_rejects_unreadable_or_malformed_data():
         raise AssertionError("unreadable processing state must stop the run")
 
 
+def test_follow_up_service_runs_only_when_delayed_work_is_due(monkeypatch):
+    class FakeCronTrigger:
+        @staticmethod
+        def from_crontab(value):
+            return ("cron", value)
+
+    class FakeIntervalTrigger:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    plugin = RecentEpisodeMaintenance()
+    plugin._enabled = True
+    plugin._cron = "0 0,12 * * *"
+    monkeypatch.setattr(plugin_module, "CronTrigger", FakeCronTrigger)
+    monkeypatch.setattr(plugin_module, "IntervalTrigger", FakeIntervalTrigger)
+
+    services = plugin.get_service()
+
+    assert [service["id"] for service in services] == [
+        "RecentEpisodeMaintenance",
+        "RecentEpisodeMaintenanceFollowUp",
+    ]
+    assert services[1]["trigger"].kwargs == {
+        "minutes": plugin._FOLLOW_UP_POLL_MINUTES
+    }
+    assert plugin._FOLLOW_UP_POLL_MINUTES == 10
+
+    runs = []
+    plugin.run_once = lambda: runs.append("run")
+    stored = {
+        "episode": {
+            "status": plugin._STATE_PENDING_REFRESH,
+            "refresh_check_after": "2999-01-01T00:00:00",
+        }
+    }
+    plugin._load_processing_state = lambda: deepcopy(stored)
+
+    plugin.run_due_follow_up()
+    assert runs == []
+
+    stored["episode"]["refresh_check_after"] = "2000-01-01T00:00:00"
+    plugin.run_due_follow_up()
+    assert runs == ["run"]
+
+
 def test_operation_intents_are_recovered_by_operation_stage():
     plugin = RecentEpisodeMaintenance()
     state = {
@@ -325,6 +370,7 @@ def test_operation_intents_are_recovered_by_operation_stage():
             "operation_intent": {
                 "operation": "refresh",
                 "prepared_at": "2026-07-24T12:00:00",
+                "refresh_attempts": 2,
             }
         },
         "reorganize": {
@@ -348,6 +394,7 @@ def test_operation_intents_are_recovered_by_operation_stage():
     assert state["refresh"]["status"] == plugin._STATE_PENDING_REFRESH
     assert state["refresh"]["had_action"] is True
     assert state["refresh"]["refresh_check_after"] == "2026-07-24T12:30:00"
+    assert state["refresh"]["refresh_attempts"] == 2
     assert state["reorganize"]["status"] == plugin._STATE_PENDING_REORGANIZE
     assert state["reorganize"]["sidecar_pending"] is True
     assert state["reorganize"]["cleanup_pending"] is True
@@ -380,6 +427,12 @@ def test_retry_attention_records_resets_the_failed_stage():
             "status": plugin._STATE_ATTENTION,
             "rename_attempts": 3,
         },
+        "refresh": {
+            "status": plugin._STATE_ATTENTION,
+            "attention_stage": "refresh",
+            "refresh_attempts": 3,
+            "refresh_check_after": "2999-01-01T00:00:00",
+        },
         "complete": {
             "status": plugin._STATE_COMPLETE,
         },
@@ -393,7 +446,7 @@ def test_retry_attention_records_resets_the_failed_stage():
 
     plugin._save_processing_state = save_state
 
-    assert plugin._retry_attention_records() == 3
+    assert plugin._retry_attention_records() == 4
     state = saved[-1]
     assert state["cleanup"]["status"] == plugin._STATE_PENDING_REORGANIZE
     assert state["cleanup"]["cleanup_passes"] == 0
@@ -404,6 +457,9 @@ def test_retry_attention_records_resets_the_failed_stage():
     assert "sidecar_check_after" not in state["sidecar"]
     assert state["rename"]["status"] == plugin._STATE_PENDING_REFRESH
     assert state["rename"]["rename_attempts"] == 0
+    assert state["refresh"]["status"] == plugin._STATE_PENDING_REFRESH
+    assert state["refresh"]["refresh_attempts"] == 0
+    assert "refresh_check_after" not in state["refresh"]
     assert state["complete"]["status"] == plugin._STATE_COMPLETE
 
 
@@ -911,6 +967,8 @@ def test_reorganized_record_is_rechecked_by_jellyfin_before_completion(
 
     class FakeClient:
         refresh_calls = 0
+        successful_refreshes = 0
+        fail_refresh = False
 
         @staticmethod
         def path_key(path):
@@ -924,6 +982,9 @@ def test_reorganized_record_is_rechecked_by_jellyfin_before_completion(
 
         def refresh_episode(self, **_kwargs):
             type(self).refresh_calls += 1
+            if type(self).fail_refresh:
+                raise RuntimeError("Jellyfin unavailable")
+            type(self).successful_refreshes += 1
 
     plugin = RecentEpisodeMaintenance()
     plugin._enable_refresh = True
@@ -964,6 +1025,7 @@ def test_reorganized_record_is_rechecked_by_jellyfin_before_completion(
     assert FakeClient.refresh_calls == 0
     assert saved[-1]["episode"]["status"] == plugin._STATE_PENDING_REORGANIZE
     assert saved[-1]["episode"]["sidecar_pending"] is False
+    assert saved[-1]["episode"]["refresh_attempts"] == 0
 
     history.dest = str(new_media)
     episode.path = str(new_media)
@@ -974,9 +1036,34 @@ def test_reorganized_record_is_rechecked_by_jellyfin_before_completion(
     assert FakeReorganizer.reorganize_calls == 1
     assert saved[-1]["episode"]["status"] == plugin._STATE_PENDING_REFRESH
     assert saved[-1]["episode"]["refresh_check_after"] > "2000-01-01T00:00:00"
+    assert saved[-1]["episode"]["refresh_attempts"] == 1
+
+    FakeClient.fail_refresh = True
+    saved[-1]["episode"]["refresh_check_after"] = "2000-01-01T00:00:00"
+    plugin._run_once()
+
+    assert FakeClient.refresh_calls == 2
+    assert FakeClient.successful_refreshes == 1
+    assert saved[-1]["episode"]["refresh_attempts"] == 1
+
+    FakeClient.fail_refresh = False
+    for expected_attempts in (2, 3):
+        saved[-1]["episode"]["refresh_check_after"] = "2000-01-01T00:00:00"
+        plugin._run_once()
+        assert FakeClient.successful_refreshes == expected_attempts
+        assert saved[-1]["episode"]["refresh_attempts"] == expected_attempts
+
+    saved[-1]["episode"]["refresh_check_after"] = "2000-01-01T00:00:00"
+    plugin._run_once()
+
+    assert FakeClient.refresh_calls == 4
+    assert FakeClient.successful_refreshes == 3
+    assert saved[-1]["episode"]["status"] == plugin._STATE_ATTENTION
+    assert saved[-1]["episode"]["attention_stage"] == "refresh"
+    assert saved[-1]["episode"]["refresh_attempts"] == 3
 
 
-def test_cleanup_and_scan_finish_before_post_reorganize_metadata_check(
+def test_cleanup_verification_does_not_block_post_scan_metadata_check(
     tmp_path,
     monkeypatch,
 ):
@@ -1111,31 +1198,41 @@ def test_cleanup_and_scan_finish_before_post_reorganize_metadata_check(
     assert FakeClient.scan_calls == 1
     assert not old_nfo.exists()
     assert saved[-1]["episode"]["cleanup_pending"] is True
-    assert saved[-1]["episode"]["status"] == plugin._STATE_PENDING_REORGANIZE
-    assert "refresh_check_after" not in saved[-1]["episode"]
+    assert saved[-1]["episode"]["cleanup_passes"] == 1
+    assert saved[-1]["episode"]["status"] == plugin._STATE_PENDING_REFRESH
+    saved[-1]["episode"]["refresh_check_after"] = "2000-01-01T00:00:00"
+    plugin._run_once()
+
+    assert FakeClient.refresh_calls == 1
+    assert FakeClient.scan_calls == 1
+    assert saved[-1]["episode"]["cleanup_pending"] is True
+    assert saved[-1]["episode"]["status"] == plugin._STATE_PENDING_REFRESH
+    assert saved[-1]["episode"]["refresh_attempts"] == 1
+    refreshed_check_after = saved[-1]["episode"]["refresh_check_after"]
 
     saved[-1]["episode"]["cleanup_check_after"] = "2000-01-01T00:00:00"
     plugin._run_once()
 
-    assert FakeClient.refresh_calls == 0
-    assert FakeClient.scan_calls == 2
+    assert FakeClient.refresh_calls == 1
+    assert FakeClient.scan_calls == 1
     assert not saved[-1]["episode"].get("cleanup_pending")
     assert saved[-1]["episode"]["status"] == plugin._STATE_PENDING_REFRESH
-    assert saved[-1]["episode"]["refresh_check_after"] > "2000-01-01T00:00:00"
+    assert saved[-1]["episode"]["refresh_check_after"] == refreshed_check_after
 
     plugin._run_once()
 
-    assert FakeClient.refresh_calls == 0
-    assert FakeClient.scan_calls == 2
+    assert FakeClient.refresh_calls == 1
+    assert FakeClient.scan_calls == 1
 
     episode.name = "New Title"
     saved[-1]["episode"]["refresh_check_after"] = "2000-01-01T00:00:00"
     plugin._run_once()
 
-    assert FakeClient.refresh_calls == 0
-    assert FakeClient.scan_calls == 2
+    assert FakeClient.refresh_calls == 1
+    assert FakeClient.scan_calls == 1
     assert FakeReorganizer.reorganize_calls == 0
     assert saved[-1]["episode"]["status"] == plugin._STATE_COMPLETE
+    assert "refresh_attempts" not in saved[-1]["episode"]
 
 
 def test_sidecar_checks_scan_shared_directory_once(tmp_path, monkeypatch):

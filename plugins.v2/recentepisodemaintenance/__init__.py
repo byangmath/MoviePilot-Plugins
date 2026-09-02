@@ -11,8 +11,10 @@ from typing import Any
 
 try:
     from apscheduler.triggers.cron import CronTrigger
+    from apscheduler.triggers.interval import IntervalTrigger
 except Exception:
     CronTrigger = None
+    IntervalTrigger = None
 
 try:
     from app.log import logger
@@ -50,6 +52,7 @@ class RecentEpisodeMaintenance(_PluginBase):
     _STATE_COMPLETE = "complete"
     _STATE_ATTENTION = "attention"
     _MAX_REORGANIZE_ATTEMPTS = 2
+    _MAX_REFRESH_ATTEMPTS = 3
     _MAX_SIDECAR_ATTEMPTS = 2
     _SIDECAR_WAIT_SECONDS = 60
     _SIDECAR_POLL_SECONDS = 5
@@ -58,6 +61,7 @@ class RecentEpisodeMaintenance(_PluginBase):
     _OLD_SIDECAR_VERIFY_MINUTES = 10
     _OLD_SIDECAR_MAX_PASSES = 2
     _REFRESH_RECHECK_MINUTES = 30
+    _FOLLOW_UP_POLL_MINUTES = 10
     _MONITOR_INTERVAL_HOURS = (24, 48, 72)
     _INSPECTION_MULTIPLIER = 5
     _STATE_SAVE_ATTEMPTS = 3
@@ -108,7 +112,7 @@ class RecentEpisodeMaintenance(_PluginBase):
     plugin_name = "最近剧集维护"
     plugin_desc = "维护 MoviePilot 最近整理入库的 Jellyfin 剧集"
     plugin_icon = "https://raw.githubusercontent.com/byangmath/MoviePilot-Plugins/main/icons/recentepisodemaintenance.png"
-    plugin_version = "0.2.6"
+    plugin_version = "0.2.7"
     plugin_author = "byangmath"
     author_url = "https://github.com/byangmath"
     plugin_config_prefix = "recentepisodemaintenance_"
@@ -180,15 +184,26 @@ class RecentEpisodeMaintenance(_PluginBase):
         return self._enabled
 
     def get_service(self) -> list[dict[str, Any]]:
-        if not self._enabled or not self._cron or CronTrigger is None:
+        if not self._enabled:
             return []
-        return [{
-            "id": "RecentEpisodeMaintenance",
-            "name": "最近剧集维护",
-            "trigger": CronTrigger.from_crontab(self._cron),
-            "func": self.run_once,
-            "kwargs": {},
-        }]
+        services = []
+        if self._cron and CronTrigger is not None:
+            services.append({
+                "id": "RecentEpisodeMaintenance",
+                "name": "最近剧集维护",
+                "trigger": CronTrigger.from_crontab(self._cron),
+                "func": self.run_once,
+                "kwargs": {},
+            })
+        if IntervalTrigger is not None:
+            services.append({
+                "id": "RecentEpisodeMaintenanceFollowUp",
+                "name": "最近剧集维护延迟复查",
+                "trigger": IntervalTrigger(minutes=self._FOLLOW_UP_POLL_MINUTES),
+                "func": self.run_due_follow_up,
+                "kwargs": {},
+            })
+        return services
 
     @staticmethod
     def get_command() -> list[dict[str, Any]]:
@@ -370,6 +385,19 @@ class RecentEpisodeMaintenance(_PluginBase):
                     return
 
             logger.info("[最近剧集维护] 上一轮已结束，开始执行排队任务")
+
+    def run_due_follow_up(self):
+        if not self._enabled:
+            return
+        try:
+            processing_state = self._load_processing_state()
+        except Exception as err:
+            logger.error(f"[最近剧集维护] 检查延迟复查任务失败：{err}")
+            return
+        if not self._has_due_follow_up(processing_state):
+            return
+        logger.info("[最近剧集维护] 检测到已到期的延迟复查任务，开始运行")
+        self.run_once()
 
     def _run_once(self):
         if not self._enable_refresh and not self._enable_reorganize:
@@ -568,6 +596,7 @@ class RecentEpisodeMaintenance(_PluginBase):
         deferred_reorganize_targets: set[str] = set()
         deferred_reorganize_reasons: dict[str, str] = {}
         refresh_first_targets: set[str] = set()
+        refresh_confirmation_waiting_targets: set[str] = set()
         history_keys_by_target: dict[str, set[str]] = {}
         expected_paths: dict[str, Path] = {}
         preview_failed_keys: set[str] = set()
@@ -751,6 +780,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                         continue
 
                     post_reorganize_wait_reason = ""
+                    refresh_confirmation_waiting = False
                     if self._scan_after_reorganize:
                         state_items = [
                             processing_state.get(key) or {}
@@ -760,16 +790,37 @@ class RecentEpisodeMaintenance(_PluginBase):
                             post_reorganize_wait_reason = (
                                 "等待重新整理附件生成和 Jellyfin 扫描"
                             )
-                        elif any(item.get("cleanup_pending") for item in state_items):
+                        elif any(
+                            self._cleanup_blocks_metadata_check(item)
+                            for item in state_items
+                        ):
                             post_reorganize_wait_reason = (
                                 "等待旧附件清理和 Jellyfin 扫描"
                             )
                         elif any(item.get("scan_pending") for item in state_items):
                             post_reorganize_wait_reason = "等待 Jellyfin 扫描完成"
+                        elif any(
+                            item.get("status") == self._STATE_PENDING_REFRESH
+                            and item.get("refresh_check_after")
+                            and not self._timestamp_is_due(
+                                item.get("refresh_check_after")
+                            )
+                            for item in state_items
+                        ):
+                            refresh_confirmation_waiting = True
+                            post_reorganize_wait_reason = (
+                                "等待扫描后的元数据确认时间"
+                            )
                     if post_reorganize_wait_reason:
-                        result.add_skipped(
-                            *(episode_target_keys.get(episode.item_id) or {episode.item_id})
+                        waiting_targets = (
+                            episode_target_keys.get(episode.item_id)
+                            or {episode.item_id}
                         )
+                        result.add_skipped(*waiting_targets)
+                        if refresh_confirmation_waiting:
+                            refresh_confirmation_waiting_targets.update(
+                                waiting_targets
+                            )
                         logger.info(
                             f"[最近剧集维护] 暂缓元数据检查 {episode_label}："
                             f"{post_reorganize_wait_reason}｜文件：{episode_file}"
@@ -877,12 +928,43 @@ class RecentEpisodeMaintenance(_PluginBase):
                     refresh_targets = episode_target_keys.get(episode.item_id) or set()
                     deferred_reorganize_targets.update(refresh_targets)
                     refresh_first_targets.update(refresh_targets)
+                    refresh_attempts = self._refresh_attempts_for_keys(
+                        processing_state,
+                        episode_history_keys,
+                    )
                     for refresh_target in refresh_targets:
                         deferred_reorganize_reasons[refresh_target] = (
                             "MP 和 Jellyfin 标题均不可靠，本轮尝试一次元数据刷新"
                             if placeholder_refresh_needed
                             else "标题不一致，本轮先刷新元数据"
                         )
+                    if (
+                        not self._dry_run
+                        and refresh_attempts >= self._MAX_REFRESH_ATTEMPTS
+                    ):
+                        message = (
+                            f"{episode_label} 已连续刷新 {refresh_attempts} 次，"
+                            "Jellyfin 标题仍与 MoviePilot 预览不一致，"
+                            "已停止自动刷新；请检查 Jellyfin 元数据和 NFO"
+                        )
+                        result.add_error(message, episode_file)
+                        self._mark_processing_state(
+                            processing_state,
+                            episode_history_keys,
+                            self._STATE_ATTENTION,
+                            attention_stage="refresh",
+                            refresh_attempts=refresh_attempts,
+                        )
+                        for refresh_target in refresh_targets:
+                            deferred_reorganize_reasons[refresh_target] = (
+                                "连续刷新达到上限，需人工检查"
+                            )
+                        logger.error(
+                            f"[最近剧集维护] 停止刷新 {episode_label}："
+                            f"连续刷新 {refresh_attempts} 次后标题仍不一致｜"
+                            f"文件：{episode_file}"
+                        )
+                        continue
                     if result.operations_used >= result.operation_limit:
                         result.add_skipped(*refresh_targets)
                         for refresh_target in refresh_targets:
@@ -926,6 +1008,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                         episode_history_keys,
                         "refresh",
                         jellyfin_item_id=episode.item_id,
+                        refresh_attempts=refresh_attempts + 1,
                     )
                     if not self._checkpoint_processing_state(processing_state):
                         self._restore_state_items(
@@ -956,6 +1039,10 @@ class RecentEpisodeMaintenance(_PluginBase):
                             if placeholder_refresh_needed
                             else "标题不一致，已提交元数据和图片刷新"
                         )
+                        refresh_reason += (
+                            f"（第 {refresh_attempts + 1}/"
+                            f"{self._MAX_REFRESH_ATTEMPTS} 次）"
+                        )
                         logger.info(
                             f"[最近剧集维护] 刷新 {episode_label}："
                             f"{refresh_reason}｜文件：{episode_file}"
@@ -966,6 +1053,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                             self._STATE_PENDING_REFRESH,
                             had_action=True,
                             refresh_check_after=self._refresh_recheck_at(),
+                            refresh_attempts=refresh_attempts + 1,
                             placeholder_refresh_done=(
                                 True if placeholder_refresh_needed else None
                             ),
@@ -1122,6 +1210,12 @@ class RecentEpisodeMaintenance(_PluginBase):
                     cleanup_old_media_path = state_item.get("cleanup_old_media_path")
                     cleanup_check_after = state_item.get("cleanup_check_after")
                     cleanup_passes = int(state_item.get("cleanup_passes") or 0)
+                    cleanup_completion_status = (
+                        self._STATE_PENDING_REFRESH
+                        if state_item.get("status") == self._STATE_PENDING_REFRESH
+                        and state_item.get("refresh_check_after")
+                        else self._STATE_PENDING_REORGANIZE
+                    )
                     same_path = self._same_path(current_file, expected_path)
                     if sidecar_pending and not self._missing_reorganized_sidecars(
                         expected_path,
@@ -1192,7 +1286,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                             self._mark_processing_state(
                                 processing_state,
                                 {processing_key},
-                                self._STATE_PENDING_REORGANIZE,
+                                cleanup_completion_status,
                                 cleanup_pending=False,
                             )
                             cleanup_pending = False
@@ -1213,7 +1307,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                             self._mark_processing_state(
                                 processing_state,
                                 {processing_key},
-                                self._STATE_PENDING_REORGANIZE,
+                                cleanup_completion_status,
                                 cleanup_pending=False,
                             )
                             cleanup_pending = False
@@ -1260,6 +1354,12 @@ class RecentEpisodeMaintenance(_PluginBase):
                                     ),
                                     cleanup_passes=next_cleanup_pass,
                                 )
+                                if self._scan_after_reorganize:
+                                    item = dict(
+                                        processing_state.get(processing_key) or {}
+                                    )
+                                    item["scan_pending"] = True
+                                    processing_state[processing_key] = item
                                 self._clear_operation_intent(
                                     processing_state,
                                     {processing_key},
@@ -1322,7 +1422,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                             self._mark_processing_state(
                                 processing_state,
                                 {processing_key},
-                                self._STATE_PENDING_REORGANIZE,
+                                cleanup_completion_status,
                                 cleanup_pending=False,
                             )
                             self._clear_operation_intent(
@@ -1339,11 +1439,18 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 state_persistence_failed = True
                                 break
                             cleanup_pending = False
-                            sidecars_ready_for_scan.add(processing_key)
+                            if deleted or renamed:
+                                sidecars_ready_for_scan.add(processing_key)
                             logger.info(
                                 f"[最近剧集维护] 清理完成 {label}："
                                 f"复查删除 {len(deleted)} 个、改名 {len(renamed)} 个旧名称附件"
                             )
+                    if target_key in refresh_confirmation_waiting_targets:
+                        logger.info(
+                            f"[最近剧集维护] 等待刷新确认 {label}："
+                            f"尚未到扫描后的元数据确认时间｜文件：{expected_path}"
+                        )
+                        continue
                     if (
                         self._skip_same_name
                         and not sidecar_pending
@@ -1608,6 +1715,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 rename_attempts=(
                                     rename_attempts if sidecar_pending else rename_attempts + 1
                                 ),
+                                refresh_attempts=0,
                                 had_action=True,
                                 expected_path=target,
                                 sidecar_pending=True,
@@ -2318,7 +2426,11 @@ class RecentEpisodeMaintenance(_PluginBase):
         ]
         waiting_keys = {
             key
-            for _, key in refresh_waiting + sidecar_waiting + cleanup_waiting
+            for _, key in pending_all
+            if not self._pending_state_has_due_work(
+                state.get(key) or {},
+                cleanup_enabled=cleanup_enabled,
+            )
         }
         pending = [
             (history, key)
@@ -2379,6 +2491,8 @@ class RecentEpisodeMaintenance(_PluginBase):
                 reason = "旧名称附件清理失败"
             elif attention_stage == "sidecar":
                 reason = "刮削附件多次补齐失败"
+            elif attention_stage == "refresh":
+                reason = "连续刷新后标题仍不一致"
             else:
                 reason = "多次重命名后路径仍变化"
             target = (
@@ -2567,6 +2681,18 @@ class RecentEpisodeMaintenance(_PluginBase):
                 item["refresh_check_after"] = self._intent_refresh_check_after(
                     intent.get("prepared_at")
                 )
+                try:
+                    recovered_attempts = int(intent.get("refresh_attempts") or 0)
+                except (TypeError, ValueError):
+                    recovered_attempts = 0
+                try:
+                    existing_attempts = int(item.get("refresh_attempts") or 0)
+                except (TypeError, ValueError):
+                    existing_attempts = 0
+                item["refresh_attempts"] = max(
+                    existing_attempts,
+                    recovered_attempts,
+                )
             elif operation == "reorganize":
                 item["status"] = self._STATE_PENDING_REORGANIZE
                 item["had_action"] = True
@@ -2658,7 +2784,7 @@ class RecentEpisodeMaintenance(_PluginBase):
             key
             for key in keys
             if not (state.get(key) or {}).get("sidecar_pending")
-            and not (state.get(key) or {}).get("cleanup_pending")
+            and not self._cleanup_blocks_metadata_check(state.get(key) or {})
         }
         if not eligible_keys:
             return 0
@@ -2678,6 +2804,65 @@ class RecentEpisodeMaintenance(_PluginBase):
             return datetime.fromisoformat(str(value)) <= datetime.now()
         except (TypeError, ValueError):
             return True
+
+    @staticmethod
+    def _cleanup_blocks_metadata_check(state_item: dict[str, Any]) -> bool:
+        return bool(state_item.get("cleanup_pending")) and int(
+            state_item.get("cleanup_passes") or 0
+        ) < 1
+
+    def _pending_state_has_due_work(
+        self,
+        state_item: dict[str, Any],
+        *,
+        cleanup_enabled: bool,
+    ) -> bool:
+        if state_item.get("operation_intent") or state_item.get("scan_pending"):
+            return True
+        if state_item.get("sidecar_pending"):
+            return self._timestamp_is_due(state_item.get("sidecar_check_after"))
+
+        due_checks = []
+        if cleanup_enabled and state_item.get("cleanup_pending"):
+            due_checks.append(
+                self._timestamp_is_due(state_item.get("cleanup_check_after"))
+            )
+        if (
+            state_item.get("status") == self._STATE_PENDING_REFRESH
+            and state_item.get("refresh_check_after")
+        ):
+            due_checks.append(
+                self._timestamp_is_due(state_item.get("refresh_check_after"))
+            )
+        return not due_checks or any(due_checks)
+
+    def _has_due_follow_up(self, state: dict[str, dict[str, Any]]) -> bool:
+        pending_statuses = {
+            self._STATE_PENDING_REFRESH,
+            self._STATE_PENDING_REORGANIZE,
+        }
+        for state_item in state.values():
+            if not isinstance(state_item, dict):
+                continue
+            if state_item.get("status") not in pending_statuses:
+                continue
+            if state_item.get("operation_intent") or state_item.get("scan_pending"):
+                return True
+            if state_item.get("sidecar_pending") and self._timestamp_is_due(
+                state_item.get("sidecar_check_after")
+            ):
+                return True
+            if state_item.get("cleanup_pending") and self._timestamp_is_due(
+                state_item.get("cleanup_check_after")
+            ):
+                return True
+            if (
+                state_item.get("status") == self._STATE_PENDING_REFRESH
+                and state_item.get("refresh_check_after")
+                and self._timestamp_is_due(state_item.get("refresh_check_after"))
+            ):
+                return True
+        return False
 
     def _load_processing_state(self) -> dict[str, dict[str, Any]]:
         get_data = getattr(self, "get_data", None)
@@ -2839,6 +3024,10 @@ class RecentEpisodeMaintenance(_PluginBase):
                 item["status"] = self._STATE_PENDING_REORGANIZE
                 item["sidecar_attempts"] = 0
                 item.pop("sidecar_check_after", None)
+            elif attention_stage == "refresh":
+                item["status"] = self._STATE_PENDING_REFRESH
+                item["refresh_attempts"] = 0
+                item.pop("refresh_check_after", None)
             else:
                 item["status"] = (
                     self._STATE_PENDING_REFRESH
@@ -2865,7 +3054,7 @@ class RecentEpisodeMaintenance(_PluginBase):
     @staticmethod
     def _attention_stage(item: dict[str, Any]) -> str:
         stage = str(item.get("attention_stage") or "")
-        if stage in {"sidecar", "cleanup", "rename"}:
+        if stage in {"sidecar", "cleanup", "refresh", "rename"}:
             return stage
         if item.get("sidecar_pending"):
             return "sidecar"
@@ -2924,13 +3113,15 @@ class RecentEpisodeMaintenance(_PluginBase):
                 counts["scan_waiting"] += 1
             elif item.get("sidecar_pending"):
                 counts["sidecar_waiting"] += 1
-            elif item.get("cleanup_pending"):
+            elif self._cleanup_blocks_metadata_check(item):
                 counts["cleanup_waiting"] += 1
             elif (
                 status == self._STATE_PENDING_REFRESH
                 and not self._timestamp_is_due(item.get("refresh_check_after"))
             ):
                 counts["refresh_waiting"] += 1
+            elif item.get("cleanup_pending"):
+                counts["cleanup_waiting"] += 1
             elif (
                 status == self._STATE_MONITORING
                 and not self._timestamp_is_due(item.get("next_preview_at"))
@@ -3005,6 +3196,22 @@ class RecentEpisodeMaintenance(_PluginBase):
                 return True
         return False
 
+    @staticmethod
+    def _refresh_attempts_for_keys(
+        state: dict[str, dict[str, Any]],
+        keys: set[str],
+    ) -> int:
+        attempts = 0
+        for key in keys:
+            try:
+                attempts = max(
+                    attempts,
+                    int((state.get(key) or {}).get("refresh_attempts") or 0),
+                )
+            except (TypeError, ValueError):
+                continue
+        return attempts
+
     def _mark_processing_verified(
         self,
         state: dict[str, dict[str, Any]],
@@ -3017,17 +3224,29 @@ class RecentEpisodeMaintenance(_PluginBase):
                     state,
                     {key},
                     self._STATE_PENDING_REORGANIZE,
+                    refresh_attempts=0,
                 )
             elif bool(state_item.get("cleanup_pending")):
                 self._mark_processing_state(
                     state,
                     {key},
                     self._STATE_PENDING_REORGANIZE,
+                    refresh_attempts=0,
                 )
             elif bool(state_item.get("had_action")):
-                self._mark_processing_state(state, {key}, self._STATE_COMPLETE)
+                self._mark_processing_state(
+                    state,
+                    {key},
+                    self._STATE_COMPLETE,
+                    refresh_attempts=0,
+                )
             elif self._history_window_expired(state_item):
-                self._mark_processing_state(state, {key}, self._STATE_COMPLETE)
+                self._mark_processing_state(
+                    state,
+                    {key},
+                    self._STATE_COMPLETE,
+                    refresh_attempts=0,
+                )
             else:
                 monitoring_checks = int(state_item.get("monitoring_checks") or 0) + 1
                 interval_index = min(
@@ -3044,6 +3263,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                     self._STATE_MONITORING,
                     next_preview_at=next_preview_at,
                     monitoring_checks=monitoring_checks,
+                    refresh_attempts=0,
                 )
 
     def _mark_processing_waiting_for_preview_title(
@@ -3107,6 +3327,7 @@ class RecentEpisodeMaintenance(_PluginBase):
         next_preview_at: str | None = None,
         monitoring_checks: int | None = None,
         refresh_check_after: str | None = None,
+        refresh_attempts: int | None = None,
         sidecar_pending: bool | None = None,
         sidecar_attempts: int | None = None,
         sidecar_check_after: str | None = None,
@@ -3143,6 +3364,8 @@ class RecentEpisodeMaintenance(_PluginBase):
                 item["refresh_check_after"] = refresh_check_after
             elif status != RecentEpisodeMaintenance._STATE_PENDING_REFRESH:
                 item.pop("refresh_check_after", None)
+            if refresh_attempts is not None:
+                item["refresh_attempts"] = max(int(refresh_attempts), 0)
             if sidecar_pending is not None:
                 item["sidecar_pending"] = sidecar_pending
             if sidecar_attempts is not None:
@@ -3192,6 +3415,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                 RecentEpisodeMaintenance._STATE_MONITORING,
             }:
                 for finished_key in (
+                    "refresh_attempts",
                     "sidecar_pending",
                     "sidecar_attempts",
                     "sidecar_check_after",

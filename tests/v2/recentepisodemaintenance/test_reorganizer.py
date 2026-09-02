@@ -343,6 +343,54 @@ def test_refresh_cooldown_defers_record_without_dropping_it():
     assert state[key]["history_id"] == 1
 
 
+def test_due_cleanup_and_refresh_wait_are_selected_independently():
+    plugin = RecentEpisodeMaintenance()
+    plugin._max_items = 10
+    plugin._cleanup_old_sidecars = True
+    reorganizer = MoviePilotReorganizer(logger=None)
+    cleanup_due = history(
+        history_id=1,
+        source="/source/show/cleanup-due.mkv",
+        dest="/library/show/Season 01/测试剧 S01E01.mkv",
+        date="2026-07-01 12:00:00",
+        download_hash="cleanup-due",
+    )
+    refresh_due = history(
+        history_id=2,
+        source="/source/show/refresh-due.mkv",
+        dest="/library/show/Season 01/测试剧 S01E02.mkv",
+        date="2026-07-01 12:01:00",
+        download_hash="refresh-due",
+    )
+    refresh_due.episodes = "E02"
+    stored_state = {
+        reorganizer.processing_key(cleanup_due): {
+            "status": plugin._STATE_PENDING_REFRESH,
+            "refresh_check_after": "2999-01-01T00:00:00",
+            "cleanup_pending": True,
+            "cleanup_check_after": "2000-01-01T00:00:00",
+            "cleanup_passes": 1,
+        },
+        reorganizer.processing_key(refresh_due): {
+            "status": plugin._STATE_PENDING_REFRESH,
+            "refresh_check_after": "2000-01-01T00:00:00",
+            "cleanup_pending": True,
+            "cleanup_check_after": "2999-01-01T00:00:00",
+            "cleanup_passes": 1,
+        },
+    }
+
+    selected, _, selection = plugin._select_histories(
+        histories=[cleanup_due, refresh_due],
+        reorganizer=reorganizer,
+        state=stored_state,
+    )
+
+    assert selected == [cleanup_due, refresh_due]
+    assert selection["refresh_waiting"] == 1
+    assert selection["cleanup_waiting"] == 1
+
+
 def test_due_monitoring_records_are_not_starved_by_new_records():
     plugin = RecentEpisodeMaintenance()
     plugin._max_items = 1
@@ -491,6 +539,38 @@ def test_selection_lists_attention_records_with_reason_and_path():
     assert selection["attention"] == 1
     assert selection["attention_items"] == [
         "测试剧 S01E01：刮削附件多次补齐失败｜"
+        "文件：/library/show/Season 01/测试剧 S01E01.mkv"
+    ]
+
+
+def test_selection_describes_refresh_attention_records():
+    plugin = RecentEpisodeMaintenance()
+    plugin._max_items = 10
+    reorganizer = MoviePilotReorganizer(logger=None)
+    video = history(
+        history_id=1,
+        source="/source/show/episode.mkv",
+        dest="/library/show/Season 01/测试剧 S01E01.mkv",
+        date="2026-07-19 12:00:00",
+    )
+    key = reorganizer.processing_key(video)
+    plugin._load_processing_state = lambda: {
+        key: {
+            "status": plugin._STATE_ATTENTION,
+            "attention_stage": "refresh",
+            "refresh_attempts": 3,
+            "expected_path": "/library/show/Season 01/测试剧 S01E01.mkv",
+        }
+    }
+
+    selected, _, selection = plugin._select_histories(
+        histories=[video],
+        reorganizer=reorganizer,
+    )
+
+    assert selected == []
+    assert selection["attention_items"] == [
+        "测试剧 S01E01：连续刷新后标题仍不一致｜"
         "文件：/library/show/Season 01/测试剧 S01E01.mkv"
     ]
 
