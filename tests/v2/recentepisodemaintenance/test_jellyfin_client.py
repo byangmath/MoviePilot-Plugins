@@ -3,6 +3,7 @@ import pytest
 import recentepisodemaintenance.jellyfin_client as client_module
 from recentepisodemaintenance import RecentEpisodeMaintenance
 from recentepisodemaintenance.jellyfin_client import JellyfinServiceClient
+from recentepisodemaintenance.models import EpisodeTarget
 
 
 class UnavailableService:
@@ -114,3 +115,54 @@ def test_form_library_options_disable_retry():
         {"title": "全部", "value": "__all__"},
         {"title": "电视剧", "value": "tv"},
     ]
+
+
+def test_matches_movies_and_episodes_with_separate_jellyfin_item_types():
+    class MediaService:
+        def __init__(self):
+            self.urls = []
+
+        def get_data(self, url):
+            self.urls.append(url)
+            if "IncludeItemTypes=Movie" in url:
+                return {
+                    "Items": [{
+                        "Id": "movie-1",
+                        "Type": "Movie",
+                        "Name": "挽救计划",
+                        "Path": "/library/movies/挽救计划 (2026)/挽救计划 (2026).mkv",
+                        "DateCreated": "2999-01-01T00:00:00Z",
+                    }]
+                }
+            if "IncludeItemTypes=Episode" in url:
+                return {
+                    "Items": [{
+                        "Id": "episode-1",
+                        "Type": "Episode",
+                        "Name": "正式标题",
+                        "SeriesName": "测试剧",
+                        "ParentIndexNumber": 1,
+                        "IndexNumber": 1,
+                        "Path": "/library/tv/测试剧/Season 01/测试剧 S01E01 - 正式标题.mkv",
+                        "DateCreated": "2999-01-01T00:00:00Z",
+                    }]
+                }
+            raise AssertionError(url)
+
+    service = MediaService()
+    client = JellyfinServiceClient(service)
+    movie_path = "/library/movies/挽救计划 (2026)/挽救计划 (2026).mkv"
+    episode_path = "/library/tv/测试剧/Season 01/测试剧 S01E01 - 正式标题.mkv"
+
+    matches = client.match_recent_media(
+        targets=[
+            EpisodeTarget(path=movie_path, media_type="movie"),
+            EpisodeTarget(path=episode_path, media_type="tv"),
+        ],
+        days=15,
+    )
+
+    assert matches[client.path_key(movie_path)][0].is_movie
+    assert matches[client.path_key(episode_path)][0].is_episode
+    assert any("IncludeItemTypes=Movie" in url for url in service.urls)
+    assert any("IncludeItemTypes=Episode" in url for url in service.urls)

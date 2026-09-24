@@ -12,6 +12,7 @@ def history(
     source: str,
     date: str,
     download_hash: str = "same-transfer",
+    media_type: str = "电视剧",
 ):
     return SimpleNamespace(
         id=history_id,
@@ -24,6 +25,7 @@ def history(
         dest_storage="local",
         mode="link",
         status=True,
+        type=media_type,
         title="测试剧",
         year="2026",
         tmdbid=123,
@@ -113,6 +115,25 @@ def test_ignores_episode_group_without_video_history():
     )
 
     assert reorganizer._select_primary_histories([subtitle]) == []
+
+
+def test_movie_history_uses_movie_type_without_season_or_episode():
+    reorganizer = MoviePilotReorganizer(logger=None)
+    movie = history(
+        history_id=1,
+        source="/source/movie/Project.Hail.Mary.2026.mkv",
+        dest="/library/movies/挽救计划 (2026)/挽救计划 (2026).mkv",
+        date="2026-08-24 00:00:00",
+        media_type="电影",
+    )
+    movie.title = "挽救计划"
+    movie.seasons = ""
+    movie.episodes = ""
+
+    assert reorganizer._select_primary_histories([movie]) == [movie]
+    assert reorganizer.media_type(movie) == "movie"
+    assert reorganizer.display_name(movie) == "挽救计划 (2026)"
+    assert reorganizer.media_target(movie).media_type == "movie"
 
 
 def test_attachment_histories_do_not_consume_video_inspection_limit():
@@ -233,6 +254,7 @@ def test_recent_history_query_includes_tracked_records_outside_date_window():
         date = Column("date")
         id = Column("id")
         status = Column("status")
+        type = Column("type")
         seasons = Column("seasons")
         episodes = Column("episodes")
 
@@ -272,6 +294,7 @@ def test_recent_history_query_includes_tracked_records_outside_date_window():
     assert reorganizer.recent_histories(15, tracked_history_ids={7, 8}) == []
     assert query.filters[0][0] == "or"
     assert query.filters[0][2] == ("in", "id", {7, 8})
+    assert ("in", "type", {"电影", "电视剧"}) in query.filters
 
 
 def test_verified_monitoring_uses_adaptive_intervals():

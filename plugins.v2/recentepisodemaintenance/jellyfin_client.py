@@ -88,7 +88,7 @@ class JellyfinServiceClient:
                 ):
                     break
                 logger.warning(
-                    "[最近剧集维护] Jellyfin 请求失败，%s 秒后重试（%s/%s）：%s",
+                    "[最近媒体维护] Jellyfin 请求失败，%s 秒后重试（%s/%s）：%s",
                     self._REQUEST_RETRY_DELAY_SECONDS,
                     attempt,
                     request_attempts,
@@ -131,17 +131,35 @@ class JellyfinServiceClient:
         library_ids: Iterable[str] | None = None,
         limit: int = 20,
     ) -> list[EpisodeItem]:
+        return self.recent_added_media(
+            media_type="tv",
+            days=days,
+            library_ids=library_ids,
+            limit=limit,
+        )
+
+    def recent_added_media(
+        self,
+        media_type: str,
+        days: int,
+        library_ids: Iterable[str] | None = None,
+        limit: int = 20,
+    ) -> list[EpisodeItem]:
         since = datetime.now(timezone.utc) - timedelta(days=max(int(days or 1), 1))
         ids = [item.strip() for item in (library_ids or []) if item and item.strip()]
         parent_ids: list[str | None] = ids or [None]
-        episodes: dict[str, EpisodeItem] = {}
+        media_items: dict[str, EpisodeItem] = {}
+        item_type = "Movie" if str(media_type).casefold() == "movie" else "Episode"
 
         for parent_id in parent_ids:
             params: dict[str, Any] = {
-                "IncludeItemTypes": "Episode",
+                "IncludeItemTypes": item_type,
                 "Recursive": "true",
                 "IsMissing": "false",
-                "Fields": "Path,DateCreated,SeriesName,SeasonName,IndexNumber,ParentIndexNumber",
+                "Fields": (
+                    "Path,DateCreated,ProviderIds,SeriesName,SeasonName,"
+                    "IndexNumber,ParentIndexNumber"
+                ),
                 "SortBy": "DateCreated",
                 "SortOrder": "Descending",
                 "Limit": max(int(limit), 1),
@@ -151,12 +169,16 @@ class JellyfinServiceClient:
                 params["ParentId"] = parent_id
 
             for item in self._get_json("Items", params).get("Items") or []:
-                episode = EpisodeItem.from_jellyfin(item)
-                if episode.item_id and episode.path and self._created_after(episode.date_created, since):
-                    episodes[episode.item_id] = episode
+                media_item = EpisodeItem.from_jellyfin(item)
+                if (
+                    media_item.item_id
+                    and media_item.path
+                    and self._created_after(media_item.date_created, since)
+                ):
+                    media_items[media_item.item_id] = media_item
 
         return sorted(
-            episodes.values(),
+            media_items.values(),
             key=lambda item: item.date_created,
             reverse=True,
         )[:max(int(limit), 1)]
@@ -168,6 +190,23 @@ class JellyfinServiceClient:
         library_ids: Iterable[str] | None = None,
     ) -> dict[str, list[EpisodeItem]]:
         """Match MoviePilot history targets to Jellyfin episodes."""
+        episode_targets = [
+            EpisodeTarget(path=target.path, media_type="tv")
+            for target in targets
+        ]
+        return self.match_recent_media(
+            targets=episode_targets,
+            days=days,
+            library_ids=library_ids,
+        )
+
+    def match_recent_media(
+        self,
+        targets: Iterable[EpisodeTarget],
+        days: int,
+        library_ids: Iterable[str] | None = None,
+    ) -> dict[str, list[EpisodeItem]]:
+        """Match MoviePilot movie and episode targets to Jellyfin items."""
         target_map = {
             self.path_key(target.path): target
             for target in targets
@@ -176,21 +215,54 @@ class JellyfinServiceClient:
         if not target_map:
             return {}
 
-        candidate_limit = min(max(len(target_map) * 10, 50), 500)
-        candidates = self.recent_added_episodes(
-            days=days,
-            library_ids=library_ids,
-            limit=candidate_limit,
-        )
+        matches: dict[str, list[EpisodeItem]] = {}
+        for media_type in ("tv", "movie"):
+            media_targets = {
+                key: target
+                for key, target in target_map.items()
+                if str(target.media_type or "tv").casefold() == media_type
+            }
+            if not media_targets:
+                continue
+            candidate_limit = min(max(len(media_targets) * 10, 50), 500)
+            candidates = self.recent_added_media(
+                media_type=media_type,
+                days=days,
+                library_ids=library_ids,
+                limit=candidate_limit,
+            )
+            matches.update(self._match_targets(media_targets, candidates))
+            unmatched = {
+                key: target
+                for key, target in media_targets.items()
+                if key not in matches
+            }
+            if not unmatched:
+                continue
+            if media_type == "tv":
+                matches.update(self._match_by_series(unmatched.values(), library_ids))
+            else:
+                matches.update(
+                    self._match_targets(
+                        unmatched,
+                        self._all_media_items("Movie", library_ids),
+                    )
+                )
+        return matches
 
+    def _match_targets(
+        self,
+        target_map: dict[str, EpisodeTarget],
+        candidates: Iterable[EpisodeItem],
+    ) -> dict[str, list[EpisodeItem]]:
         by_path: dict[str, list[EpisodeItem]] = {}
         by_name: dict[str, list[EpisodeItem]] = {}
-        for episode in candidates:
-            key = self.path_key(episode.path)
+        for media_item in candidates:
+            key = self.path_key(media_item.path)
             if not key:
                 continue
-            by_path.setdefault(key, []).append(episode)
-            by_name.setdefault(Path(episode.path).name.casefold(), []).append(episode)
+            by_path.setdefault(key, []).append(media_item)
+            by_name.setdefault(Path(media_item.path).name.casefold(), []).append(media_item)
 
         matches: dict[str, list[EpisodeItem]] = {}
         for target_key, target in target_map.items():
@@ -204,11 +276,30 @@ class JellyfinServiceClient:
             unique_ids = {item.item_id for item in filename_matches}
             if len(unique_ids) == 1:
                 matches[target_key] = filename_matches
-
-        unmatched = [target for key, target in target_map.items() if key not in matches]
-        if unmatched:
-            matches.update(self._match_by_series(unmatched, library_ids))
         return matches
+
+    def _all_media_items(
+        self,
+        item_type: str,
+        library_ids: Iterable[str] | None,
+    ) -> list[EpisodeItem]:
+        ids = [item.strip() for item in (library_ids or []) if item and item.strip()]
+        parent_ids: list[str | None] = ids or [None]
+        media_items: dict[str, EpisodeItem] = {}
+        for parent_id in parent_ids:
+            params: dict[str, Any] = {
+                "IncludeItemTypes": item_type,
+                "Recursive": "true",
+                "IsMissing": "false",
+                "Fields": "Path,DateCreated,ProviderIds",
+            }
+            if parent_id:
+                params["ParentId"] = parent_id
+            for item in self._paged_items(params):
+                media_item = EpisodeItem.from_jellyfin(item)
+                if media_item.item_id and media_item.path:
+                    media_items[media_item.item_id] = media_item
+        return list(media_items.values())
 
     def _match_by_series(
         self,

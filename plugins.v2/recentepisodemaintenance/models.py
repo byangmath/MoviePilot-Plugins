@@ -95,6 +95,7 @@ class EpisodeItem:
     date_created: str = ""
     path: str = ""
     provider_ids: dict[str, Any] = field(default_factory=dict)
+    item_type: str = "Episode"
 
     @classmethod
     def from_jellyfin(cls, item: dict[str, Any]) -> "EpisodeItem":
@@ -107,7 +108,22 @@ class EpisodeItem:
             date_created=item.get("DateCreated") or "",
             path=item.get("Path") or "",
             provider_ids=item.get("ProviderIds") or {},
+            item_type=item.get("Type") or "Episode",
         )
+
+    @property
+    def is_episode(self) -> bool:
+        return str(self.item_type or "Episode").casefold() == "episode"
+
+    @property
+    def is_movie(self) -> bool:
+        return str(self.item_type or "").casefold() == "movie"
+
+    @property
+    def media_label(self) -> str:
+        if self.is_movie:
+            return self.name or "未知电影"
+        return self.episode_label
 
     @property
     def episode_label(self) -> str:
@@ -127,10 +143,21 @@ class EpisodeItem:
         return self.title_matches_path(self.path)
 
     def title_matches_path(self, path: str | Path | None) -> bool:
-        """Check whether Jellyfin's episode title occurs in an expected media filename."""
+        """Check whether Jellyfin's title occurs in the expected media path."""
         title_key = _title_key(self.name)
         if not title_key or not path:
             return False
+
+        if self.is_movie:
+            media_path = Path(path)
+            return any(
+                title_key in candidate_key
+                for candidate_key in (
+                    _title_key(media_path.stem),
+                    _title_key(media_path.parent.name),
+                )
+                if candidate_key
+            )
 
         filename_stem = Path(path).stem
         marker = _EPISODE_MARKER.search(filename_stem)
@@ -151,10 +178,12 @@ class EpisodeItem:
         if (
             not title_key
             or title_key in _UNRELIABLE_TITLE_KEYS
-            or _PLACEHOLDER_EPISODE_TITLE.search(title)
-            or _EPISODE_MARKER.search(title)
             or any(marker in title for marker in ("�", "锟斤拷"))
         ):
+            return True
+        if self.is_movie:
+            return False
+        if _PLACEHOLDER_EPISODE_TITLE.search(title) or _EPISODE_MARKER.search(title):
             return True
         if self.series_name and title_key == _title_key(self.series_name):
             return True
@@ -194,7 +223,8 @@ class EpisodeItem:
         expected_path: str | Path | None,
     ) -> bool:
         return (
-            self.path_title_is_placeholder(expected_path)
+            self.is_episode
+            and self.path_title_is_placeholder(expected_path)
             and not self.title_is_unreliable()
         )
 
@@ -202,6 +232,7 @@ class EpisodeItem:
 @dataclass(frozen=True)
 class EpisodeTarget:
     path: str
+    media_type: str = "tv"
 
 
 @dataclass
@@ -283,20 +314,20 @@ class RunResult:
         lines.extend(
             [
                 f"操作统计：刷新和重新整理 {self.operations_used}/{self.operation_limit} 次；"
-                f"重新整理试运行预览 {self.previewed} 条，成功 {self.reorganized} 集；"
-                f"元数据刷新试运行预览 {self.refresh_previewed} 集，成功 {self.refreshed} 集",
-                f"匹配结果：匹配到 Jellyfin 剧集 {self.refresh_candidates} 集，"
-                f"跳过 {self.skipped} 集，失败 {self.failed} 集",
+                f"重新整理试运行预览 {self.previewed} 条，成功 {self.reorganized} 项；"
+                f"元数据刷新试运行预览 {self.refresh_previewed} 项，成功 {self.refreshed} 项",
+                f"匹配结果：匹配到 Jellyfin 媒体 {self.refresh_candidates} 项，"
+                f"跳过 {self.skipped} 项，失败 {self.failed} 项",
             ]
         )
         if self.refreshed_titles:
-            lines.append("元数据刷新成功剧集：")
+            lines.append("元数据刷新成功媒体：")
             lines.extend(f"- {title}" for title in self.refreshed_titles)
         if self.reorganized_titles:
-            lines.append("重新整理成功剧集：")
+            lines.append("重新整理成功媒体：")
             lines.extend(f"- {title}" for title in self.reorganized_titles)
         if self.failed_titles:
-            lines.append("处理失败剧集：")
+            lines.append("处理失败媒体：")
             lines.extend(f"- {title}" for title in self.failed_titles)
         if self.errors:
             lines.append("失败详情：")
@@ -306,4 +337,4 @@ class RunResult:
         return "\n".join(lines)
 
     def should_notify(self) -> bool:
-        return self.actions_submitted > 0 or self.failed > 0
+        return True

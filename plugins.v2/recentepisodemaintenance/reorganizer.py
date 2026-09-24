@@ -72,10 +72,8 @@ class MoviePilotReorganizer:
                 query = db.query(history_cls).filter(date_filter)
             if getattr(history_cls, "status", None) is not None:
                 query = query.filter(history_cls.status.is_(True))
-            if getattr(history_cls, "seasons", None) is not None:
-                query = query.filter(history_cls.seasons.isnot(None))
-            if getattr(history_cls, "episodes", None) is not None:
-                query = query.filter(history_cls.episodes.isnot(None))
+            if getattr(history_cls, "type", None) is not None:
+                query = query.filter(history_cls.type.in_(("电影", "电视剧")))
             if getattr(history_cls, "date", None) is not None:
                 query = query.order_by(history_cls.date.desc())
             if getattr(history_cls, "id", None) is not None:
@@ -94,6 +92,8 @@ class MoviePilotReorganizer:
     ) -> list[Any]:
         grouped: dict[tuple[str, str, str], list[Any]] = {}
         for history in candidates:
+            if self.media_type(history) not in {"movie", "tv"}:
+                continue
             grouped.setdefault(self._episode_key(history), []).append(history)
 
         preferred_ids = {
@@ -241,7 +241,7 @@ class MoviePilotReorganizer:
         if not self._supports_preview():
             return OperationResult(
                 success=False,
-                message="当前 MoviePilot 版本不支持整理预览，无法安全判断最新剧集标题",
+                message="当前 MoviePilot 版本不支持整理预览，无法安全判断最新媒体标题",
                 source=source,
                 target=current_target,
             )
@@ -268,7 +268,7 @@ class MoviePilotReorganizer:
         if not preview_target:
             return OperationResult(
                 success=False,
-                message="整理预览未返回目标文件，无法安全判断最新剧集标题",
+                message="整理预览未返回目标文件，无法安全判断最新媒体标题",
                 source=source,
                 target=current_target,
             )
@@ -282,7 +282,14 @@ class MoviePilotReorganizer:
 
     @staticmethod
     def display_name(history: Any) -> str:
-        title = str(getattr(history, "title", None) or "未知剧集")
+        media_type = MoviePilotReorganizer.media_type(history)
+        title = str(
+            getattr(history, "title", None)
+            or ("未知电影" if media_type == "movie" else "未知剧集")
+        )
+        if media_type == "movie":
+            year = str(getattr(history, "year", None) or "").strip()
+            return f"{title} ({year})" if year else title
         season = str(getattr(history, "seasons", None) or "S??")
         episode = str(getattr(history, "episodes", None) or "E??")
         return f"{title} {season}{episode}"
@@ -293,10 +300,33 @@ class MoviePilotReorganizer:
 
     @classmethod
     def episode_target(cls, history: Any) -> EpisodeTarget | None:
+        return cls.media_target(history)
+
+    @classmethod
+    def media_target(cls, history: Any) -> EpisodeTarget | None:
         path = cls._history_target(history)
         if not path:
             return None
-        return EpisodeTarget(path=str(path))
+        media_type = cls.media_type(history)
+        if media_type not in {"movie", "tv"}:
+            return None
+        return EpisodeTarget(path=str(path), media_type=media_type)
+
+    @staticmethod
+    def media_type(history: Any) -> str:
+        raw_type = getattr(history, "type", None)
+        value = getattr(raw_type, "value", raw_type)
+        normalized = str(value or "").strip().casefold()
+        if normalized in {"电影", "movie", "mediatype.movie"}:
+            return "movie"
+        if normalized in {"电视剧", "tv", "television", "mediatype.tv"}:
+            return "tv"
+        if (
+            str(getattr(history, "seasons", None) or "").strip()
+            and str(getattr(history, "episodes", None) or "").strip()
+        ):
+            return "tv"
+        return "unknown"
 
     @classmethod
     def processing_key(cls, history: Any) -> str:

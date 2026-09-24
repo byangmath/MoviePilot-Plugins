@@ -69,6 +69,22 @@ def test_placeholder_preview_preserves_only_usable_jellyfin_title():
     assert usable.title_is_unreliable() is False
 
 
+def test_movie_title_matches_movie_preview_without_episode_markers():
+    movie = EpisodeItem(
+        item_id="movie",
+        item_type="Movie",
+        name="挽救计划",
+        path="/library/movies/挽救计划 (2026)/挽救计划 (2026).mkv",
+    )
+
+    assert movie.media_label == "挽救计划"
+    assert movie.title_matches_path(
+        "/library/movies/挽救计划 (2026)/挽救计划 (2026) - 1080p.mkv"
+    )
+    assert movie.title_is_unreliable() is False
+    assert movie.should_preserve_jellyfin_title(movie.path) is False
+
+
 def test_equivalent_placeholder_titles_match_the_same_episode():
     episode = EpisodeItem(
         item_id="episode",
@@ -94,7 +110,7 @@ def test_summary_lists_bare_full_file_paths():
 
     assert "- /media/搞笑一家人3 S01E83.mkv" in summary
     assert "- /media/仙逆 S01E149.mp4" in summary
-    assert "处理失败剧集：" in summary
+    assert "处理失败媒体：" in summary
     assert "- /media/秘密森林 S02E16.mkv" in summary
     assert "失败详情：" in summary
     assert "- 刷新失败" in summary
@@ -183,10 +199,37 @@ def test_cleanup_waiting_details_name_omitted_old_sidecars():
     )
 
 
-def test_notification_requires_action_or_failure():
-    assert RunResult().should_notify() is False
+def test_notification_is_sent_for_every_full_run():
+    assert RunResult().should_notify() is True
     assert RunResult(actions_submitted=1).should_notify() is True
     assert RunResult(failed=1).should_notify() is True
+
+
+def test_finish_run_notifies_even_without_action_or_failure():
+    plugin = RecentEpisodeMaintenance()
+    plugin._notify = True
+    messages = []
+    plugin._post_message = lambda title, text: messages.append((title, text))
+
+    plugin._finish_run(RunResult())
+
+    assert len(messages) == 1
+    assert messages[0][0] == "最近媒体维护完成"
+
+
+def test_unhandled_run_failure_sends_failure_notification():
+    plugin = RecentEpisodeMaintenance()
+    plugin._notify = True
+    plugin._max_items = 10
+    messages = []
+    plugin._run_once = lambda: (_ for _ in ()).throw(RuntimeError("unexpected"))
+    plugin._post_message = lambda title, text: messages.append((title, text))
+
+    plugin.run_once()
+
+    assert len(messages) == 1
+    assert messages[0][0] == "最近媒体维护失败"
+    assert "运行异常：unexpected" in messages[0][1]
 
 
 def test_final_queue_counts_use_mutually_exclusive_current_states():
@@ -896,6 +939,103 @@ def test_moviepilot_compatibility_failure_stops_before_history_query(monkeypatch
     plugin._run_once()
 
     assert IncompatibleReorganizer.history_calls == 0
+
+
+def test_movie_history_uses_movie_matching_and_completes_without_refresh(
+    monkeypatch,
+):
+    movie_path = Path(
+        "/library/movies/挽救计划 (2026)/"
+        "挽救计划 (2026) - 1080p DDP 5.1 Atmos H264.mkv"
+    )
+    history = SimpleNamespace(
+        id=1,
+        type="电影",
+        title="挽救计划",
+        year="2026",
+        seasons="",
+        episodes="",
+        date="2999-08-24 00:00:00",
+        dest=str(movie_path),
+    )
+
+    class FakeReorganizer:
+        def __init__(self, logger, dry_run):
+            pass
+
+        @staticmethod
+        def compatibility_error():
+            return ""
+
+        def recent_histories(self, **_kwargs):
+            return [history]
+
+        @staticmethod
+        def processing_key(_history):
+            return "movie"
+
+        @staticmethod
+        def target_path(_history):
+            return movie_path
+
+        @staticmethod
+        def display_name(_history):
+            return "挽救计划 (2026)"
+
+        @staticmethod
+        def media_target(_history):
+            return EpisodeTarget(path=str(movie_path), media_type="movie")
+
+        @staticmethod
+        def preview(_history):
+            return OperationResult(success=True, target=movie_path)
+
+    movie = EpisodeItem(
+        item_id="movie-1",
+        item_type="Movie",
+        name="挽救计划",
+        path=str(movie_path),
+    )
+
+    class FakeClient:
+        refresh_calls = 0
+
+        @staticmethod
+        def path_key(path):
+            return JellyfinServiceClient.path_key(path)
+
+        @staticmethod
+        def libraries():
+            return []
+
+        def match_recent_media(self, targets, days, library_ids):
+            assert [target.media_type for target in targets] == ["movie"]
+            return {self.path_key(movie_path): [movie]}
+
+        def refresh_episode(self, **_kwargs):
+            type(self).refresh_calls += 1
+
+    plugin = RecentEpisodeMaintenance()
+    plugin._enable_refresh = True
+    plugin._enable_reorganize = False
+    plugin._max_items = 10
+    plugin._days = 15
+    plugin._dry_run = False
+    plugin._notify = False
+    plugin._library_ids = []
+    plugin._refresh_mode = "all"
+    plugin._replace_images = True
+    plugin._scan_after_reorganize = False
+    saved = []
+    plugin._load_processing_state = lambda: deepcopy(saved[-1]) if saved else {}
+    plugin._save_processing_state = lambda state: saved.append(deepcopy(state)) or True
+    plugin._get_jellyfin_client = FakeClient
+    monkeypatch.setattr(plugin_module, "MoviePilotReorganizer", FakeReorganizer)
+
+    plugin._run_once()
+
+    assert FakeClient.refresh_calls == 0
+    assert saved[-1]["movie"]["status"] == plugin._STATE_MONITORING
 
 
 def test_reorganized_record_is_rechecked_by_jellyfin_before_completion(
