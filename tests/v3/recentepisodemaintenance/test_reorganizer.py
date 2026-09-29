@@ -1,0 +1,859 @@
+from datetime import datetime
+from types import SimpleNamespace
+
+from recentepisodemaintenance.reorganizer import MoviePilotReorganizer
+from recentepisodemaintenance import RecentEpisodeMaintenance
+
+
+def history(
+    *,
+    history_id: int,
+    dest: str,
+    source: str,
+    date: str,
+    download_hash: str = "same-transfer",
+    media_type: str = "电视剧",
+):
+    return SimpleNamespace(
+        id=history_id,
+        date=date,
+        src=source,
+        dest=dest,
+        src_fileitem={"path": source},
+        dest_fileitem={"path": dest},
+        src_storage="local",
+        dest_storage="local",
+        mode="link",
+        status=True,
+        type=media_type,
+        title="测试剧",
+        year="2026",
+        media_source="themoviedb",
+        media_id="123",
+        seasons="S01",
+        episodes="E01",
+        download_hash=download_hash,
+    )
+
+
+def test_prefers_video_history_when_newer_record_is_subtitle():
+    reorganizer = MoviePilotReorganizer(logger=None)
+    subtitle = history(
+        history_id=2,
+        source="/source/show/episode.zh-tw.srt",
+        dest="/library/show/Season 01/测试剧 S01E01.zh-tw.srt",
+        date="2026-07-19 12:01:00",
+    )
+    video = history(
+        history_id=1,
+        source="/source/show/episode.mkv",
+        dest="/library/show/Season 01/测试剧 S01E01.mkv",
+        date="2026-07-19 12:00:59",
+    )
+
+    selected = reorganizer._select_primary_histories([subtitle, video])
+
+    assert selected == [video]
+    assert reorganizer.related_history_count(video) == 1
+
+
+def test_does_not_attach_history_from_another_download():
+    reorganizer = MoviePilotReorganizer(logger=None)
+    video = history(
+        history_id=2,
+        source="/source/show/new/episode.mkv",
+        dest="/library/show/Season 01/测试剧 S01E01.mkv",
+        date="2026-07-19 12:01:00",
+        download_hash="new-transfer",
+    )
+    old_subtitle = history(
+        history_id=1,
+        source="/source/show/old/episode.srt",
+        dest="/library/show/Season 01/测试剧 S01E01.srt",
+        date="2026-07-19 11:00:00",
+        download_hash="old-transfer",
+    )
+
+    selected = reorganizer._select_primary_histories([video, old_subtitle])
+
+    assert selected == [video]
+    assert reorganizer.related_history_count(video) == 0
+
+
+def test_preferred_tracked_video_finishes_before_newer_replacement():
+    reorganizer = MoviePilotReorganizer(logger=None)
+    older = history(
+        history_id=1,
+        source="/source/show/older.mkv",
+        dest="/library/show/Season 01/测试剧 S01E01 - 旧文件.mkv",
+        date="2026-07-20 12:00:00",
+        download_hash="older-transfer",
+    )
+    newer = history(
+        history_id=2,
+        source="/source/show/newer.mkv",
+        dest="/library/show/Season 01/测试剧 S01E01 - 新文件.mkv",
+        date="2026-07-21 12:00:00",
+        download_hash="newer-transfer",
+    )
+
+    selected = reorganizer._select_primary_histories(
+        [newer, older],
+        preferred_history_ids={1},
+    )
+
+    assert selected == [older]
+
+
+def test_ignores_episode_group_without_video_history():
+    reorganizer = MoviePilotReorganizer(logger=None)
+    subtitle = history(
+        history_id=1,
+        source="/source/show/episode.srt",
+        dest="/library/show/Season 01/测试剧 S01E01.srt",
+        date="2026-07-19 12:00:00",
+    )
+
+    assert reorganizer._select_primary_histories([subtitle]) == []
+
+
+def test_movie_history_uses_movie_type_without_season_or_episode():
+    reorganizer = MoviePilotReorganizer(logger=None)
+    movie = history(
+        history_id=1,
+        source="/source/movie/Project.Hail.Mary.2026.mkv",
+        dest="/library/movies/挽救计划 (2026)/挽救计划 (2026).mkv",
+        date="2026-08-24 00:00:00",
+        media_type="电影",
+    )
+    movie.title = "挽救计划"
+    movie.seasons = ""
+    movie.episodes = ""
+
+    assert reorganizer._select_primary_histories([movie]) == [movie]
+    assert reorganizer.media_type(movie) == "movie"
+    assert reorganizer.display_name(movie) == "挽救计划 (2026)"
+    assert reorganizer.media_target(movie).media_type == "movie"
+
+
+def test_attachment_histories_do_not_consume_video_inspection_limit():
+    plugin = RecentEpisodeMaintenance()
+    plugin._max_items = 1
+    reorganizer = MoviePilotReorganizer(logger=None)
+    candidates = []
+
+    for index in range(12):
+        subtitle = history(
+            history_id=100 + index,
+            source=f"/source/show/subtitle-{index}.srt",
+            dest=f"/library/show/Season 01/subtitle-{index}.srt",
+            date=f"2026-07-19 12:{index:02d}:00",
+        )
+        subtitle.episodes = f"E{20 + index:02d}"
+        candidates.append(subtitle)
+
+    for index in range(6):
+        video = history(
+            history_id=index + 1,
+            source=f"/source/show/episode-{index + 1}.mkv",
+            dest=f"/library/show/Season 01/episode-{index + 1}.mkv",
+            date=f"2026-07-19 11:{index:02d}:00",
+        )
+        video.episodes = f"E{index + 1:02d}"
+        candidates.append(video)
+
+    video_pool = reorganizer._select_primary_histories(candidates)
+    selected, state, _ = plugin._select_histories(
+        histories=video_pool,
+        reorganizer=reorganizer,
+    )
+
+    assert len(video_pool) == 6
+    assert len(selected) == 5
+    assert all(reorganizer._is_video_history(item) for item in selected)
+    assert {item["history_id"] for item in state.values()} == set(range(1, 7))
+
+
+def test_tracked_history_ids_keep_unfinished_records_only():
+    plugin = RecentEpisodeMaintenance()
+
+    tracked = plugin._tracked_history_ids(
+        {
+            "pending": {"status": plugin._STATE_PENDING_REFRESH, "history_id": 10},
+            "monitoring": {"status": plugin._STATE_MONITORING, "history_id": "11"},
+            "attention": {"status": plugin._STATE_ATTENTION, "history_id": 12},
+            "complete": {"status": plugin._STATE_COMPLETE, "history_id": 13},
+            "invalid": {"status": plugin._STATE_PENDING_REFRESH, "history_id": "x"},
+        }
+    )
+
+    assert tracked == {10, 11, 12}
+
+
+def test_selection_removes_queue_state_when_mp_history_is_deleted():
+    plugin = RecentEpisodeMaintenance()
+    plugin._max_items = 10
+    reorganizer = MoviePilotReorganizer(logger=None)
+    remaining = history(
+        history_id=1,
+        source="/source/show/remaining.mkv",
+        dest="/library/show/Season 01/测试剧 S01E01.mkv",
+        date="2026-07-22 12:00:00",
+        download_hash="remaining-transfer",
+    )
+    remaining_key = reorganizer.processing_key(remaining)
+    stored_state = {
+        remaining_key: {
+            "status": plugin._STATE_PENDING_REFRESH,
+            "history_id": 1,
+        },
+        "deleted-history": {
+            "status": plugin._STATE_PENDING_REFRESH,
+            "history_id": 2,
+        },
+    }
+
+    _, state, _ = plugin._select_histories(
+        histories=[remaining],
+        reorganizer=reorganizer,
+        state=stored_state,
+    )
+
+    assert set(state) == {remaining_key}
+    assert state[remaining_key]["history_id"] == 1
+
+
+def test_recent_history_query_includes_tracked_records_outside_date_window():
+    reorganizer = MoviePilotReorganizer(logger=None)
+    old_seven = history(
+        history_id=7,
+        source="/source/show/old-7.mkv",
+        dest="/library/show/Season 01/测试剧 S01E07.mkv",
+        date="2025-01-01 00:00:00",
+        download_hash="old-7",
+    )
+    old_seven.episodes = "E07"
+    old_eight = history(
+        history_id=8,
+        source="/source/show/old-8.mkv",
+        dest="/library/show/Season 01/测试剧 S01E08.mkv",
+        date="2025-01-01 00:00:01",
+        download_hash="old-8",
+    )
+    old_eight.episodes = "E08"
+    calls = []
+
+    def list_transfer_history(*, filters, page):
+        calls.append((filters, page))
+        ids = set(filters.get("ids") or ())
+        items = [item for item in (old_seven, old_eight) if item.id in ids]
+        return {
+            "items": items,
+            "page": 1,
+            "count": max(len(items), 1),
+            "total": len(items),
+        }
+
+    reorganizer._list_transfer_history = list_transfer_history
+
+    result = reorganizer.recent_histories(15, tracked_history_ids={7, 8})
+
+    assert {item.id for item in result} == {7, 8}
+    assert calls[0][0] == {
+        "status": True,
+        "media_types": ("电影", "电视剧"),
+        "require_media_identity": True,
+    }
+    assert set(calls[1][0]["ids"]) == {7, 8}
+
+
+def test_v3_processing_key_uses_media_source_and_migrates_v2_state():
+    plugin = RecentEpisodeMaintenance()
+    plugin._max_items = 10
+    reorganizer = MoviePilotReorganizer(logger=None)
+    video = history(
+        history_id=9,
+        source="/source/show/episode.mkv",
+        dest="/library/show/Season 01/测试剧 S01E01.mkv",
+        date="2026-09-29 12:00:00",
+    )
+    new_key = reorganizer.processing_key(video)
+    old_key = "123|S01|E01|same-transfer"
+
+    _, state, _ = plugin._select_histories(
+        histories=[video],
+        reorganizer=reorganizer,
+        state={
+            old_key: {
+                "status": plugin._STATE_PENDING_REFRESH,
+                "history_id": 9,
+                "refresh_attempts": 1,
+            }
+        },
+    )
+
+    assert new_key.startswith("themoviedb:123|")
+    assert old_key not in state
+    assert state[new_key]["refresh_attempts"] == 1
+
+
+def test_v3_preview_uses_public_transfer_chain_with_current_media_identity():
+    calls = []
+
+    class FileItem:
+        def __init__(self, **values):
+            self.__dict__.update(values)
+
+    class MediaType:
+        MOVIE = "movie"
+        TV = "tv"
+
+    class EpisodeFormat:
+        def __init__(self, **values):
+            self.__dict__.update(values)
+
+    class TransferChain:
+        def manual_transfer(self, *, preview=False, **kwargs):
+            calls.append({"preview": preview, **kwargs})
+            return True, {
+                "items": [
+                    {
+                        "success": True,
+                        "target": "/library/show/Season 01/测试剧 S01E01 - 新标题.mkv",
+                    }
+                ]
+            }
+
+    reorganizer = MoviePilotReorganizer(logger=None)
+    reorganizer._transfer_chain_cls = TransferChain
+    reorganizer._file_item_cls = FileItem
+    reorganizer._episode_format_cls = EpisodeFormat
+    reorganizer._media_type_cls = MediaType
+    video = history(
+        history_id=1,
+        source="/source/show/episode.mkv",
+        dest="/library/show/Season 01/测试剧 S01E01.mkv",
+        date="2026-09-29 12:00:00",
+    )
+
+    preview = reorganizer.preview(video)
+
+    assert preview.success is True
+    assert calls[0]["preview"] is True
+    assert calls[0]["media_source"] == "themoviedb"
+    assert calls[0]["media_id"] == "123"
+    assert calls[0]["mtype"] == "tv"
+    assert calls[0]["season"] == 1
+    assert calls[0]["epformat"].detail == "01"
+    assert calls[0]["fileitem"].path == video.src
+
+
+def test_v3_episode_format_restores_history_range():
+    class EpisodeFormat:
+        def __init__(self, **values):
+            self.__dict__.update(values)
+
+    reorganizer = MoviePilotReorganizer(logger=None)
+    reorganizer._episode_format_cls = EpisodeFormat
+    video = history(
+        history_id=1,
+        source="/source/show/episodes.mkv",
+        dest="/library/show/Season 01/测试剧 S01E01-E03.mkv",
+        date="2026-09-29 12:00:00",
+    )
+    video.episodes = "E01-E03"
+
+    assert reorganizer._episode_format(video).detail == "1,2,3"
+
+
+def test_verified_monitoring_uses_adaptive_intervals():
+    plugin = RecentEpisodeMaintenance()
+    state = {"episode": {}}
+    observed_hours = []
+
+    for _ in range(4):
+        before = datetime.now()
+        plugin._mark_processing_verified(state, {"episode"})
+        due = datetime.fromisoformat(state["episode"]["next_preview_at"])
+        observed_hours.append(round((due - before).total_seconds() / 3600))
+
+    assert observed_hours == [24, 48, 72, 72]
+    assert state["episode"]["monitoring_checks"] == 4
+
+
+def test_expired_healthy_record_completes_only_after_it_is_checked():
+    plugin = RecentEpisodeMaintenance()
+    plugin._days = 15
+    state = {
+        "episode": {
+            "status": plugin._STATE_MONITORING,
+            "history_id": 1,
+            "history_date": "2026-01-01 00:00:00",
+            "monitoring_checks": 3,
+        }
+    }
+
+    assert plugin._tracked_history_ids(state) == {1}
+
+    plugin._mark_processing_verified(state, {"episode"})
+
+    assert state["episode"]["status"] == plugin._STATE_COMPLETE
+    assert "monitoring_checks" not in state["episode"]
+    assert plugin._tracked_history_ids(state) == set()
+
+
+def test_refresh_cooldown_defers_record_without_dropping_it():
+    plugin = RecentEpisodeMaintenance()
+    plugin._max_items = 10
+    reorganizer = MoviePilotReorganizer(logger=None)
+    video = history(
+        history_id=1,
+        source="/source/show/episode.mkv",
+        dest="/library/show/Season 01/测试剧 S01E01.mkv",
+        date="2026-07-01 12:00:00",
+    )
+    key = reorganizer.processing_key(video)
+    stored_state = {
+        key: {
+            "status": plugin._STATE_PENDING_REFRESH,
+            "history_id": 1,
+            "refresh_check_after": "2999-01-01T00:00:00",
+        }
+    }
+
+    selected, state, selection = plugin._select_histories(
+        histories=[video],
+        reorganizer=reorganizer,
+        state=stored_state,
+    )
+
+    assert selected == []
+    assert selection["refresh_waiting"] == 1
+    assert selection["refresh_waiting_items"] == [
+        f"测试剧 S01E01｜文件：{reorganizer.target_path(video)}"
+    ]
+    assert state[key]["history_id"] == 1
+
+
+def test_due_cleanup_and_refresh_wait_are_selected_independently():
+    plugin = RecentEpisodeMaintenance()
+    plugin._max_items = 10
+    plugin._cleanup_old_sidecars = True
+    reorganizer = MoviePilotReorganizer(logger=None)
+    cleanup_due = history(
+        history_id=1,
+        source="/source/show/cleanup-due.mkv",
+        dest="/library/show/Season 01/测试剧 S01E01.mkv",
+        date="2026-07-01 12:00:00",
+        download_hash="cleanup-due",
+    )
+    refresh_due = history(
+        history_id=2,
+        source="/source/show/refresh-due.mkv",
+        dest="/library/show/Season 01/测试剧 S01E02.mkv",
+        date="2026-07-01 12:01:00",
+        download_hash="refresh-due",
+    )
+    refresh_due.episodes = "E02"
+    stored_state = {
+        reorganizer.processing_key(cleanup_due): {
+            "status": plugin._STATE_PENDING_REFRESH,
+            "refresh_check_after": "2999-01-01T00:00:00",
+            "cleanup_pending": True,
+            "cleanup_check_after": "2000-01-01T00:00:00",
+            "cleanup_passes": 1,
+        },
+        reorganizer.processing_key(refresh_due): {
+            "status": plugin._STATE_PENDING_REFRESH,
+            "refresh_check_after": "2000-01-01T00:00:00",
+            "cleanup_pending": True,
+            "cleanup_check_after": "2999-01-01T00:00:00",
+            "cleanup_passes": 1,
+        },
+    }
+
+    selected, _, selection = plugin._select_histories(
+        histories=[cleanup_due, refresh_due],
+        reorganizer=reorganizer,
+        state=stored_state,
+    )
+
+    assert selected == [cleanup_due, refresh_due]
+    assert selection["refresh_waiting"] == 1
+    assert selection["cleanup_waiting"] == 1
+
+
+def test_due_monitoring_records_are_not_starved_by_new_records():
+    plugin = RecentEpisodeMaintenance()
+    plugin._max_items = 1
+    reorganizer = MoviePilotReorganizer(logger=None)
+    due_items = []
+    stored_state = {}
+    for index in range(8):
+        item = history(
+            history_id=100 + index,
+            source=f"/source/show/due-{index}.mkv",
+            dest=f"/library/show/Season 01/测试剧 S01E{index + 1:02d}.mkv",
+            date=f"2026-07-20 12:0{index}:00",
+            download_hash=f"due-{index}",
+        )
+        item.episodes = f"E{index + 1:02d}"
+        due_items.append(item)
+        stored_state[reorganizer.processing_key(item)] = {
+            "status": plugin._STATE_MONITORING,
+            "history_id": item.id,
+            "next_preview_at": "2000-01-01T00:00:00",
+        }
+    new_items = []
+    for index in range(10):
+        item = history(
+            history_id=index + 1,
+            source=f"/source/show/new-{index}.mkv",
+            dest=f"/library/show/Season 01/测试剧 S02E{index + 1:02d}.mkv",
+            date=f"2026-07-22 12:{index:02d}:00",
+            download_hash=f"new-{index}",
+        )
+        item.seasons = "S02"
+        item.episodes = f"E{index + 1:02d}"
+        new_items.append(item)
+
+    selected, _, selection = plugin._select_histories(
+        histories=new_items + due_items,
+        reorganizer=reorganizer,
+        state=stored_state,
+    )
+
+    assert any(item in selected for item in due_items)
+    assert any(item in selected for item in new_items)
+    assert selection["monitoring"] > 0
+    assert selection["monitoring_queued"] > 0
+    assert selection["new_queued"] > 0
+
+
+def test_pending_library_scan_has_priority_over_regular_pending_records():
+    plugin = RecentEpisodeMaintenance()
+    plugin._max_items = 1
+    reorganizer = MoviePilotReorganizer(logger=None)
+    histories = []
+    stored_state = {}
+    for index in range(6):
+        item = history(
+            history_id=index + 1,
+            source=f"/source/show/pending-{index}.mkv",
+            dest=f"/library/show/Season 01/测试剧 S01E{index + 1:02d}.mkv",
+            date=f"2026-07-24 12:0{index}:00",
+            download_hash=f"pending-{index}",
+        )
+        item.episodes = f"E{index + 1:02d}"
+        histories.append(item)
+        stored_state[reorganizer.processing_key(item)] = {
+            "status": plugin._STATE_PENDING_REORGANIZE,
+            "history_id": item.id,
+            "updated_at": f"2026-07-24T12:0{index}:00",
+            "scan_pending": index == 5,
+        }
+
+    selected, _, selection = plugin._select_histories(
+        histories=histories,
+        reorganizer=reorganizer,
+        state=stored_state,
+    )
+
+    assert histories[-1] in selected
+    assert selection["scan_waiting"] == 1
+    assert selection["pending_queued"] == 1
+
+
+def test_selection_counts_due_and_waiting_monitoring_records():
+    plugin = RecentEpisodeMaintenance()
+    plugin._max_items = 10
+    reorganizer = MoviePilotReorganizer(logger=None)
+    due = history(
+        history_id=1,
+        source="/source/show/due.mkv",
+        dest="/library/show/Season 01/测试剧 S01E01.mkv",
+        date="2026-07-19 12:00:00",
+        download_hash="due-transfer",
+    )
+    waiting = history(
+        history_id=2,
+        source="/source/show/waiting.mkv",
+        dest="/library/show/Season 01/测试剧 S01E02.mkv",
+        date="2026-07-19 12:01:00",
+        download_hash="waiting-transfer",
+    )
+    waiting.episodes = "E02"
+    plugin._load_processing_state = lambda: {
+        reorganizer.processing_key(due): {
+            "status": plugin._STATE_MONITORING,
+            "next_preview_at": "2000-01-01T00:00:00",
+        },
+        reorganizer.processing_key(waiting): {
+            "status": plugin._STATE_MONITORING,
+            "next_preview_at": "2999-01-01T00:00:00",
+        },
+    }
+
+    selected, _, selection = plugin._select_histories(
+        histories=[due, waiting],
+        reorganizer=reorganizer,
+    )
+
+    assert selected == [due]
+    assert selection["monitoring"] == 1
+    assert selection["monitoring_waiting"] == 1
+
+def test_selection_lists_attention_records_with_reason_and_path():
+    plugin = RecentEpisodeMaintenance()
+    plugin._max_items = 10
+    reorganizer = MoviePilotReorganizer(logger=None)
+    video = history(
+        history_id=1,
+        source="/source/show/episode.mkv",
+        dest="/library/show/Season 01/测试剧 S01E01.mkv",
+        date="2026-07-19 12:00:00",
+    )
+    key = reorganizer.processing_key(video)
+    plugin._load_processing_state = lambda: {
+        key: {
+            "status": plugin._STATE_ATTENTION,
+            "expected_path": "/library/show/Season 01/测试剧 S01E01.mkv",
+            "sidecar_pending": True,
+        }
+    }
+
+    selected, _, selection = plugin._select_histories(
+        histories=[video],
+        reorganizer=reorganizer,
+    )
+
+    assert selected == []
+    assert selection["attention"] == 1
+    assert selection["attention_items"] == [
+        "测试剧 S01E01：刮削附件多次补齐失败｜"
+        "文件：/library/show/Season 01/测试剧 S01E01.mkv"
+    ]
+
+
+def test_selection_describes_refresh_attention_records():
+    plugin = RecentEpisodeMaintenance()
+    plugin._max_items = 10
+    reorganizer = MoviePilotReorganizer(logger=None)
+    video = history(
+        history_id=1,
+        source="/source/show/episode.mkv",
+        dest="/library/show/Season 01/测试剧 S01E01.mkv",
+        date="2026-07-19 12:00:00",
+    )
+    key = reorganizer.processing_key(video)
+    plugin._load_processing_state = lambda: {
+        key: {
+            "status": plugin._STATE_ATTENTION,
+            "attention_stage": "refresh",
+            "refresh_attempts": 3,
+            "expected_path": "/library/show/Season 01/测试剧 S01E01.mkv",
+        }
+    }
+
+    selected, _, selection = plugin._select_histories(
+        histories=[video],
+        reorganizer=reorganizer,
+    )
+
+    assert selected == []
+    assert selection["attention_items"] == [
+        "测试剧 S01E01：连续刷新后标题仍不一致｜"
+        "文件：/library/show/Season 01/测试剧 S01E01.mkv"
+    ]
+
+def test_selection_defers_pending_sidecars_until_recheck_time():
+    plugin = RecentEpisodeMaintenance()
+    plugin._max_items = 10
+    reorganizer = MoviePilotReorganizer(logger=None)
+    due = history(
+        history_id=1,
+        source="/source/show/due.mkv",
+        dest="/library/show/Season 01/测试剧 S01E01.mkv",
+        date="2026-07-19 12:00:00",
+        download_hash="due-sidecar",
+    )
+    waiting = history(
+        history_id=2,
+        source="/source/show/waiting.mkv",
+        dest="/library/show/Season 01/测试剧 S01E02.mkv",
+        date="2026-07-19 12:01:00",
+        download_hash="waiting-sidecar",
+    )
+    waiting.episodes = "E02"
+    plugin._load_processing_state = lambda: {
+        reorganizer.processing_key(due): {
+            "status": plugin._STATE_PENDING_REORGANIZE,
+            "sidecar_pending": True,
+            "sidecar_check_after": "2000-01-01T00:00:00",
+        },
+        reorganizer.processing_key(waiting): {
+            "status": plugin._STATE_PENDING_REORGANIZE,
+            "sidecar_pending": True,
+            "sidecar_check_after": "2999-01-01T00:00:00",
+            "expected_path": "/library/show/Season 01/测试剧 S01E02 - 新标题.mkv",
+        },
+    }
+
+    selected, _, selection = plugin._select_histories(
+        histories=[due, waiting],
+        reorganizer=reorganizer,
+    )
+
+    assert selected == [due]
+    assert selection["pending"] == 1
+    assert selection["sidecar_waiting"] == 1
+    assert selection["sidecar_waiting_items"] == [
+        "测试剧 S01E02｜文件：/library/show/Season 01/测试剧 S01E02 - 新标题.mkv"
+    ]
+
+
+def test_clearing_sidecar_pending_also_clears_recheck_time():
+    plugin = RecentEpisodeMaintenance()
+    state = {
+        "episode": {
+            "status": plugin._STATE_PENDING_REORGANIZE,
+            "sidecar_pending": True,
+            "sidecar_attempts": 1,
+            "sidecar_check_after": "2999-01-01T00:00:00",
+        }
+    }
+
+    plugin._mark_processing_state(
+        state,
+        {"episode"},
+        plugin._STATE_PENDING_REORGANIZE,
+        sidecar_pending=False,
+    )
+
+    assert state["episode"]["sidecar_pending"] is False
+    assert "sidecar_check_after" not in state["episode"]
+
+def test_selection_migrates_pending_sidecars_without_recheck_time():
+    plugin = RecentEpisodeMaintenance()
+    plugin._max_items = 10
+    reorganizer = MoviePilotReorganizer(logger=None)
+    video = history(
+        history_id=1,
+        source="/source/show/episode.mkv",
+        dest="/library/show/Season 01/测试剧 S01E01.mkv",
+        date="2026-07-19 12:00:00",
+    )
+    key = reorganizer.processing_key(video)
+    plugin._load_processing_state = lambda: {
+        key: {
+            "status": plugin._STATE_PENDING_REORGANIZE,
+            "sidecar_pending": True,
+            "sidecar_attempts": 1,
+        }
+    }
+
+    selected, state, selection = plugin._select_histories(
+        histories=[video],
+        reorganizer=reorganizer,
+    )
+
+    assert selected == []
+    assert selection["sidecar_waiting"] == 1
+    assert state[key]["sidecar_check_after"]
+
+def test_selection_defers_old_sidecar_cleanup_until_due():
+    plugin = RecentEpisodeMaintenance()
+    plugin._max_items = 10
+    plugin._cleanup_old_sidecars = True
+    reorganizer = MoviePilotReorganizer(logger=None)
+    due = history(
+        history_id=1,
+        source="/source/show/due.mkv",
+        dest="/library/show/Season 01/测试剧 S01E01.mkv",
+        date="2026-07-19 12:00:00",
+        download_hash="due-cleanup",
+    )
+    waiting = history(
+        history_id=2,
+        source="/source/show/waiting.mkv",
+        dest="/library/show/Season 01/测试剧 S01E02.mkv",
+        date="2026-07-19 12:01:00",
+        download_hash="waiting-cleanup",
+    )
+    waiting.episodes = "E02"
+    plugin._load_processing_state = lambda: {
+        reorganizer.processing_key(due): {
+            "status": plugin._STATE_PENDING_REORGANIZE,
+            "cleanup_pending": True,
+            "cleanup_check_after": "2000-01-01T00:00:00",
+        },
+        reorganizer.processing_key(waiting): {
+            "status": plugin._STATE_PENDING_REORGANIZE,
+            "cleanup_pending": True,
+            "cleanup_check_after": "2999-01-01T00:00:00",
+            "cleanup_old_media_path": "/library/show/Season 01/测试剧 S01E02 - 旧标题.mkv",
+            "old_sidecars": [
+                "/library/show/Season 01/测试剧 S01E02 - 旧标题.nfo",
+                "/library/show/Season 01/测试剧 S01E02 - 旧标题.jpg",
+            ],
+        },
+    }
+
+    selected, _, selection = plugin._select_histories(
+        histories=[due, waiting],
+        reorganizer=reorganizer,
+    )
+
+    assert selected == [due]
+    assert selection["pending"] == 1
+    assert selection["cleanup_waiting"] == 1
+    assert selection["cleanup_waiting_items"] == [
+        "测试剧 S01E02｜旧文件：/library/show/Season 01/测试剧 S01E02 - 旧标题.mkv｜"
+        "旧附件（2 个）：/library/show/Season 01/测试剧 S01E02 - 旧标题.nfo；"
+        "/library/show/Season 01/测试剧 S01E02 - 旧标题.jpg"
+    ]
+
+
+def test_verified_record_remains_pending_until_old_sidecar_cleanup():
+    plugin = RecentEpisodeMaintenance()
+    state = {
+        "episode": {
+            "status": plugin._STATE_PENDING_REORGANIZE,
+            "had_action": True,
+            "cleanup_pending": True,
+            "old_sidecars": ["/library/show/old.nfo"],
+        }
+    }
+
+    plugin._mark_processing_verified(state, {"episode"})
+
+    assert state["episode"]["status"] == plugin._STATE_PENDING_REORGANIZE
+    assert state["episode"]["cleanup_pending"] is True
+    assert state["episode"]["old_sidecars"] == ["/library/show/old.nfo"]
+
+
+def test_clearing_cleanup_pending_removes_cleanup_state():
+    plugin = RecentEpisodeMaintenance()
+    state = {
+        "episode": {
+            "status": plugin._STATE_PENDING_REORGANIZE,
+            "cleanup_pending": True,
+            "old_sidecars": ["/library/show/old.nfo"],
+            "cleanup_old_media_path": "/library/show/old.mkv",
+            "cleanup_check_after": "2999-01-01T00:00:00",
+            "cleanup_passes": 1,
+        }
+    }
+
+    plugin._mark_processing_state(
+        state,
+        {"episode"},
+        plugin._STATE_PENDING_REORGANIZE,
+        cleanup_pending=False,
+    )
+
+    assert "cleanup_pending" not in state["episode"]
+    assert "old_sidecars" not in state["episode"]
+    assert "cleanup_old_media_path" not in state["episode"]
+    assert "cleanup_check_after" not in state["episode"]
+    assert "cleanup_passes" not in state["episode"]

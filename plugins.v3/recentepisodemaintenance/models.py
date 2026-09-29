@@ -1,0 +1,340 @@
+from dataclasses import dataclass, field
+from pathlib import Path
+import re
+from typing import Any, Optional
+import unicodedata
+
+
+_EPISODE_MARKER = re.compile(r"s\d{1,3}e\d{1,4}(?:[\s._-]*e\d{1,4})?", re.IGNORECASE)
+_PLACEHOLDER_EPISODE_TITLE = re.compile(
+    r"(?:"
+    r"第\s*(?:\d+|[零〇一二三四五六七八九十百千两]+)\s*[集话]"
+    r"|(?:episode|ep)\s*\.?\s*\d+"
+    r"|e\s*\d+"
+    r")\s*$",
+    re.IGNORECASE,
+)
+_PLACEHOLDER_EPISODE_NUMBER = re.compile(
+    r"(?:"
+    r"第\s*(?P<chinese>\d+|[零〇一二三四五六七八九十百千两]+)\s*[集话]"
+    r"|(?:episode|ep)\s*\.?\s*(?P<latin>\d+)"
+    r"|e\s*(?P<short>\d+)"
+    r")\s*$",
+    re.IGNORECASE,
+)
+_UNRELIABLE_TITLE_KEYS = {
+    "unknown",
+    "unknowntitle",
+    "untitled",
+    "notitle",
+    "未知",
+    "未知标题",
+    "未命名",
+    "暂无标题",
+    "无标题",
+}
+
+
+def _title_key(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value or "").casefold()
+    return "".join(character for character in normalized if character.isalnum())
+
+
+def _chinese_number(value: str) -> int | None:
+    if value.isdigit():
+        return int(value)
+
+    digits = {
+        "零": 0,
+        "〇": 0,
+        "一": 1,
+        "二": 2,
+        "两": 2,
+        "三": 3,
+        "四": 4,
+        "五": 5,
+        "六": 6,
+        "七": 7,
+        "八": 8,
+        "九": 9,
+    }
+    units = {"十": 10, "百": 100, "千": 1000}
+    if not value or any(character not in digits | units for character in value):
+        return None
+    if not any(character in units for character in value):
+        return int("".join(str(digits[character]) for character in value))
+
+    total = 0
+    current = 0
+    for character in value:
+        if character in digits:
+            current = digits[character]
+        else:
+            total += (current or 1) * units[character]
+            current = 0
+    return total + current
+
+
+def _placeholder_episode_number(value: str) -> int | None:
+    match = _PLACEHOLDER_EPISODE_NUMBER.search(str(value or "").strip())
+    if not match:
+        return None
+    number = match.group("latin") or match.group("short")
+    if number:
+        return int(number)
+    return _chinese_number(match.group("chinese") or "")
+
+
+@dataclass
+class EpisodeItem:
+    item_id: str
+    name: str = ""
+    series_name: str = ""
+    season_number: Optional[int] = None
+    episode_number: Optional[int] = None
+    date_created: str = ""
+    path: str = ""
+    provider_ids: dict[str, Any] = field(default_factory=dict)
+    item_type: str = "Episode"
+
+    @classmethod
+    def from_jellyfin(cls, item: dict[str, Any]) -> "EpisodeItem":
+        return cls(
+            item_id=str(item.get("Id") or ""),
+            name=item.get("Name") or "",
+            series_name=item.get("SeriesName") or "",
+            season_number=item.get("ParentIndexNumber"),
+            episode_number=item.get("IndexNumber"),
+            date_created=item.get("DateCreated") or "",
+            path=item.get("Path") or "",
+            provider_ids=item.get("ProviderIds") or {},
+            item_type=item.get("Type") or "Episode",
+        )
+
+    @property
+    def is_episode(self) -> bool:
+        return str(self.item_type or "Episode").casefold() == "episode"
+
+    @property
+    def is_movie(self) -> bool:
+        return str(self.item_type or "").casefold() == "movie"
+
+    @property
+    def media_label(self) -> str:
+        if self.is_movie:
+            return self.name or "未知电影"
+        return self.episode_label
+
+    @property
+    def episode_label(self) -> str:
+        season = f"S{int(self.season_number):02d}" if self.season_number is not None else "S??"
+        episode = f"E{int(self.episode_number):02d}" if self.episode_number is not None else "E??"
+        series = self.series_name or "未知剧集"
+        return f"{series} {season}{episode}"
+
+    @property
+    def display_name(self) -> str:
+        title = self.name or "未知标题"
+        media_file = Path(self.path).name if self.path else "未知文件"
+        return f"{self.episode_label}｜Jellyfin 标题：{title}｜文件：{media_file}"
+
+    def title_matches_filename(self) -> bool:
+        """Check whether Jellyfin's episode title is the title stored in the media filename."""
+        return self.title_matches_path(self.path)
+
+    def title_matches_path(self, path: str | Path | None) -> bool:
+        """Check whether Jellyfin's title occurs in the expected media path."""
+        title_key = _title_key(self.name)
+        if not title_key or not path:
+            return False
+
+        if self.is_movie:
+            media_path = Path(path)
+            return any(
+                title_key in candidate_key
+                for candidate_key in (
+                    _title_key(media_path.stem),
+                    _title_key(media_path.parent.name),
+                )
+                if candidate_key
+            )
+
+        filename_stem = Path(path).stem
+        marker = _EPISODE_MARKER.search(filename_stem)
+        if not marker:
+            return False
+
+        filename_title_key = _title_key(filename_stem[marker.end():])
+        return bool(filename_title_key) and filename_title_key.endswith(title_key)
+
+    @staticmethod
+    def title_is_placeholder(value: str | None) -> bool:
+        title = str(value or "").strip()
+        return not title or bool(_PLACEHOLDER_EPISODE_TITLE.fullmatch(title))
+
+    def title_is_unreliable(self) -> bool:
+        title = str(self.name or "").strip()
+        title_key = _title_key(title)
+        if (
+            not title_key
+            or title_key in _UNRELIABLE_TITLE_KEYS
+            or any(marker in title for marker in ("�", "锟斤拷"))
+        ):
+            return True
+        if self.is_movie:
+            return False
+        if _PLACEHOLDER_EPISODE_TITLE.search(title) or _EPISODE_MARKER.search(title):
+            return True
+        if self.series_name and title_key == _title_key(self.series_name):
+            return True
+        if self.path and title_key == _title_key(Path(self.path).stem):
+            return True
+        return False
+
+    @staticmethod
+    def path_title_is_placeholder(path: str | Path | None) -> bool:
+        if not path:
+            return False
+        filename_stem = Path(path).stem
+        marker = _EPISODE_MARKER.search(filename_stem)
+        if not marker:
+            return False
+        trailing_title = filename_stem[marker.end():].strip(" ._-")
+        return bool(_PLACEHOLDER_EPISODE_TITLE.search(trailing_title))
+
+    def placeholder_title_matches_path(self, path: str | Path | None) -> bool:
+        """Check whether Jellyfin and MP use equivalent placeholders for this episode."""
+        if not self.title_is_placeholder(self.name) or not self.path_title_is_placeholder(path):
+            return False
+
+        jellyfin_number = _placeholder_episode_number(self.name)
+        expected_number = _placeholder_episode_number(Path(path).stem if path else "")
+        if jellyfin_number is None or expected_number is None:
+            return False
+        if (
+            self.episode_number is not None
+            and jellyfin_number != int(self.episode_number)
+        ):
+            return False
+        return jellyfin_number == expected_number
+
+    def should_preserve_jellyfin_title(
+        self,
+        expected_path: str | Path | None,
+    ) -> bool:
+        return (
+            self.is_episode
+            and self.path_title_is_placeholder(expected_path)
+            and not self.title_is_unreliable()
+        )
+
+
+@dataclass(frozen=True)
+class EpisodeTarget:
+    path: str
+    media_type: str = "tv"
+
+
+@dataclass
+class OperationResult:
+    success: bool = False
+    skipped: bool = False
+    message: str = ""
+    source: Optional[Path] = None
+    target: Optional[Path] = None
+
+
+@dataclass
+class RunResult:
+    operation_limit: int = 0
+    operations_used: int = 0
+    actions_submitted: int = 0
+    reorganize_candidates: int = 0
+    refresh_candidates: int = 0
+    previewed: int = 0
+    refresh_previewed: int = 0
+    reorganized: int = 0
+    refreshed: int = 0
+    skipped: int = 0
+    failed: int = 0
+    errors: list[str] = field(default_factory=list)
+    refreshed_titles: list[str] = field(default_factory=list)
+    reorganized_titles: list[str] = field(default_factory=list)
+    failed_titles: list[str] = field(default_factory=list)
+    queue_counts: dict[str, int] = field(default_factory=dict)
+    _skipped_keys: set[str] = field(default_factory=set, repr=False)
+
+    def add_error(self, message: str, file_path: str | Path | None = None) -> None:
+        self.failed += 1
+        self.errors.append(message)
+        normalized_path = str(file_path or "").strip()
+        if normalized_path and normalized_path not in self.failed_titles:
+            self.failed_titles.append(normalized_path)
+
+    def add_refreshed_title(self, title: str) -> None:
+        if title and title not in self.refreshed_titles:
+            self.refreshed_titles.append(title)
+
+    def add_reorganized_title(self, title: str) -> None:
+        if title and title not in self.reorganized_titles:
+            self.reorganized_titles.append(title)
+
+    def add_skipped(self, *keys: str) -> None:
+        values = keys or (f"unknown:{len(self._skipped_keys)}",)
+        for key in values:
+            normalized = str(key or "").strip()
+            if not normalized:
+                normalized = f"unknown:{len(self._skipped_keys)}"
+            if normalized in self._skipped_keys:
+                continue
+            self._skipped_keys.add(normalized)
+            self.skipped += 1
+
+    def summary(self) -> str:
+        lines = [f"本轮检查：MP 视频整理记录 {self.reorganize_candidates} 条"]
+        if self.queue_counts:
+            lines[0] += (
+                "；队列："
+                f"本轮待复查 {self.queue_counts.get('pending', 0)} 条，"
+                f"新记录 {self.queue_counts.get('new', 0)} 条，"
+                f"到期复查 {self.queue_counts.get('monitoring', 0)} 条"
+            )
+            lines.append(
+                "当前状态："
+                f"待后续检查 "
+                f"{self.queue_counts.get('pending_queued', 0) + self.queue_counts.get('new_queued', 0) + self.queue_counts.get('monitoring_queued', 0)} 条，"
+                f"等待扫描 {self.queue_counts.get('scan_waiting', 0)} 条，"
+                f"等待刷新确认 {self.queue_counts.get('refresh_waiting', 0)} 条，"
+                f"等待复查 {self.queue_counts.get('monitoring_waiting', 0)} 条，"
+                f"等待附件 {self.queue_counts.get('sidecar_waiting', 0)} 条，"
+                f"等待清理 {self.queue_counts.get('cleanup_waiting', 0)} 条，"
+                f"当前范围内已完成 {self.queue_counts.get('complete', 0)} 条，"
+                f"需人工检查 {self.queue_counts.get('attention', 0)} 条"
+            )
+        lines.extend(
+            [
+                f"操作统计：刷新和重新整理 {self.operations_used}/{self.operation_limit} 次；"
+                f"重新整理试运行预览 {self.previewed} 条，成功 {self.reorganized} 项；"
+                f"元数据刷新试运行预览 {self.refresh_previewed} 项，成功 {self.refreshed} 项",
+                f"匹配结果：匹配到 Jellyfin 媒体 {self.refresh_candidates} 项，"
+                f"跳过 {self.skipped} 项，失败 {self.failed} 项",
+            ]
+        )
+        if self.refreshed_titles:
+            lines.append("元数据刷新成功媒体：")
+            lines.extend(f"- {title}" for title in self.refreshed_titles)
+        if self.reorganized_titles:
+            lines.append("重新整理成功媒体：")
+            lines.extend(f"- {title}" for title in self.reorganized_titles)
+        if self.failed_titles:
+            lines.append("处理失败媒体：")
+            lines.extend(f"- {title}" for title in self.failed_titles)
+        if self.errors:
+            lines.append("失败详情：")
+            lines.extend(f"- {item}" for item in self.errors[:10])
+            if len(self.errors) > 10:
+                lines.append(f"- 其余 {len(self.errors) - 10} 条错误已省略，请查看日志")
+        return "\n".join(lines)
+
+    def should_notify(self) -> bool:
+        return True

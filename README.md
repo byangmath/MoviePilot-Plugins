@@ -10,7 +10,7 @@ MoviePilot 环境变量 `PLUGIN_MARKET` 添加本项目地址，多个插件市�
 https://github.com/byangmath/MoviePilot-Plugins
 ```
 
-MoviePilot V2 也可以在插件页面右上角的插件市场设置中添加上述地址。
+也可以在 MoviePilot 插件页面右上角的插件市场设置中添加上述地址。
 
 添加后刷新插件市场，安装“最近媒体维护”。插件市场仓库地址需使用 GitHub 仓库 `main` 分支。
 
@@ -33,7 +33,7 @@ MoviePilot V2 也可以在插件页面右上角的插件市场设置中添加上
 
 配置项：执行周期，最近 N 天，媒体服务器，维护媒体库，刷新模式，是否替换现有图片，重新处理需人工检查记录，试运行模式，单次最大处理数量。
 
-详细配置说明和推荐测试步骤见：[最近媒体维护插件说明](plugins.v2/recentepisodemaintenance/README.md)
+详细配置说明和推荐测试步骤见：[最近媒体维护插件说明](plugins.v3/recentepisodemaintenance/README.md)
 
 ## 使用建议
 

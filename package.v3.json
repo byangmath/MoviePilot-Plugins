@@ -1,0 +1,15 @@
+{
+  "RecentEpisodeMaintenance": {
+    "name": "最近媒体维护",
+    "description": "刷新元数据并重命名 MoviePilot 最近整理入库的 Jellyfin 电影和剧集。",
+    "labels": "Jellyfin,媒体库,电影,剧集",
+    "version": "1.0.0",
+    "icon": "https://raw.githubusercontent.com/byangmath/MoviePilot-Plugins/main/icons/recentepisodemaintenance.png",
+    "author": "byangmath",
+    "level": 1,
+    "system_version": ">=3.0.0",
+    "history": {
+      "v1.0.0": "迁移到 MoviePilot V3，使用公开整理历史查询、V3 媒体身份和整理链接口，并兼容迁移原有处理队列。"
+    }
+  }
+}
