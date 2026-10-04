@@ -3,12 +3,13 @@
     "name": "最近媒体维护",
     "description": "刷新元数据并重命名 MoviePilot 最近整理入库的 Jellyfin 电影和剧集。",
     "labels": "Jellyfin,媒体库,电影,剧集",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "icon": "https://raw.githubusercontent.com/byangmath/MoviePilot-Plugins/main/icons/recentepisodemaintenance.png",
     "author": "byangmath",
     "level": 1,
     "system_version": ">=3.0.0",
     "history": {
+      "v1.0.1": "更新至 v1.0.1：修复 V3 重新整理被成功历史记录跳过的问题，校验视频执行回执；手动重试立即处理；运行总结列出全部人工检查记录，并区分新视频未生成与刮削附件缺失。",
       "v1.0.0": "迁移到 MoviePilot V3，使用公开整理历史查询、V3 媒体身份和整理链接口，并兼容迁移原有处理队列。"
     }
   }

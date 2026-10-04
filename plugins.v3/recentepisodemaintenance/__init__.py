@@ -107,7 +107,7 @@ class RecentEpisodeMaintenance(_PluginBase):
     plugin_name = "最近媒体维护"
     plugin_desc = "维护 MoviePilot 最近整理入库的 Jellyfin 电影和剧集"
     plugin_icon = "https://raw.githubusercontent.com/byangmath/MoviePilot-Plugins/main/icons/recentepisodemaintenance.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_author = "byangmath"
     author_url = "https://github.com/byangmath"
     plugin_config_prefix = "recentepisodemaintenance_"
@@ -453,6 +453,13 @@ class RecentEpisodeMaintenance(_PluginBase):
                 state=stored_state,
             )
             result.reorganize_candidates = len(histories)
+            result.history_details = {
+                reorganizer.processing_key(history): (
+                    reorganizer.display_name(history),
+                    str(reorganizer.target_path(history) or "未知文件"),
+                )
+                for history in history_pool
+            }
             result.queue_counts = {
                 key: int(selection.get(key) or 0)
                 for key in (
@@ -1756,6 +1763,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                             reorganized_sidecars.append({
                                 "key": processing_key,
                                 "label": label,
+                                "old_target": current_file,
                                 "target": Path(target) if target else None,
                                 "attempts": next_sidecar_attempts,
                             })
@@ -1815,7 +1823,8 @@ class RecentEpisodeMaintenance(_PluginBase):
                             self._mark_processing_state(
                                 processing_state,
                                 {processing_key},
-                                self._STATE_PENDING_REORGANIZE,
+                                self._STATE_ATTENTION if operation.requires_review else self._STATE_PENDING_REORGANIZE,
+                                attention_stage="transfer" if operation.requires_review else None,
                             )
                             self._clear_operation_intent(
                                 processing_state,
@@ -1904,6 +1913,12 @@ class RecentEpisodeMaintenance(_PluginBase):
                     continue
 
                 missing_text = "、".join(missing)
+                missing_video = "目标文件" in missing
+                failure_detail = (
+                    "重新整理后未找到预期新视频文件；"
+                    + self._file_change_details(item.get("old_target"), target)
+                    if missing_video else f"重新整理后仍缺少{missing_text}"
+                )
                 exhausted = attempts >= self._MAX_SIDECAR_ATTEMPTS
                 status = self._STATE_ATTENTION if exhausted else self._STATE_PENDING_REORGANIZE
                 self._mark_processing_state(
@@ -1915,22 +1930,22 @@ class RecentEpisodeMaintenance(_PluginBase):
                     sidecar_check_after=(
                         None if exhausted else self._sidecar_recheck_at()
                     ),
-                    attention_stage="sidecar" if exhausted else None,
+                    attention_stage=("transfer" if missing_video else "sidecar") if exhausted else None,
                 )
                 if exhausted:
                     message = (
-                        f"{label}：重新整理后仍缺少{missing_text}，已连续尝试 {attempts} 次，"
-                        "请检查 MoviePilot 刮削日志"
+                        f"{label}：{failure_detail}，已连续尝试 {attempts} 次，"
+                        + ("请检查 MoviePilot 整理日志" if missing_video else "请检查 MoviePilot 刮削日志")
                     )
                     result.add_error(message, target)
                     logger.error(
-                        f"[最近媒体维护] 停止刮削 {label}：重新整理后缺少{missing_text}，"
+                        f"[最近媒体维护] 停止重试 {label}：{failure_detail}，"
                         f"已尝试 {attempts}/{self._MAX_SIDECAR_ATTEMPTS} 次｜"
                         f"文件：{Path(target).name if target else '未知文件'}"
                     )
                 else:
                     logger.warning(
-                        f"[最近媒体维护] 等待附件 {label}：重新整理后仍缺少{missing_text}，"
+                        f"[最近媒体维护] 等待整理结果 {label}：{failure_detail}，"
                         f"最早在 {self._SIDECAR_RECHECK_MINUTES} 分钟后的下一轮复查｜"
                         f"文件：{Path(target).name if target else '未知文件'}"
                     )
@@ -2517,22 +2532,12 @@ class RecentEpisodeMaintenance(_PluginBase):
             state_item = state.get(key) or {}
             if state_item.get("status") != self._STATE_ATTENTION:
                 continue
-            attention_stage = self._attention_stage(state_item)
-            if attention_stage == "cleanup":
-                reason = "旧名称附件清理失败"
-            elif attention_stage == "sidecar":
-                reason = "刮削附件多次补齐失败"
-            elif attention_stage == "refresh":
-                reason = "连续刷新后标题仍不一致"
-            else:
-                reason = "多次重命名后路径仍变化"
-            target = (
-                state_item.get("expected_path")
-                or reorganizer.target_path(history)
-                or "未知文件"
-            )
             attention_items.append(
-                f"{reorganizer.display_name(history)}：{reason}｜文件：{target}"
+                self._attention_record_detail(
+                    state_item,
+                    reorganizer.display_name(history),
+                    str(reorganizer.target_path(history) or "未知文件"),
+                )
             )
         return (
             [history for history, _ in selected],
@@ -3076,6 +3081,7 @@ class RecentEpisodeMaintenance(_PluginBase):
             logger.error(f"[最近媒体维护] 无法重新处理人工检查记录：{err}")
             return 0
         retried = 0
+        retry_at = datetime.now().isoformat(timespec="seconds")
         for key, value in list(state.items()):
             item = dict(value) if isinstance(value, dict) else {}
             if item.get("status") != self._STATE_ATTENTION:
@@ -3084,15 +3090,15 @@ class RecentEpisodeMaintenance(_PluginBase):
             if attention_stage == "cleanup":
                 item["status"] = self._STATE_PENDING_REORGANIZE
                 item["cleanup_passes"] = 0
-                item.pop("cleanup_check_after", None)
-            elif attention_stage == "sidecar":
+                item["cleanup_check_after"] = retry_at
+            elif attention_stage in {"sidecar", "transfer"}:
                 item["status"] = self._STATE_PENDING_REORGANIZE
                 item["sidecar_attempts"] = 0
-                item.pop("sidecar_check_after", None)
+                item["sidecar_check_after"] = retry_at
             elif attention_stage == "refresh":
                 item["status"] = self._STATE_PENDING_REFRESH
                 item["refresh_attempts"] = 0
-                item.pop("refresh_check_after", None)
+                item["refresh_check_after"] = retry_at
             else:
                 item["status"] = (
                     self._STATE_PENDING_REFRESH
@@ -3100,7 +3106,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                     else self._STATE_PENDING_REORGANIZE
                 )
                 item["rename_attempts"] = 0
-            item["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            item["updated_at"] = retry_at
             item.pop("operation_intent", None)
             item.pop("attention_stage", None)
             state[key] = item
@@ -3119,7 +3125,7 @@ class RecentEpisodeMaintenance(_PluginBase):
     @staticmethod
     def _attention_stage(item: dict[str, Any]) -> str:
         stage = str(item.get("attention_stage") or "")
-        if stage in {"sidecar", "cleanup", "refresh", "rename"}:
+        if stage in {"sidecar", "cleanup", "refresh", "rename", "transfer"}:
             return stage
         if item.get("sidecar_pending"):
             return "sidecar"
@@ -3144,6 +3150,20 @@ class RecentEpisodeMaintenance(_PluginBase):
         if self._notify and result.should_notify():
             self._post_message("最近媒体维护完成", result.summary())
 
+    def _attention_record_detail(
+        self, item: dict[str, Any], name: str, file_path: str
+    ) -> str:
+        reasons = {
+            "cleanup": "旧名称附件清理失败",
+            "sidecar": "刮削附件多次补齐失败",
+            "refresh": "连续刷新后标题仍不一致",
+            "rename": "多次重命名后路径仍变化",
+            "transfer": "MP 整理结果尚未确认，请检查整理队列后再决定是否重试",
+        }
+        reason = reasons[self._attention_stage(item)]
+        target = item.get("expected_path") or file_path or "未知文件"
+        return f"{name}：{reason}｜文件：{target}"
+
     def _refresh_result_queue_counts(
         self,
         result: RunResult,
@@ -3151,6 +3171,7 @@ class RecentEpisodeMaintenance(_PluginBase):
     ) -> None:
         if not result.queue_counts:
             return
+        result.attention_items = []
         counts = {
             "pending_queued": 0,
             "new_queued": 0,
@@ -3167,13 +3188,19 @@ class RecentEpisodeMaintenance(_PluginBase):
             self._STATE_PENDING_REFRESH,
             self._STATE_PENDING_REORGANIZE,
         }
-        for value in state.values():
+        for key, value in state.items():
             item = value if isinstance(value, dict) else {}
             status = item.get("status")
             if status == self._STATE_COMPLETE:
                 counts["complete"] += 1
             elif status == self._STATE_ATTENTION:
                 counts["attention"] += 1
+                name, file_path = result.history_details.get(
+                    key, (f"整理记录 {item.get('history_id') or key}", "未知文件")
+                )
+                result.attention_items.append(
+                    self._attention_record_detail(item, name, file_path)
+                )
             elif item.get("scan_pending"):
                 counts["scan_waiting"] += 1
             elif item.get("sidecar_pending"):

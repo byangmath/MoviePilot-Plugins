@@ -1,5 +1,8 @@
 from datetime import datetime
 from types import SimpleNamespace
+from pathlib import Path
+
+import pytest
 
 from recentepisodemaintenance.reorganizer import MoviePilotReorganizer
 from recentepisodemaintenance import RecentEpisodeMaintenance
@@ -346,6 +349,69 @@ def test_v3_preview_uses_public_transfer_chain_with_current_media_identity():
     assert calls[0]["season"] == 1
     assert calls[0]["epformat"].detail == "01"
     assert calls[0]["fileitem"].path == video.src
+
+
+@pytest.mark.parametrize("mode", ["link", "move"])
+@pytest.mark.parametrize("receipt_state", ["completed", "skipped", "failed", "accepted", "retry_wait", "manual_review", "missing"])
+def test_v3_reorganization_requires_the_video_execution_receipt(mode, receipt_state):
+    calls = []
+    new_path = "/library/show/new.mkv"
+
+    class TransferChain:
+        def manual_transfer(self, *, preview=False, reorganize=False, report_results=False, **kwargs):
+            calls.append((preview, reorganize, report_results, kwargs["fileitem"].path))
+            if preview:
+                assert not reorganize and not report_results
+                return True, {"items": [{"success": True, "target": new_path}]}
+            assert reorganize and report_results
+            items = [{"source": "/source/subtitle.srt", "state": "completed", "target": "/library/new.srt"}]
+            if receipt_state != "missing":
+                items.append({
+                    "source": kwargs["fileitem"].path,
+                    "state": receipt_state,
+                    "message": "已整理过" if receipt_state == "skipped" else receipt_state,
+                    "target": new_path,
+                })
+            return True, {"items": items}
+
+    reorganizer = MoviePilotReorganizer(logger=None, dry_run=False)
+    reorganizer._transfer_chain_cls = TransferChain
+    reorganizer._file_item_cls = SimpleNamespace
+    reorganizer._episode_format_cls = SimpleNamespace
+    reorganizer._media_type_cls = SimpleNamespace(MOVIE="movie", TV="tv")
+    video = history(history_id=1, source="/source/video.mkv", dest="/library/old.mkv", date="2026-10-03")
+    video.mode = mode
+
+    operation = reorganizer.reorganize(video)
+
+    assert operation.success is (receipt_state == "completed")
+    assert not operation.skipped
+    assert operation.requires_review is (receipt_state in {"accepted", "retry_wait", "manual_review", "missing"})
+    assert operation.target == Path(new_path)
+    assert len(calls) == 2
+    assert all(call[3] == (video.dest if mode == "move" else video.src) for call in calls)
+    if receipt_state == "skipped":
+        assert "已整理过" in operation.message
+
+
+def test_v3_reorganization_without_receipt_support_does_not_execute():
+    calls = []
+
+    class TransferChain:
+        def manual_transfer(self, *, preview=False, **kwargs):
+            calls.append(preview)
+            return True, {"items": [{"success": True, "target": "/library/new.mkv"}]}
+
+    reorganizer = MoviePilotReorganizer(logger=None, dry_run=False)
+    reorganizer._transfer_chain_cls = TransferChain
+    reorganizer._file_item_cls = SimpleNamespace
+    reorganizer._episode_format_cls = SimpleNamespace
+    reorganizer._media_type_cls = SimpleNamespace(MOVIE="movie", TV="tv")
+    video = history(history_id=1, source="/source/video.mkv", dest="/library/old.mkv", date="2026-10-03")
+    operation = reorganizer.reorganize(video)
+    assert not operation.success
+    assert "不支持重新整理执行回执" in operation.message
+    assert calls == [True]
 
 
 def test_v3_episode_format_restores_history_range():

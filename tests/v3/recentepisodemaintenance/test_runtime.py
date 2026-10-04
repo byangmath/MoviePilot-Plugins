@@ -2,6 +2,8 @@ from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from recentepisodemaintenance import RecentEpisodeMaintenance
 from recentepisodemaintenance.jellyfin_client import JellyfinServiceClient
 from recentepisodemaintenance.models import (
@@ -230,6 +232,87 @@ def test_unhandled_run_failure_sends_failure_notification():
     assert len(messages) == 1
     assert messages[0][0] == "最近媒体维护失败"
     assert "运行异常：unexpected" in messages[0][1]
+
+
+def test_final_summary_lists_existing_and_new_attention_without_inflating_failures():
+    plugin = RecentEpisodeMaintenance()
+    plugin._notify = True
+    plugin._dry_run = False
+    plugin._save_processing_state = lambda state: True
+    messages = []
+    plugin._post_message = lambda title, text: messages.append(text)
+    result = RunResult(
+        queue_counts={"attention": 1},
+        history_details={
+            "existing": ("师兄啊师兄 S01E161", "/library/existing.mp4"),
+            "new": ("斗破苍穹 S05E213", "/library/old.mp4"),
+        },
+    )
+    state = {
+        "existing": {"status": plugin._STATE_ATTENTION, "sidecar_pending": True},
+        "new": {"status": plugin._STATE_PENDING_REORGANIZE},
+    }
+    plugin._refresh_result_queue_counts(result, state)
+    assert len(result.attention_items) == 1
+
+    state["new"].update(
+        status=plugin._STATE_ATTENTION,
+        attention_stage="sidecar",
+        expected_path="/library/山雨欲来.mp4",
+    )
+    result.add_error("斗破苍穹 S05E213：附件缺失", "/library/山雨欲来.mp4")
+    plugin._finish_run(result, state)
+
+    assert result.queue_counts["attention"] == 2
+    assert result.failed == 1
+    assert result.attention_items == [
+        "师兄啊师兄 S01E161：刮削附件多次补齐失败｜文件：/library/existing.mp4",
+        "斗破苍穹 S05E213：刮削附件多次补齐失败｜文件：/library/山雨欲来.mp4",
+    ]
+    assert "需人工检查记录（共 2 条，含此前遗留）：" in messages[0]
+    assert all(item in messages[0] for item in result.attention_items)
+
+    for item in state.values():
+        item["status"] = plugin._STATE_PENDING_REORGANIZE
+    plugin._finish_run(result, state)
+    assert result.queue_counts["attention"] == 0
+    assert result.attention_items == []
+    assert "需人工检查记录（" not in messages[-1]
+
+
+def test_run_with_only_attention_records_still_reports_their_details(monkeypatch):
+    histories = [
+        SimpleNamespace(id=1, name="测试剧 S01E01", dest="/library/episode.mp4"),
+        SimpleNamespace(id=2, name="测试电影", dest="/library/movie.mkv"),
+    ]
+    reorganizer = SimpleNamespace(
+        recent_histories=lambda **kwargs: histories,
+        processing_key=lambda history: str(history.id),
+        display_name=lambda history: history.name,
+        target_path=lambda history: Path(history.dest),
+    )
+    monkeypatch.setattr(plugin_module, "MoviePilotReorganizer", lambda **kwargs: reorganizer)
+    plugin = RecentEpisodeMaintenance()
+    plugin._enable_refresh = True
+    plugin._max_items = 10
+    plugin._days = 15
+    plugin._notify = True
+    plugin._dry_run = False
+    plugin._load_processing_state = lambda: {
+        "1": {"status": plugin._STATE_ATTENTION, "attention_stage": "refresh"},
+        "2": {"status": plugin._STATE_ATTENTION, "attention_stage": "cleanup"},
+    }
+    plugin._save_processing_state = lambda state: True
+    messages = []
+    plugin._post_message = lambda title, text: messages.append(text)
+
+    plugin._run_once()
+
+    assert len(messages) == 1
+    assert "MP 视频整理记录 0 条" in messages[0]
+    assert "需人工检查 2 条" in messages[0]
+    assert f"测试剧 S01E01：连续刷新后标题仍不一致｜文件：{Path(histories[0].dest)}" in messages[0]
+    assert f"测试电影：旧名称附件清理失败｜文件：{Path(histories[1].dest)}" in messages[0]
 
 
 def test_v3_run_queue_is_coalesced_per_plugin_instance():
@@ -516,17 +599,65 @@ def test_retry_attention_records_resets_the_failed_stage():
     state = saved[-1]
     assert state["cleanup"]["status"] == plugin._STATE_PENDING_REORGANIZE
     assert state["cleanup"]["cleanup_passes"] == 0
-    assert "cleanup_check_after" not in state["cleanup"]
+    assert plugin._timestamp_is_due(state["cleanup"]["cleanup_check_after"])
     assert state["sidecar"]["status"] == plugin._STATE_PENDING_REORGANIZE
     assert state["sidecar"]["sidecar_attempts"] == 0
     assert state["sidecar"]["cleanup_passes"] == 2
-    assert "sidecar_check_after" not in state["sidecar"]
+    assert plugin._timestamp_is_due(state["sidecar"]["sidecar_check_after"])
     assert state["rename"]["status"] == plugin._STATE_PENDING_REFRESH
     assert state["rename"]["rename_attempts"] == 0
     assert state["refresh"]["status"] == plugin._STATE_PENDING_REFRESH
     assert state["refresh"]["refresh_attempts"] == 0
-    assert "refresh_check_after" not in state["refresh"]
+    assert plugin._timestamp_is_due(state["refresh"]["refresh_check_after"])
     assert state["complete"]["status"] == plugin._STATE_COMPLETE
+
+
+def test_manual_attention_retry_is_selected_immediately_without_restarting_cooldown():
+    plugin = RecentEpisodeMaintenance()
+    plugin._max_items = 10
+    plugin._enable_refresh = True
+    plugin._cleanup_old_sidecars = True
+    histories = [
+        SimpleNamespace(id=i, dest=f"/library/video{i}.mkv")
+        for i in range(1, 6)
+    ]
+    stages = ["sidecar", "cleanup", "refresh", "transfer"]
+    state = {
+        str(i): {
+            "status": plugin._STATE_ATTENTION,
+            "attention_stage": stage,
+            "sidecar_pending": stage in {"sidecar", "transfer"},
+            "cleanup_pending": stage == "cleanup",
+            "sidecar_check_after": "2999-01-01T00:00:00",
+            "cleanup_check_after": "2999-01-01T00:00:00",
+            "refresh_check_after": "2999-01-01T00:00:00",
+        }
+        for i, stage in enumerate(stages, 1)
+    }
+    state["5"] = {
+        "status": plugin._STATE_PENDING_REORGANIZE,
+        "sidecar_pending": True,
+        "sidecar_check_after": "2999-01-01T00:00:00",
+    }
+    saved = []
+    plugin._load_processing_state = lambda: deepcopy(saved[-1] if saved else state)
+    plugin._save_processing_state = lambda value: saved.append(deepcopy(value)) or True
+    fake = SimpleNamespace(
+        processing_key=lambda history: str(history.id),
+        display_name=lambda history: f"Video {history.id}",
+        target_path=lambda history: Path(history.dest),
+    )
+
+    assert plugin._retry_attention_records() == 4
+    selected, final_state, selection = plugin._select_histories(histories, fake)
+
+    assert {history.id for history in selected} == {1, 2, 3, 4}
+    assert selection["pending"] == 4
+    assert selection["sidecar_waiting"] == 1
+    assert selection["cleanup_waiting"] == 0
+    assert selection["refresh_waiting"] == 0
+    assert plugin._has_due_follow_up(final_state)
+    assert final_state["5"] == state["5"] | {"history_id": 5}
 
 
 def test_pending_library_scan_is_retried_before_episode_processing(monkeypatch):
@@ -1059,6 +1190,66 @@ def test_movie_history_uses_movie_matching_and_completes_without_refresh(
 
     assert FakeClient.refresh_calls == 0
     assert saved[-1]["movie"]["status"] == plugin._STATE_MONITORING
+
+
+@pytest.mark.parametrize("requires_review", [False, True])
+def test_unconfirmed_transfer_never_waits_for_scrape_or_counts_success(tmp_path, monkeypatch, requires_review):
+    old_path = tmp_path / "Show S01E01 - Old.mkv"
+    new_path = tmp_path / "Show S01E01 - New.mkv"
+    old_path.write_bytes(b"video")
+    history = SimpleNamespace(id=1, date="2026-10-03", dest=str(old_path))
+    calls = []
+
+    def reorganize(**kwargs):
+        calls.append(kwargs)
+        return OperationResult(
+            success=False, requires_review=requires_review,
+            message="整理结果尚未确认" if requires_review else "已整理过",
+            target=new_path,
+        )
+
+    fake = SimpleNamespace(
+        recent_histories=lambda **kwargs: [history],
+        processing_key=lambda history: "episode",
+        target_path=lambda history: old_path,
+        display_name=lambda history: "Show S01E01",
+        preview=lambda history: OperationResult(success=True, target=new_path),
+        related_history_count=lambda history: 0,
+        reorganize=reorganize,
+    )
+    monkeypatch.setattr(plugin_module, "MoviePilotReorganizer", lambda **kwargs: fake)
+    plugin = RecentEpisodeMaintenance()
+    plugin._enable_refresh = False
+    plugin._enable_reorganize = True
+    plugin._scan_after_reorganize = False
+    plugin._cleanup_old_sidecars = False
+    plugin._skip_same_name = True
+    plugin._max_items = 10
+    plugin._days = 15
+    plugin._dry_run = False
+    plugin._notify = True
+    saved, messages = [], []
+    plugin._load_processing_state = lambda: deepcopy(saved[-1]) if saved else {}
+    plugin._save_processing_state = lambda state: saved.append(deepcopy(state)) or True
+    plugin._post_message = lambda title, text: messages.append(text)
+    plugin._wait_for_reorganized_sidecars = lambda items: pytest.fail("unconfirmed transfer must not wait for sidecars")
+
+    plugin._run_once()
+
+    assert len(calls) == 1
+    assert old_path.is_file()
+    assert "成功 0 项" in messages[-1]
+    assert "失败 1 项" in messages[-1]
+    assert not saved[-1]["episode"].get("sidecar_pending")
+    if requires_review:
+        assert saved[-1]["episode"]["status"] == plugin._STATE_ATTENTION
+        assert saved[-1]["episode"]["attention_stage"] == "transfer"
+        plugin._run_once()
+        assert len(calls) == 1
+        assert plugin._retry_attention_records() == 1
+        assert saved[-1]["episode"]["status"] == plugin._STATE_PENDING_REORGANIZE
+    else:
+        assert saved[-1]["episode"]["status"] == plugin._STATE_PENDING_REORGANIZE
 
 
 def test_reorganized_record_is_rechecked_by_jellyfin_before_completion(

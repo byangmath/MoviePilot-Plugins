@@ -242,6 +242,7 @@ class OperationResult:
     message: str = ""
     source: Optional[Path] = None
     target: Optional[Path] = None
+    requires_review: bool = False
 
 
 @dataclass
@@ -261,6 +262,8 @@ class RunResult:
     refreshed_titles: list[str] = field(default_factory=list)
     reorganized_titles: list[str] = field(default_factory=list)
     failed_titles: list[str] = field(default_factory=list)
+    attention_items: list[str] = field(default_factory=list)
+    history_details: dict[str, tuple[str, str]] = field(default_factory=dict, repr=False)
     queue_counts: dict[str, int] = field(default_factory=dict)
     _skipped_keys: set[str] = field(default_factory=set, repr=False)
 
@@ -334,6 +337,9 @@ class RunResult:
             lines.extend(f"- {item}" for item in self.errors[:10])
             if len(self.errors) > 10:
                 lines.append(f"- 其余 {len(self.errors) - 10} 条错误已省略，请查看日志")
+        if self.attention_items:
+            lines.append(f"需人工检查记录（共 {len(self.attention_items)} 条，含此前遗留）：")
+            lines.extend(f"- {item}" for item in self.attention_items)
         return "\n".join(lines)
 
     def should_notify(self) -> bool:

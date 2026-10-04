@@ -256,6 +256,7 @@ class MoviePilotReorganizer:
         if not self._response_success(response):
             return OperationResult(
                 success=False,
+                requires_review=bool(response.get("requires_review")),
                 message=f"MoviePilot 历史记录重新整理失败：{self._response_message(response)}",
                 source=source,
                 target=preview_target or current_target,
@@ -263,9 +264,9 @@ class MoviePilotReorganizer:
 
         return OperationResult(
             success=True,
-            message=f"已按 MoviePilot 整理记录 #{history_id} 重新整理",
+            message=f"MoviePilot 已确认整理记录 #{history_id} 对应文件整理完成",
             source=source,
-            target=preview_target or current_target,
+            target=self._preview_target(response) or preview_target or current_target,
         )
 
     def preview(self, history: Any) -> OperationResult:
@@ -427,6 +428,12 @@ class MoviePilotReorganizer:
         return "preview" in parameters
 
     def _call_manual_transfer(self, history: Any, preview: bool) -> Any:
+        parameters = inspect.signature(self._transfer_chain_cls.manual_transfer).parameters
+        if not preview and not {"reorganize", "report_results"}.issubset(parameters):
+            return {
+                "success": False,
+                "message": "当前 MoviePilot 不支持重新整理执行回执，请升级 MoviePilot 后重试",
+            }
         fileitem = self._history_fileitem(history)
         media_source = getattr(history, "media_source", None)
         media_id = getattr(history, "media_id", None)
@@ -459,10 +466,32 @@ class MoviePilotReorganizer:
             download_hash=getattr(history, "download_hash", None),
             preview=preview,
             sync_extra_files=True,
-            reorganize=False,
+            reorganize=not preview,
+            **({"report_results": True} if not preview else {}),
         )
         data = result if isinstance(result, dict) else None
         message = result.get("message") if isinstance(result, dict) else result
+        if not preview:
+            items = data.get("items") if data else None
+            # Only the requested video's receipt proves completion; sidecars may have other results.
+            receipts = [
+                item for item in (items if isinstance(items, list) else [])
+                if isinstance(item, dict) and item.get("source") == fileitem.path
+            ]
+            if len(receipts) != 1:
+                return {
+                    "success": False,
+                    "requires_review": True,
+                    "message": "未收到唯一的视频执行回执，整理结果未确认，请检查 MoviePilot 整理队列",
+                }
+            receipt = receipts[0]
+            completed = receipt.get("state") == "completed" and not receipt.get("overwrite_skipped")
+            return {
+                "success": completed,
+                "requires_review": receipt.get("state") not in {"completed", "skipped", "failed"},
+                "message": str(receipt.get("message") or message or f"整理回执：{receipt.get('state')}"),
+                "data": {"items": [receipt]},
+            }
         return {
             "success": bool(state),
             "message": str(message or ""),
