@@ -37,6 +37,7 @@ except Exception:
 from .jellyfin_client import JellyfinServiceClient
 from .models import EpisodeItem, RunResult
 from .reorganizer import MoviePilotReorganizer
+from .danmu import DanmuMaintenance, LogVarClient
 
 
 class RecentEpisodeMaintenance(_PluginBase):
@@ -107,7 +108,7 @@ class RecentEpisodeMaintenance(_PluginBase):
     plugin_name = "最近媒体维护"
     plugin_desc = "维护 MoviePilot 最近整理入库的 Jellyfin 电影和剧集"
     plugin_icon = "https://raw.githubusercontent.com/byangmath/MoviePilot-Plugins/main/icons/recentepisodemaintenance.png"
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     plugin_author = "byangmath"
     author_url = "https://github.com/byangmath"
     plugin_config_prefix = "recentepisodemaintenance_"
@@ -126,6 +127,8 @@ class RecentEpisodeMaintenance(_PluginBase):
         self._notify = bool(config.get("notify", False))
         self._enable_refresh = bool(config.get("enable_refresh", True))
         self._enable_reorganize = bool(config.get("enable_reorganize", False))
+        self._enable_danmu = bool(config.get("enable_danmu", False))
+        self._danmu_api_url = str(config.get("danmu_api_url") or "").strip()
         self._scan_after_reorganize = bool(config.get("scan_after_reorganize", True))
         self._cleanup_old_sidecars = bool(config.get("cleanup_old_sidecars", True))
         self._skip_same_name = bool(config.get("skip_same_name", True))
@@ -244,7 +247,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 "max_items",
                                 "单次最大处理数量",
                                 6,
-                                "限制每轮刷新和重新整理的合计操作数；最多检查该数量五倍的视频整理记录",
+                                "限制每轮刷新、重新整理和弹幕补全的合计操作数；媒体维护与弹幕补全分别最多检查该数量五倍的记录",
                             ),
                             self._switch(
                                 "dry_run",
@@ -282,6 +285,17 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 "清理旧名称附件",
                                 6,
                                 "确认新视频、NFO 和图片就绪后，延迟清理本次重命名留下的旧名称附件",
+                            ),
+                            self._switch(
+                                "enable_danmu", "补全缺失弹幕", 6,
+                                "仅支持 LogVar：为电影和单集剧集精确匹配后交给 Jellyfin Danmu 下载 XML；"
+                                "是否生成 ASS 沿用 Danmu 配置，不覆盖已有 XML",
+                            ),
+                            self._text(
+                                "danmu_api_url", "LogVar 弹幕 API 服务器地址",
+                                "http://服务器IP:9321 或 https://域名/Token", 6,
+                                "填写 MP 可访问的 LogVar 基础地址，可包含 Token 路径；与 Jellyfin Danmu "
+                                "可使用不同网络入口，但须连接同一服务并共用媒体 ID，不要添加 /api/v2 等接口路径",
                             ),
                             self._switch(
                                 "skip_same_name",
@@ -339,6 +353,8 @@ class RecentEpisodeMaintenance(_PluginBase):
             "notify": False,
             "enable_refresh": True,
             "enable_reorganize": False,
+            "enable_danmu": False,
+            "danmu_api_url": "",
             "scan_after_reorganize": True,
             "cleanup_old_sidecars": True,
             "skip_same_name": True,
@@ -406,6 +422,31 @@ class RecentEpisodeMaintenance(_PluginBase):
     def run_due_follow_up(self):
         if not self._enabled:
             return
+        if getattr(self, "_enable_danmu", False) and not self._dry_run:
+            self._ensure_run_state()
+            with self._run_state_lock:
+                if self._run_active:
+                    return
+                self._run_active = True
+            confirmation_failed = False
+            try:
+                state = self._load_processing_state()
+                result = RunResult(operation_limit=max(int(self._max_items), 1))
+                if DanmuMaintenance.confirm_due(state, logger, result):
+                    self._finish_run(result, state)
+            except Exception:
+                logger.error("[最近媒体维护] 弹幕文件确认失败，未调用外部接口")
+                confirmation_failed = True
+            finally:
+                with self._run_state_lock:
+                    pending_run = self._pending_run
+                    self._pending_run = False
+                    self._run_active = False
+            if pending_run:
+                self.run_once()
+                return
+            if confirmation_failed:
+                return
         try:
             processing_state = self._load_processing_state()
         except Exception as err:
@@ -419,9 +460,9 @@ class RecentEpisodeMaintenance(_PluginBase):
     def _run_once(self):
         operation_limit = max(int(self._max_items), 1)
         result = RunResult(operation_limit=operation_limit)
-        if not self._enable_refresh and not self._enable_reorganize:
+        if not self._enable_refresh and not self._enable_reorganize and not getattr(self, "_enable_danmu", False):
             logger.warning("[最近媒体维护] 未启用任何功能")
-            result.add_error("未启用元数据刷新或重新整理功能")
+            result.add_error("未启用元数据刷新、重新整理或弹幕补全功能")
             self._finish_run(result)
             return
 
@@ -505,12 +546,15 @@ class RecentEpisodeMaintenance(_PluginBase):
             self._finish_run(result)
             return
 
-        if not histories:
+        if not histories or (not self._enable_refresh and not self._enable_reorganize):
             waiting_text = self._waiting_records_text(selection)
             logger.info(
-                "[最近媒体维护] 当前时间范围内没有到期待处理的整理记录"
-                f"{waiting_text}"
+                ("[最近媒体维护] 仅检查缺失弹幕，不调用 MP 整理预览"
+                 if not self._enable_refresh and not self._enable_reorganize
+                 else "[最近媒体维护] 当前时间范围内没有到期待处理的整理记录")
+                + waiting_text
             )
+            self._maintain_danmu(history_pool, reorganizer, processing_state, result)
             self._finish_run(result, processing_state)
             return
 
@@ -2044,7 +2088,50 @@ class RecentEpisodeMaintenance(_PluginBase):
                 "完成清理前不触发 Jellyfin 媒体库扫描"
             )
 
+        if not state_persistence_failed:
+            self._maintain_danmu(history_pool, reorganizer, processing_state, result, client)
         self._finish_run(result, processing_state)
+
+    def _maintain_danmu(
+        self, histories: list[Any], reorganizer: MoviePilotReorganizer,
+        state: dict[str, dict[str, Any]], result: RunResult,
+        client: JellyfinServiceClient | None = None,
+    ) -> None:
+        if not getattr(self, "_enable_danmu", False):
+            return
+        logvar = None
+        try:
+            logvar = LogVarClient(getattr(self, "_danmu_api_url", ""))
+            client = client or self._get_jellyfin_client()
+            if client is None:
+                raise RuntimeError("未找到可用 Jellyfin 服务")
+            if not self._enable_refresh and not self._enable_reorganize:
+                for history in histories:
+                    item = state.setdefault(reorganizer.processing_key(history), {})
+                    if not item.get("status"):
+                        item["danmu_only"] = True
+            DanmuMaintenance(
+                client, logvar, logger, self._checkpoint_processing_state, self._dry_run,
+            ).run(histories, reorganizer, state, result, self._days, self._library_ids)
+        except Exception as err:
+            # Network exceptions can embed the configured server's API key in their URL.
+            from .danmu import safe_error
+            result.add_error(f"弹幕补全失败：{safe_error(err)}")
+            logger.error(f"[最近媒体维护] 弹幕补全失败：{safe_error(err)}")
+            for item in state.values():
+                node = item.get("danmu") or {}
+                if node.get("status") in {"ready", "retry"} and DanmuMaintenance.due(node):
+                    attempts = int(node.get("attempts", 0)) + 1
+                    node.update(
+                        attempts=attempts,
+                        status="attention" if attempts >= DanmuMaintenance.MAX_ATTEMPTS else "retry",
+                        error="弹幕服务或配置检查失败，请检查本轮日志",
+                        check_after=DanmuMaintenance.after(DanmuMaintenance.RETRY_MINUTES),
+                    )
+            DanmuMaintenance._counts(state, result)
+        finally:
+            if logvar is not None:
+                logvar.close()
 
     def _post_message(self, title: str, text: str) -> None:
         from app.schemas.types import MessageType
@@ -2914,6 +3001,8 @@ class RecentEpisodeMaintenance(_PluginBase):
         for state_item in state.values():
             if not isinstance(state_item, dict):
                 continue
+            if getattr(self, "_enable_danmu", False) and DanmuMaintenance.due(state_item.get("danmu") or {}):
+                return True
             if state_item.get("status") not in pending_statuses:
                 continue
             if state_item.get("operation_intent") or state_item.get("scan_pending"):
@@ -2957,7 +3046,12 @@ class RecentEpisodeMaintenance(_PluginBase):
     ) -> set[int]:
         tracked: set[int] = set()
         for item in state.values():
-            if not isinstance(item, dict) or item.get("status") == cls._STATE_COMPLETE:
+            if not isinstance(item, dict):
+                continue
+            danmu_pending = (item.get("danmu") or {}).get("status") in {"ready", "retry", "submitted", "attention"}
+            if (item.get("status") == cls._STATE_COMPLETE or (
+                item.get("danmu_only") and not item.get("status")
+            )) and not danmu_pending:
                 continue
             try:
                 history_id = int(item.get("history_id") or 0)
@@ -3084,7 +3178,14 @@ class RecentEpisodeMaintenance(_PluginBase):
         retry_at = datetime.now().isoformat(timespec="seconds")
         for key, value in list(state.items()):
             item = dict(value) if isinstance(value, dict) else {}
+            danmu = item.get("danmu") or {}
+            danmu_retried = danmu.get("status") == "attention"
+            if danmu_retried:
+                item["danmu"] = {**danmu, "status": "ready", "attempts": 0,
+                                 "check_after": retry_at, "confirmations": 0, "error": ""}
+                state[key] = item
             if item.get("status") != self._STATE_ATTENTION:
+                retried += int(danmu_retried)
                 continue
             attention_stage = self._attention_stage(item)
             if attention_stage == "cleanup":

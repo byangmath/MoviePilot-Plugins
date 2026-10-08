@@ -150,6 +150,46 @@ def test_summary_includes_queue_counts():
     assert "需人工检查 5 条" in summary
 
 
+def test_summary_merges_danmu_counts_and_preserves_media_lists():
+    result = RunResult(
+        queue_counts={"attention": 2},
+        danmu_checked=10,
+        danmu_previewed=3,
+        danmu_submitted=4,
+        danmu_waiting=5,
+        danmu_completed=["/library/completed.xml"],
+        danmu_attention=["Show S01E01｜原因：匹配不唯一"],
+    )
+
+    lines = result.summary().splitlines()
+    checks = next(line for line in lines if line.startswith("本轮检查："))
+    state = next(line for line in lines if line.startswith("当前状态："))
+    operations = next(line for line in lines if line.startswith("操作统计："))
+
+    assert "弹幕检查 10 项" in checks
+    assert "需人工检查 2 条；弹幕等待处理 5 项，弹幕需人工检查 1 项" in state
+    assert "弹幕试运行预览 3 项，提交 4 项，确认完成 1 项" in operations
+    assert sum(line.startswith("当前状态：") for line in lines) == 1
+    assert sum(line.startswith("操作统计：") for line in lines) == 1
+    assert not any(line.startswith("弹幕补全：") for line in lines)
+    assert "弹幕补全完成媒体：" in lines
+    assert "- /library/completed.xml" in lines
+    assert "弹幕需人工检查：" in lines
+    assert "- Show S01E01｜原因：匹配不唯一" in lines
+
+
+def test_summary_includes_danmu_waiting_without_media_queue_counts():
+    result = RunResult(danmu_waiting=2, danmu_attention=["需要检查"])
+
+    assert "当前状态：弹幕等待处理 2 项，弹幕需人工检查 1 项" in result.summary()
+
+
+def test_summary_includes_danmu_completion_without_checks():
+    result = RunResult(danmu_completed=["/library/completed.xml"])
+
+    assert "弹幕试运行预览 0 项，提交 0 项，确认完成 1 项" in result.summary()
+
+
 def test_waiting_records_text_spacing():
     assert RecentEpisodeMaintenance._waiting_records_text({}) == ""
     assert RecentEpisodeMaintenance._waiting_records_text(

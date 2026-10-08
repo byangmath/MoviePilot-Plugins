@@ -265,6 +265,12 @@ class RunResult:
     attention_items: list[str] = field(default_factory=list)
     history_details: dict[str, tuple[str, str]] = field(default_factory=dict, repr=False)
     queue_counts: dict[str, int] = field(default_factory=dict)
+    danmu_checked: int = 0
+    danmu_previewed: int = 0
+    danmu_submitted: int = 0
+    danmu_waiting: int = 0
+    danmu_completed: list[str] = field(default_factory=list)
+    danmu_attention: list[str] = field(default_factory=list)
     _skipped_keys: set[str] = field(default_factory=set, repr=False)
 
     def add_error(self, message: str, file_path: str | Path | None = None) -> None:
@@ -294,7 +300,10 @@ class RunResult:
             self.skipped += 1
 
     def summary(self) -> str:
-        lines = [f"本轮检查：MP 视频整理记录 {self.reorganize_candidates} 条"]
+        lines = [
+            f"本轮检查：MP 视频整理记录 {self.reorganize_candidates} 条；"
+            f"弹幕检查 {self.danmu_checked} 项"
+        ]
         if self.queue_counts:
             lines[0] += (
                 "；队列："
@@ -312,13 +321,22 @@ class RunResult:
                 f"等待附件 {self.queue_counts.get('sidecar_waiting', 0)} 条，"
                 f"等待清理 {self.queue_counts.get('cleanup_waiting', 0)} 条，"
                 f"当前范围内已完成 {self.queue_counts.get('complete', 0)} 条，"
-                f"需人工检查 {self.queue_counts.get('attention', 0)} 条"
+                f"需人工检查 {self.queue_counts.get('attention', 0)} 条；"
+                f"弹幕等待处理 {self.danmu_waiting} 项，"
+                f"弹幕需人工检查 {len(self.danmu_attention)} 项"
+            )
+        elif self.danmu_waiting or self.danmu_attention:
+            lines.append(
+                f"当前状态：弹幕等待处理 {self.danmu_waiting} 项，"
+                f"弹幕需人工检查 {len(self.danmu_attention)} 项"
             )
         lines.extend(
             [
-                f"操作统计：刷新和重新整理 {self.operations_used}/{self.operation_limit} 次；"
+                f"操作统计：刷新、重新整理和弹幕补全 {self.operations_used}/{self.operation_limit} 次；"
                 f"重新整理试运行预览 {self.previewed} 条，成功 {self.reorganized} 项；"
-                f"元数据刷新试运行预览 {self.refresh_previewed} 项，成功 {self.refreshed} 项",
+                f"元数据刷新试运行预览 {self.refresh_previewed} 项，成功 {self.refreshed} 项；"
+                f"弹幕试运行预览 {self.danmu_previewed} 项，提交 {self.danmu_submitted} 项，"
+                f"确认完成 {len(self.danmu_completed)} 项",
                 f"匹配结果：匹配到 Jellyfin 媒体 {self.refresh_candidates} 项，"
                 f"跳过 {self.skipped} 项，失败 {self.failed} 项",
             ]
@@ -332,6 +350,12 @@ class RunResult:
         if self.failed_titles:
             lines.append("处理失败媒体：")
             lines.extend(f"- {title}" for title in self.failed_titles)
+        if self.danmu_completed:
+            lines.append("弹幕补全完成媒体：")
+            lines.extend(f"- {path}" for path in self.danmu_completed)
+        if self.danmu_attention:
+            lines.append("弹幕需人工检查：")
+            lines.extend(f"- {item}" for item in self.danmu_attention)
         if self.errors:
             lines.append("失败详情：")
             lines.extend(f"- {item}" for item in self.errors[:10])

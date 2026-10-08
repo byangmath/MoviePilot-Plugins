@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import json
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import sleep
@@ -24,7 +26,7 @@ class JellyfinServiceClient:
 
     @staticmethod
     def _url(path: str, params: dict[str, Any] | None = None) -> str:
-        query = urlencode(params or {})
+        query = urlencode(params or {}).replace("%5BUSER%5D", "[USER]")
         if query:
             return f"[HOST]{path.lstrip('/')}?{query}&api_key=[APIKEY]"
         return f"[HOST]{path.lstrip('/')}?api_key=[APIKEY]"
@@ -485,3 +487,67 @@ class JellyfinServiceClient:
 
     def scan_library(self) -> None:
         self._post_json("Library/Refresh")
+
+    def danmu_settings(self) -> dict[str, Any]:
+        plugins = self._get_json("Plugins")
+        matches = [
+            item for item in plugins or []
+            if isinstance(item, dict) and str(item.get("Name", "")).casefold() == "danmu"
+            and str(item.get("Status", "Active")).casefold() == "active"
+        ]
+        if len(matches) != 1 or not matches[0].get("Id"):
+            raise RuntimeError("未找到唯一且已启用的 Jellyfin Danmu 插件")
+        settings = self._get_json(f"Plugins/{matches[0]['Id']}/Configuration")
+        if not isinstance(settings, dict):
+            raise RuntimeError("无法读取 Danmu 插件配置")
+        if not any(
+            item.get("Name") == "弹幕API" and item.get("Enable") is True
+            for item in settings.get("Scrapers") or [] if isinstance(item, dict)
+        ):
+            raise RuntimeError("请先在 Danmu 插件中启用弹幕 API 来源")
+        return settings
+
+    def danmu_item(self, item_id: str) -> dict[str, Any]:
+        # The single-item endpoint returns the editable DTO, not the limited list projection.
+        item = self._get_json(f"Items/{item_id}", {"userId": "[USER]"})
+        if not isinstance(item, dict) or str(item.get("Id", "")) != item_id:
+            raise RuntimeError("未获取到完整 Jellyfin 媒体条目")
+        if not item.get("Name") or not item.get("Path") or not isinstance(item.get("ProviderIds"), dict):
+            raise RuntimeError("Jellyfin 条目缺少名称、路径或媒体标识，拒绝修改")
+        if not isinstance(item.get("LockData"), bool) or any(
+            not isinstance(item.get(field), list)
+            for field in ("Tags", "Genres", "LockedFields")
+        ):
+            raise RuntimeError("Jellyfin 条目缺少完整编辑字段，拒绝修改以保护原元数据")
+        if item.get("Type") not in {"Episode", "Movie"}:
+            raise RuntimeError("弹幕补全仅处理电影和单集剧集")
+        supported = getattr(self, "_danmu_supported_types", set())
+        if item["Type"] not in supported:
+            editor = self._get_json(f"Items/{item_id}/MetadataEditor")
+            if not isinstance(editor, dict) or not any(
+                info.get("Key") == "DanmuID"
+                for info in editor.get("ExternalIdInfos") or [] if isinstance(info, dict)
+            ):
+                raise RuntimeError("当前 Danmu 插件未提供该媒体的 DanmuID 编辑字段，请检查插件版本")
+            self._danmu_supported_types = supported | {item["Type"]}
+        return item
+
+    def set_danmu_id(self, item: dict[str, Any], provider_value: str) -> None:
+        current = self.danmu_item(str(item["Id"]))
+        if current != item:
+            raise RuntimeError("Jellyfin 元数据已发生变化，本轮不写入弹幕关联")
+        payload = deepcopy(current)
+        payload["ProviderIds"]["DanmuID"] = f"danmuapi:{provider_value}"
+        # Re-post the complete editable DTO; a ProviderIds-only body clears other metadata.
+        response = self.service.post_data(
+            self._url(f"Items/{item['Id']}"),
+            data=json.dumps(payload, ensure_ascii=False),
+            headers={"Content-Type": "application/json"},
+        )
+        self._json(response)
+
+    def request_danmu(self, item_id: str) -> None:
+        # Used when the correct ID already exists and no metadata change is necessary.
+        response = self._get_json(f"api/danmu/{item_id}/refresh", retry=False)
+        if isinstance(response, dict) and response.get("success") is False:
+            raise RuntimeError("Danmu 插件未接受单项刷新请求")
