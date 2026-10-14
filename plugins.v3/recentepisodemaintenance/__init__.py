@@ -108,7 +108,7 @@ class RecentEpisodeMaintenance(_PluginBase):
     plugin_name = "最近媒体维护"
     plugin_desc = "维护 MoviePilot 最近整理入库的 Jellyfin 电影和剧集"
     plugin_icon = "https://raw.githubusercontent.com/byangmath/MoviePilot-Plugins/main/icons/recentepisodemaintenance.png"
-    plugin_version = "1.0.2"
+    plugin_version = "1.0.3"
     plugin_author = "byangmath"
     author_url = "https://github.com/byangmath"
     plugin_config_prefix = "recentepisodemaintenance_"
@@ -3182,7 +3182,9 @@ class RecentEpisodeMaintenance(_PluginBase):
             danmu_retried = danmu.get("status") == "attention"
             if danmu_retried:
                 item["danmu"] = {**danmu, "status": "ready", "attempts": 0,
-                                 "check_after": retry_at, "confirmations": 0, "error": ""}
+                                 "check_after": retry_at, "confirmations": 0, "error": "",
+                                 "verify_comments": True, "manual_recheck": True,
+                                 "manual_rechecks_remaining": DanmuMaintenance.MANUAL_UNAVAILABLE_RESULTS}
                 state[key] = item
             if item.get("status") != self._STATE_ATTENTION:
                 retried += int(danmu_retried)

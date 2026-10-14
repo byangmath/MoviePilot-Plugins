@@ -3,12 +3,13 @@
     "name": "最近媒体维护",
     "description": "刷新元数据并重命名最近整理入库的 Jellyfin 电影和剧集，可选通过 LogVar 补全缺失弹幕。",
     "labels": "Jellyfin,媒体库,电影,剧集,弹幕",
-    "version": "1.0.2",
+    "version": "1.0.3",
     "icon": "https://raw.githubusercontent.com/byangmath/MoviePilot-Plugins/main/icons/recentepisodemaintenance.png",
     "author": "byangmath",
     "level": 1,
     "system_version": ">=3.0.0",
     "history": {
+      "v1.0.3": "更新至 v1.0.3：修复 Jellyfin 弹幕关联写入错误，保留可编辑元数据并排除 Trickplay 等展示字段；区分提交失败与结果未确认，回读校验并在连续失败时暂停；新增弹幕可用性复核，无匹配或空数据累计三次后停止，手动处理独立复核两次，限流及网络异常不计为空数据；补充使用说明与回归测试。",
       "v1.0.2": "更新至 v1.0.2：新增可选 LogVar 电影和单集弹幕补全及 API 地址配置，支持跨季匹配和不同网络入口；交由 Jellyfin Danmu 下载并按配置生成 ASS，保留已有文件，延迟确认并有限重试；连续网络失败暂停请求，支持人工重试，弹幕数量并入检查、状态和操作汇总。",
       "v1.0.1": "更新至 v1.0.1：修复 V3 重新整理被成功历史记录跳过的问题，校验视频执行回执；手动重试立即处理；运行总结列出全部人工检查记录，并区分新视频未生成与刮削附件缺失。",
       "v1.0.0": "迁移到 MoviePilot V3，使用公开整理历史查询、V3 媒体身份和整理链接口，并兼容迁移原有处理队列。"

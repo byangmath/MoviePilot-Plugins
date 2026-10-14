@@ -10,9 +10,9 @@ import recentepisodemaintenance as plugin_module
 
 from recentepisodemaintenance import RecentEpisodeMaintenance
 from recentepisodemaintenance.danmu import (
-    DanmuMaintenance, DanmuMatchError, LogVarClient, LogVarRequestError, api_base,
+    DanmuMaintenance, DanmuMatchError, DanmuUnavailableError, LogVarClient, LogVarRequestError, api_base, safe_error,
 )
-from recentepisodemaintenance.jellyfin_client import JellyfinServiceClient
+from recentepisodemaintenance.jellyfin_client import DanmuSubmissionError, JellyfinServiceClient
 from recentepisodemaintenance.models import EpisodeItem, RunResult
 from recentepisodemaintenance.reorganizer import MoviePilotReorganizer
 
@@ -35,6 +35,8 @@ class Session:
         self.detail_override = {}
         self.match_override = {}
         self.failure = failure
+        self.comment_payload = {"success": True, "count": 1, "comments": [{"p": "1,1,25,16777215", "m": "弹幕"}]}
+        self.comment_failure = None
         self.calls = []
 
     def request(self, method, url, **kwargs):
@@ -50,6 +52,10 @@ class Session:
                 "type": candidate.get("type"), "typeDescription": candidate.get("typeDescription"),
                 "episodes": episodes, **self.detail_override,
             }}
+        if "/comment/" in url:
+            if self.comment_failure:
+                raise self.comment_failure
+            payload = self.comment_payload
         return SimpleNamespace(status_code=200, raise_for_status=lambda: None, json=lambda: payload)
 
 
@@ -289,11 +295,23 @@ class Service:
         return SimpleNamespace(status_code=204, content=b"", raise_for_status=lambda: None)
 
 
-def test_metadata_update_preserves_every_other_field_and_provider():
+def test_metadata_update_preserves_editable_fields_and_excludes_display_data():
     dto = {"Id": "item", "Type": "Episode", "Name": "山雨欲来", "Path": "/video.mp4",
            "Overview": "简介", "ProviderIds": {"Tmdb": "123", "DanmuID": "bilibili:old"},
            "LockData": True, "Tags": ["动画"], "Genres": ["动画"], "LockedFields": [],
-           "IndexNumber": 7, "ParentIndexNumber": 1}
+           "IndexNumber": 7, "ParentIndexNumber": 1,
+           "ForcedSortName": "排序名", "OriginalTitle": "Original", "CriticRating": 80,
+           "CommunityRating": 8.5, "PreferredMetadataLanguage": "zh", "PreferredMetadataCountryCode": "CN",
+           "OfficialRating": "TV-14", "CustomRating": "TV-PG", "ProductionYear": 2026,
+           "DateCreated": "2026-01-01T00:00:00Z", "PremiereDate": "2026-01-01T00:00:00Z",
+           "EndDate": None, "ProductionLocations": ["中国"], "Taglines": ["标语"],
+           "AirsAfterSeasonNumber": 1, "AirsBeforeEpisodeNumber": 8, "AirsBeforeSeasonNumber": 2,
+           "AspectRatio": "16:9", "Video3DFormat": None,
+           "People": [{"Name": "演员", "Role": "角色", "Type": "Actor", "PrimaryImageTag": "image"}],
+           "Studios": [{"Name": "工作室", "Id": "studio-id"}],
+           "Trickplay": {"media": {"320": {"Width": 320}}},
+           "UserData": {"PlaybackPositionTicks": 123}, "MediaSources": [{"Id": "source"}],
+           "MediaStreams": [{"Type": "Video"}], "ImageTags": {"Primary": "image"}}
     original = deepcopy(dto)
     service = Service(dto)
     client = JellyfinServiceClient(service)
@@ -302,7 +320,12 @@ def test_metadata_update_preserves_every_other_field_and_provider():
     payload = service.posts[0][1]
     assert payload["ProviderIds"] == {"Tmdb": "123", "DanmuID": "danmuapi:71"}
     payload["ProviderIds"] = original["ProviderIds"]
-    assert payload == original == dto
+    expected = {key: value for key, value in original.items()
+                if key not in {"Trickplay", "UserData", "MediaSources", "MediaStreams", "ImageTags"}}
+    expected["People"] = [{"Name": "演员", "Role": "角色", "Type": "Actor"}]
+    expected["Studios"] = [{"Name": "工作室"}]
+    assert payload == expected
+    assert dto == original
     assert "userId=[USER]" in service.gets[0]
     assert not any("/Refresh" in url for url, _, _ in service.posts)
 
@@ -317,6 +340,109 @@ def test_concurrent_metadata_change_aborts_write():
     with pytest.raises(RuntimeError):
         client.set_danmu_id(original, "20")
     assert service.posts == []
+
+
+def test_playback_and_trickplay_changes_do_not_block_danmu_write():
+    dto = {"Id": "item", "Type": "Movie", "Name": "电影", "Path": "/video.mkv", "ProviderIds": {},
+           "LockData": False, "Tags": [], "Genres": [], "LockedFields": [],
+           "UserData": {"PlaybackPositionTicks": 1}, "Trickplay": {"old": {}}}
+    service = Service(dto)
+    client = JellyfinServiceClient(service)
+    original = client.danmu_item("item")
+    service.dto["UserData"]["PlaybackPositionTicks"] = 2
+    service.dto["Trickplay"] = {"new": {}}
+    client.set_danmu_id(original, "20")
+    assert len(service.posts) == 1
+    assert "UserData" not in service.posts[0][1] and "Trickplay" not in service.posts[0][1]
+
+
+@pytest.mark.parametrize("field,value", [
+    ("Path", "/renamed.mkv"), ("Overview", "新简介"), ("ProviderIds", {"Tmdb": "new"}),
+    ("LockData", True), ("Tags", ["新标签"]), ("Genres", ["新类型"]),
+    ("LockedFields", ["Name"]), ("IndexNumber", 8),
+])
+def test_editable_metadata_changes_abort_before_post(field, value):
+    dto = {"Id": "item", "Type": "Movie", "Name": "电影", "Path": "/video.mkv", "ProviderIds": {},
+           "LockData": False, "Tags": [], "Genres": [], "LockedFields": []}
+    service = Service(dto)
+    client = JellyfinServiceClient(service)
+    original = client.danmu_item("item")
+    service.dto[field] = value
+    with pytest.raises(DanmuSubmissionError) as failure:
+        client.set_danmu_id(original, "20")
+    assert not failure.value.uncertain and not service.posts
+
+
+@pytest.mark.parametrize("saved,readable", [(False, True), (True, True), (False, False)])
+def test_failed_write_reads_back_once_without_blind_repost(saved, readable):
+    dto = {"Id": "item", "Type": "Movie", "Name": "电影", "Path": "/video.mkv", "ProviderIds": {},
+           "LockData": False, "Tags": [], "Genres": [], "LockedFields": []}
+    service = Service(dto)
+    client = JellyfinServiceClient(service)
+    original = client.danmu_item("item")
+    posts = []
+    def post(url, **kwargs):
+        posts.append(url)
+        if saved:
+            service.dto["ProviderIds"]["DanmuID"] = "danmuapi:20"
+        if not readable:
+            service.get_data = lambda _: None
+        raise requests.HTTPError("HTTP 500 at https://jf.test/?api_key=secret",
+                                 response=SimpleNamespace(status_code=500))
+    service.post_data = post
+    with pytest.raises(DanmuSubmissionError) as failure:
+        client.set_danmu_id(original, "20")
+    assert failure.value.uncertain == (saved or not readable)
+    assert failure.value.status_code == 500 and len(posts) == 1
+    assert len(service.gets) == (4 if readable else 3)
+    assert original["ProviderIds"] == {}
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 429])
+def test_http_rejection_does_not_wait_for_file_confirmation(status):
+    dto = {"Id": "item", "Type": "Movie", "Name": "电影", "Path": "/video.mkv", "ProviderIds": {},
+           "LockData": False, "Tags": [], "Genres": [], "LockedFields": []}
+    service = Service(dto)
+    client = JellyfinServiceClient(service)
+    item = client.danmu_item("item")
+    def post(*args, **kwargs):
+        raise requests.HTTPError(response=SimpleNamespace(status_code=status))
+    service.post_data = post
+    with pytest.raises(DanmuSubmissionError) as failure:
+        client.set_danmu_id(item, "20")
+    assert not failure.value.uncertain and failure.value.status_code == status
+    assert len(service.gets) == 3
+
+
+def test_timeout_with_negative_readback_is_still_uncertain():
+    dto = {"Id": "item", "Type": "Movie", "Name": "电影", "Path": "/video.mkv",
+           "ProviderIds": {}, "LockData": False, "Tags": [], "Genres": [], "LockedFields": []}
+    service = Service(dto)
+
+    def timed_out(*args, **kwargs):
+        raise requests.Timeout("request still running")
+
+    service.post_data = timed_out
+    client = JellyfinServiceClient(service)
+    item = client.danmu_item("item")
+    with pytest.raises(DanmuSubmissionError) as failure:
+        client.set_danmu_id(item, "71")
+    assert failure.value.uncertain
+    assert "暂未发现目标 DanmuID" in str(failure.value)
+    assert len(service.gets) == 4
+
+
+@pytest.mark.parametrize("response,uncertain", [
+    ({"success": True}, None), ({"success": False}, False), ({}, True), ("not-json", True),
+])
+def test_single_item_request_requires_queue_acknowledgement(response, uncertain):
+    client = JellyfinServiceClient(SimpleNamespace(get_data=lambda _: response))
+    if uncertain is None:
+        client.request_danmu("item")
+    else:
+        with pytest.raises(DanmuSubmissionError) as failure:
+            client.request_danmu("item")
+        assert failure.value.uncertain == uncertain
 
 
 class Jellyfin:
@@ -345,6 +471,266 @@ def runner(path, *, dry_run=False, checkpoint=None):
     run = DanmuMaintenance(jf, LogVarClient("https://logvar.test/token", Session()),
                           logging.getLogger("test"), checkpoint or (lambda _: True), dry_run)
     return run, jf
+
+
+@pytest.mark.parametrize("payload,expected", [
+    ({"comments": [], "count": 0}, DanmuUnavailableError),
+    ({"comments": []}, DanmuUnavailableError),
+    ({"comments": [], "count": 1}, LogVarRequestError),
+    ({"comments": [], "count": False}, LogVarRequestError),
+    ({"comments": [], "count": "0"}, LogVarRequestError),
+    ({"count": 0}, LogVarRequestError),
+    ({"success": False, "comments": [], "count": 0}, LogVarRequestError),
+    ({"errorCode": 500, "comments": [], "count": 0}, LogVarRequestError),
+])
+def test_availability_requires_an_explicit_valid_empty_result(payload, expected):
+    session = Session()
+    client = LogVarClient("https://logvar.test/token", session)
+    match = client.match(history(), movie=False, settings=SETTINGS)
+    session.comment_payload = payload
+    with pytest.raises(expected):
+        client.ensure_comments_available(match)
+    assert session.calls[-1][1].endswith("/api/v2/comment/71")
+    assert session.calls[-1][2]["params"] == {"format": "json"}
+
+
+def retry_manual_state(state):
+    plugin = RecentEpisodeMaintenance()
+    plugin.get_data = lambda _: deepcopy(state)
+    plugin.save_data = lambda _, value: state.update(deepcopy(value))
+    assert plugin._retry_attention_records() == 1
+
+
+def test_empty_source_stops_automatically_and_manual_retry_does_not_reset_evidence(tmp_path):
+    path = tmp_path / "video.mp4"
+    path.touch()
+    h = history(str(path))
+    key = MoviePilotReorganizer.processing_key(h)
+    state = {key: {"status": "complete"}}
+    run, jf = runner(path)
+    run.run([h], MoviePilotReorganizer, state, RunResult(operation_limit=1), 15, [])
+    node = state[key]["danmu"]
+    node["check_after"] = "2000-01-01T00:00:00"
+    DanmuMaintenance.confirm_due(state, logging.getLogger("test"), RunResult())
+    assert node["verify_comments"] and jf.writes == ["71"]
+    run.logvar.session.comment_payload = {"count": 0, "comments": []}
+    for number in (1, 2, 3):
+        node["check_after"] = "2000-01-01T00:00:00"
+        result = RunResult(operation_limit=1)
+        run.run([h], MoviePilotReorganizer, state, result, 15, [])
+        assert node["unavailable_count"] == number
+        assert node["status"] == ("retry" if number < 3 else "attention")
+        assert result.operations_used == result.danmu_submitted == 0
+    assert "已停止自动重试" in node["error"] and "返回 0 条" in node["error"]
+    before = len(run.logvar.session.calls)
+    run.run([h], MoviePilotReorganizer, state, RunResult(operation_limit=1), 15, [])
+    assert len(run.logvar.session.calls) == before
+    retry_manual_state(state)
+    node = state[key]["danmu"]
+    assert node["unavailable_count"] == 3 and node["verify_comments"]
+    assert node["manual_rechecks_remaining"] == 2
+    run.run([h], MoviePilotReorganizer, state, RunResult(operation_limit=1), 15, [])
+    assert node["status"] == "retry" and node["unavailable_count"] == 4
+    assert node["manual_rechecks_remaining"] == 1
+    node["check_after"] = "2000-01-01T00:00:00"
+    run.run([h], MoviePilotReorganizer, state, RunResult(operation_limit=1), 15, [])
+    assert node["status"] == "attention" and node["unavailable_count"] == 5
+    assert node["manual_rechecks_remaining"] == 0
+    assert jf.writes == ["71"]
+    retry_manual_state(state)
+    run.logvar.session.comment_payload = {"count": 1, "comments": [{"p": "1", "m": "available"}]}
+    run.run([h], MoviePilotReorganizer, state, RunResult(operation_limit=1), 15, [])
+    assert state[key]["danmu"]["status"] == "submitted"
+    assert state[key]["danmu"]["unavailable_count"] == 0
+    assert not state[key]["danmu"]["manual_recheck"]
+    assert "manual_rechecks_remaining" not in state[key]["danmu"]
+    assert jf.writes == ["71", "71"]
+
+
+def test_repeated_no_match_stops_and_survives_manual_reset(tmp_path):
+    path = tmp_path / "video.mp4"
+    path.touch()
+    h = history(str(path))
+    key = MoviePilotReorganizer.processing_key(h)
+    state = {key: {"status": "complete"}}
+    run, jf = runner(path)
+    run.logvar.session.match_override = {"isMatched": False}
+    for number in (1, 2, 3):
+        if number > 1:
+            state[key]["danmu"]["check_after"] = "2000-01-01T00:00:00"
+        run.run([h], MoviePilotReorganizer, state, RunResult(operation_limit=1), 15, [])
+    assert state[key]["danmu"]["status"] == "attention"
+    retry_manual_state(state)
+    run.run([h], MoviePilotReorganizer, state, RunResult(operation_limit=1), 15, [])
+    assert state[key]["danmu"]["status"] == "retry"
+    state[key]["danmu"]["check_after"] = "2000-01-01T00:00:00"
+    run.run([h], MoviePilotReorganizer, state, RunResult(operation_limit=1), 15, [])
+    assert state[key]["danmu"]["status"] == "attention"
+    assert state[key]["danmu"]["unavailable_count"] == 5
+    assert not jf.writes
+    assert not any("/comment/" in call[1] for call in run.logvar.session.calls)
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_old_missing_xml_attention_requires_probe_but_dry_run_does_not_download(tmp_path, dry_run):
+    path = tmp_path / "video.mp4"
+    path.touch()
+    h = history(str(path))
+    key = MoviePilotReorganizer.processing_key(h)
+    state = {key: {"status": "complete", "danmu": {
+        "status": "attention", "path": str(path), "attempts": 3, "error": "提交后未生成 XML",
+    }}}
+    retry_manual_state(state)
+    assert state[key]["danmu"]["verify_comments"]
+    run, jf = runner(path, dry_run=dry_run)
+    run.logvar.session.comment_payload = {"count": 0, "comments": []}
+    result = RunResult(operation_limit=1)
+    run.run([h], MoviePilotReorganizer, state, result, 15, [])
+    calls = [call for call in run.logvar.session.calls if "/comment/" in call[1]]
+    assert len(calls) == (0 if dry_run else 1)
+    assert not jf.writes and result.operations_used == 0
+    if not dry_run:
+        assert state[key]["danmu"]["status"] == "retry"
+        assert state[key]["danmu"]["unavailable_count"] == 1
+        assert state[key]["danmu"]["manual_rechecks_remaining"] == 1
+
+
+@pytest.mark.parametrize("failure", [requests.Timeout(), requests.HTTPError(response=SimpleNamespace(status_code=429))])
+def test_comment_network_failure_is_not_counted_as_empty(tmp_path, failure):
+    path = tmp_path / "video.mp4"
+    path.touch()
+    h = history(str(path))
+    key = MoviePilotReorganizer.processing_key(h)
+    state = {key: {"status": "complete", "danmu": {
+        "status": "ready", "path": str(path), "attempts": 0, "verify_comments": True,
+        "unavailable_count": 1,
+    }}}
+    run, jf = runner(path)
+    run.logvar.session.comment_failure = failure
+    run.run([h], MoviePilotReorganizer, state, RunResult(operation_limit=1), 15, [])
+    assert state[key]["danmu"]["status"] == "retry"
+    assert state[key]["danmu"]["unavailable_count"] == 1
+    assert "返回 0 条" not in state[key]["danmu"]["error"]
+    assert not jf.writes
+
+
+@pytest.mark.parametrize("limited", [False, True])
+def test_comment_checks_have_a_per_run_cap_and_failures_stop_batch(tmp_path, limited):
+    paths = [tmp_path / f"video-{index}.mp4" for index in range(5)]
+    for path in paths:
+        path.touch()
+    histories = [history(str(path), id=index + 1) for index, path in enumerate(paths)]
+    state = {MoviePilotReorganizer.processing_key(h): {"status": "complete", "danmu": {
+        "status": "ready", "path": h.dest, "attempts": 0, "verify_comments": True,
+    }} for h in histories}
+    run, jf = runner(paths[0])
+    jf.match_recent_media = lambda targets, *_: {
+        JellyfinServiceClient.path_key(target.path): [EpisodeItem(target.path, path=target.path)]
+        for target in targets
+    }
+    jf.danmu_item = lambda path: {"Id": path, "Type": "Episode", "Path": path,
+                                "ProviderIds": {}, "ParentIndexNumber": 1, "IndexNumber": 7}
+    if limited:
+        run.logvar.session.comment_failure = requests.HTTPError(response=SimpleNamespace(status_code=429))
+    else:
+        run.logvar.session.comment_payload = {"count": 0, "comments": []}
+    result = RunResult(operation_limit=10 if limited else 2)
+    run.run(histories, MoviePilotReorganizer, state, result, 15, [])
+    assert sum("/comment/" in call[1] for call in run.logvar.session.calls) == (3 if limited else 2)
+    assert not jf.writes and result.operations_used == 0
+    assert ("本轮暂停" in result.summary()) == limited
+    nodes = [state[MoviePilotReorganizer.processing_key(h)]["danmu"] for h in histories]
+    if limited:
+        assert all(not node.get("unavailable_count") for node in nodes)
+    else:
+        assert [node.get("unavailable_count", 0) for node in nodes] == [1, 1, 0, 0, 0]
+
+
+@pytest.mark.parametrize("uncertain", [False, True])
+def test_submission_failure_classification_keeps_concrete_safe_error(tmp_path, caplog, uncertain):
+    path = tmp_path / "video.mp4"
+    path.touch()
+    h = history(str(path))
+    key = MoviePilotReorganizer.processing_key(h)
+    run, jf = runner(path)
+    calls = []
+
+    def fail_write(dto, provider_value):
+        calls.append(provider_value)
+        raise DanmuSubmissionError(
+            "HTTP 500 Trickplay https://server.test/api?api_key=private-token",
+            uncertain=uncertain,
+        )
+
+    jf.set_danmu_id = fail_write
+    state = {}
+    result = RunResult(operation_limit=1)
+    with caplog.at_level(logging.INFO, logger="test"):
+        run.run([h], MoviePilotReorganizer, state, result, 15, [])
+    node = state[key]["danmu"]
+    assert node["status"] == ("submitted" if uncertain else "retry")
+    assert node["attempts"] == 1
+    assert "HTTP 500 Trickplay" in node["error"]
+    assert "private-token" not in str(state) + caplog.text + str(result.errors)
+    assert ("单项弹幕补全等待确认" in caplog.text) == uncertain
+    assert result.failed == 1 and result.danmu_submitted == 0
+    assert result.operations_used == 1
+    run.run([h], MoviePilotReorganizer, state, RunResult(operation_limit=1), 15, [])
+    assert len(calls) == 1
+    if uncertain:
+        node["check_after"] = "2000-01-01T00:00:00"
+        DanmuMaintenance.confirm_due(state, logging.getLogger("test"), RunResult())
+        assert node["status"] == "retry"
+        assert "HTTP 500 Trickplay" in node["error"]
+        assert len(calls) == 1
+
+
+@pytest.mark.parametrize("status,expected_requests", [(500, 3), (401, 1)])
+def test_jellyfin_submission_failures_pause_batch_without_penalizing_unrequested(tmp_path, status, expected_requests):
+    paths = [tmp_path / f"video-{index}.mp4" for index in range(5)]
+    for path in paths:
+        path.touch()
+    histories = [history(str(path), id=index + 1) for index, path in enumerate(paths)]
+    run, jf = runner(paths[0])
+    jf.match_recent_media = lambda targets, *_: {
+        JellyfinServiceClient.path_key(target.path): [EpisodeItem(target.path, path=target.path)]
+        for target in targets
+    }
+    jf.danmu_item = lambda item_id: {
+        "Id": item_id, "Type": "Episode", "Path": item_id, "Name": "正确标题",
+        "ProviderIds": {}, "ParentIndexNumber": 1, "IndexNumber": 7,
+    }
+    calls = []
+    response = requests.Response()
+    response.status_code = status
+
+    def fail_write(dto, provider_value):
+        calls.append(dto["Path"])
+        cause = requests.HTTPError(f"HTTP {status}", response=response)
+        raise DanmuSubmissionError(f"写入失败：HTTP {status}", uncertain=False, cause=cause)
+
+    jf.set_danmu_id = fail_write
+    state = {}
+    result = RunResult(operation_limit=10)
+    run.run(histories, MoviePilotReorganizer, state, result, 15, [])
+    assert len(calls) == result.operations_used == expected_requests
+    assert result.danmu_submitted == 0
+    for index, h in enumerate(histories):
+        node = state[MoviePilotReorganizer.processing_key(h)]["danmu"]
+        assert node["status"] == "retry"
+        assert node["attempts"] == (1 if index < expected_requests else 0)
+        assert not DanmuMaintenance.due(node)
+    assert any("暂停后续弹幕请求" in error for error in result.errors)
+
+
+@pytest.mark.parametrize("message", [
+    "HTTP 500 https://server.test/token-secret/api",
+    "api_key=token-secret token:token-secret access_token=token-secret",
+    "Authorization: Bearer token-secret",
+    "Authorization: Basic token-secret",
+])
+def test_submission_error_redacts_urls_and_credentials(message):
+    assert "token-secret" not in safe_error(RuntimeError(message))
 
 
 def test_cross_season_preview_logs_mapping_without_metadata_write(tmp_path, caplog):

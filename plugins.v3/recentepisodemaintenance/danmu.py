@@ -11,12 +11,16 @@ from xml.etree import ElementTree
 
 import requests
 
-from .jellyfin_client import JellyfinServiceClient
+from .jellyfin_client import DanmuSubmissionError, JellyfinServiceClient
 from .models import EpisodeTarget, RunResult
 
 
 class DanmuMatchError(ValueError):
     """An ambiguous or incompatible match must not be automatically applied."""
+
+
+class DanmuUnavailableError(RuntimeError):
+    """A successful service response explicitly has no match or no comments."""
 
 
 class LogVarRequestError(RuntimeError):
@@ -28,7 +32,10 @@ class LogVarRequestError(RuntimeError):
 
 
 def safe_error(error: Exception) -> str:
-    return re.sub(r"https?://[^\s]+", "[地址已隐藏]", str(error))
+    message = re.sub(r"https?://[^\s]+", "[地址已隐藏]", str(error))
+    message = re.sub(r"\b(Bearer|Basic)\s+[^\s,;'\"]+", r"\1 [已隐藏]", message, flags=re.I)
+    return re.sub(r"\b(api_key|apikey|access_token|token|authorization)\s*[:=]\s*[^\s,;'\"]+",
+                  r"\1=[已隐藏]", message, flags=re.I)
 
 
 def api_base(value: str) -> str:
@@ -124,7 +131,7 @@ class LogVarClient:
         query = (f"{title} ({year})" if year else title) if movie else f"{title} {season_text}{episode_text}"
         payload = self._request("POST", "/api/v2/match", json={"fileName": query})
         if payload.get("isMatched") is False:
-            raise RuntimeError(f"LogVar 尚未匹配到目标媒体｜查询：{query}")
+            raise DanmuUnavailableError(f"LogVar 尚未匹配到目标媒体｜查询：{query}")
         if payload.get("isMatched") is not True:
             raise DanmuMatchError(f"LogVar 未明确返回匹配成功，未提交下载｜查询：{query}")
         matches = payload.get("matches")
@@ -195,9 +202,25 @@ class LogVarClient:
                           str(bangumi.get("animeTitle") or candidate.get("animeTitle") or "未提供作品名"),
                           str(selected[0].get("episodeTitle") or candidate.get("episodeTitle") or "未提供分集名"), query)
 
+    def ensure_comments_available(self, match: DanmuMatch) -> None:
+        payload = self._request("GET", "/api/v2/comment/" + quote(match.episode_id, safe=""),
+                                params={"format": "json"})
+        comments = payload.get("comments")
+        count = payload.get("count")
+        if not isinstance(comments, list) or (count is not None and (
+                isinstance(count, bool) or not isinstance(count, int) or count != len(comments))):
+            raise LogVarRequestError("LogVar 弹幕内容或数量格式异常，不能判定为无弹幕", stop_immediately=True)
+        if not comments:
+            raise DanmuUnavailableError(
+                f"LogVar 已匹配到媒体，但当前来源返回 0 条弹幕｜查询：{match.query}"
+                f"｜来源：{match.anime_title} / {match.episode_title}"
+            )
+
 
 class DanmuMaintenance:
     MAX_ATTEMPTS = 3
+    MAX_UNAVAILABLE_RESULTS = 3
+    MANUAL_UNAVAILABLE_RESULTS = 2
     CONFIRM_MINUTES = 10
     RETRY_MINUTES = 60
     AUTO_DOWNLOAD_GRACE_MINUTES = 30
@@ -303,7 +326,10 @@ class DanmuMaintenance:
                 self._fail(node, "已有 XML 但内容无效或 ASS 未生成；保留原文件，不覆盖下载", terminal=True)
                 continue
             if node.get("status") == "submitted":
-                self._fail(node, "提交后未生成 XML，稍后有限次重试")
+                node["verify_comments"] = True
+                previous_error = node.get("error")
+                detail = f"提交后未生成 XML；上次请求：{previous_error}" if previous_error else "提交后未生成 XML，稍后有限次重试"
+                self._fail(node, detail)
                 self.logger.warning(f"[最近媒体维护] 弹幕确认失败：{path}；{node['error']}")
                 continue
             if to_ass and Path(path).with_suffix(".danmu.ass").exists():
@@ -327,9 +353,15 @@ class DanmuMaintenance:
             self._counts(state, result)
             return
         service_failures = 0
+        submission_failures = 0
+        availability_checks = 0
         for index, (history, key, path, node) in enumerate(candidates):
             if result.operations_used >= result.operation_limit:
                 break
+            verify_comments = bool(node.get("verify_comments") or int(node.get("unavailable_count", 0)) > 0)
+            if not self.dry_run and verify_comments and availability_checks >= max(result.operation_limit, 1):
+                node["check_after"] = self.after(self.RETRY_MINUTES)
+                continue
             try:
                 items = matches.get(JellyfinServiceClient.path_key(path)) or []
                 if len(items) != 1:
@@ -351,11 +383,19 @@ class DanmuMaintenance:
                         node["check_after"] = self.after(self.AUTO_DOWNLOAD_GRACE_MINUTES)
                         continue
                 match = self.logvar.match(history, movie=dto["Type"] == "Movie", settings=settings)
-                service_failures = 0
                 if self.dry_run:
+                    service_failures = 0
                     result.danmu_previewed += 1
                     self.logger.info(f"[最近媒体维护] 弹幕试运行：{match.query} → {match.anime_title} / {match.episode_title}；分集 ID：{match.episode_id}；未写入关联或下载")
                     continue
+                # Only failed downloads need a content probe; normal first submissions stay cheap.
+                if verify_comments:
+                    availability_checks += 1
+                    self.logvar.ensure_comments_available(match)
+                    node["unavailable_count"] = 0
+                    node["manual_recheck"] = False
+                    node.pop("manual_rechecks_remaining", None)
+                service_failures = 0
                 self.logger.info(f"[最近媒体维护] 弹幕匹配：{match.query} → {match.anime_title} / {match.episode_title}；分集 ID：{match.episode_id}")
                 # Checkpoint before the external operation; interruptions resume file confirmation.
                 node.update(status="submitted", attempts=int(node.get("attempts", 0)) + 1,
@@ -370,6 +410,7 @@ class DanmuMaintenance:
                     self._fail(node, "其他任务已生成弹幕文件，保留已有文件", terminal=True)
                     continue
                 result.operations_used += 1
+                pause_submissions = False
                 try:
                     if dto["ProviderIds"].get("DanmuID") == f"danmuapi:{match.provider_value}":
                         self.jellyfin.request_danmu(media.item_id)
@@ -378,18 +419,59 @@ class DanmuMaintenance:
                         if not (settings.get("DownloadOption") or {}).get("EnableAutoDownload"):
                             self.jellyfin.request_danmu(media.item_id)
                     result.danmu_submitted += 1
-                except Exception:
-                    # A timeout may occur after a successful write: do not immediately re-submit.
-                    node["error"] = "弹幕请求结果未确认，将先检查文件再决定是否重试"
+                    submission_failures = 0
+                except Exception as err:
+                    submission_failures += 1
+                    rejected = isinstance(err, DanmuSubmissionError) and not err.uncertain
+                    detail = safe_error(err)
+                    if rejected:
+                        self._fail(node, f"弹幕提交失败：{detail}")
+                    else:
+                        # An unacknowledged write/queue request must first confirm files.
+                        node["error"] = f"弹幕请求结果未确认，将先检查文件再决定是否重试：{detail}"
+                    result.add_error(f"弹幕补全 {reorganizer.display_name(history)}：{node['error']}", path)
                     self.logger.warning(f"[最近媒体维护] {node['error']}｜文件：{path}")
+                    pause_submissions = (
+                        getattr(err, "status_code", None) in {400, 401, 403, 404, 405, 422}
+                        or submission_failures >= self.MAX_SERVICE_FAILURES
+                    )
+                    if pause_submissions:
+                        message = f"Jellyfin 弹幕提交失败，本轮暂停后续弹幕请求，约 {self.RETRY_MINUTES} 分钟后重试；未请求的媒体不计失败次数"
+                        for _, _, _, waiting in candidates[index + 1:]:
+                            waiting.update(status="retry", check_after=self.after(self.RETRY_MINUTES),
+                                           error="Jellyfin 弹幕提交暂不可用，本轮尚未请求")
+                        self.logger.warning(f"[最近媒体维护] {message}")
+                        result.add_error(message)
                 if not self.checkpoint(state):
                     result.add_error("弹幕提交后的状态保存失败，停止提交")
                     break
-                self.logger.info(f"[最近媒体维护] 单项弹幕补全等待确认：{reorganizer.display_name(history)}；{self.CONFIRM_MINUTES} 分钟后确认 XML{' 和 ASS' if to_ass else ''}｜文件：{path}")
+                if node["status"] == "submitted":
+                    self.logger.info(f"[最近媒体维护] 单项弹幕补全等待确认：{reorganizer.display_name(history)}；{self.CONFIRM_MINUTES} 分钟后确认 XML{' 和 ASS' if to_ass else ''}｜文件：{path}")
+                if pause_submissions:
+                    break
             except Exception as err:
                 node["attempts"] = int(node.get("attempts", 0)) + 1
-                self._fail(node, safe_error(err), terminal=isinstance(err, (DanmuMatchError, ValueError)))
-                result.add_error(f"弹幕补全 {reorganizer.display_name(history)}：{safe_error(err)}", path)
+                detail = safe_error(err)
+                if isinstance(err, DanmuUnavailableError):
+                    node["verify_comments"] = True
+                    node["unavailable_count"] = int(node.get("unavailable_count", 0)) + 1
+                    if node.get("manual_recheck"):
+                        remaining = max(int(node.get("manual_rechecks_remaining", self.MANUAL_UNAVAILABLE_RESULTS)) - 1, 0)
+                        node["manual_rechecks_remaining"] = remaining
+                        stopped = remaining == 0
+                    else:
+                        stopped = node["unavailable_count"] >= self.MAX_UNAVAILABLE_RESULTS
+                    detail += f"；累计确认无匹配或无弹幕 {node['unavailable_count']} 次"
+                    if node.get("manual_recheck"):
+                        detail += f"；本次手动复核剩余 {remaining} 次"
+                    detail += "，已停止自动重试；手动重新处理仅复核可用性" if stopped else "，稍后复核可用性，暂不请求 Jellyfin 下载"
+                    # Availability confirmations have their own budget, separate from download attempts.
+                    node.update(error=detail, status="attention" if stopped else "retry",
+                                check_after=self.after(self.RETRY_MINUTES))
+                    self.logger.warning(f"[最近媒体维护] 弹幕暂不可用 {reorganizer.display_name(history)}：{detail}｜文件：{path}")
+                else:
+                    self._fail(node, detail, terminal=isinstance(err, (DanmuMatchError, ValueError)))
+                result.add_error(f"弹幕补全 {reorganizer.display_name(history)}：{detail}", path)
                 if isinstance(err, LogVarRequestError):
                     service_failures += 1
                     if err.stop_immediately or service_failures >= self.MAX_SERVICE_FAILURES:
@@ -436,8 +518,11 @@ class DanmuMaintenance:
                     else:
                         node.update(status="attention", error="XML 无效或 ASS 未生成；保留 XML，不覆盖下载")
                 else:
+                    node["verify_comments"] = True
+                    previous_error = node.get("error")
+                    detail = f"提交后未生成 XML；上次请求：{previous_error}" if previous_error else "提交后未生成 XML"
                     node.update(status="attention" if int(node.get("attempts", 0)) >= cls.MAX_ATTEMPTS else "retry",
-                                error="提交后未生成 XML", check_after=cls.after(cls.RETRY_MINUTES))
+                                error=detail, check_after=cls.after(cls.RETRY_MINUTES))
                     logger.warning(f"[最近媒体维护] 弹幕确认失败：{path}；{node['error']}")
             except OSError:
                 node["attempts"] = int(node.get("attempts", 0)) + 1

@@ -14,9 +14,30 @@ from .models import EpisodeItem, EpisodeTarget
 logger = logging.getLogger(__name__)
 
 
+class DanmuSubmissionError(RuntimeError):
+    """Distinguish rejected operations from writes or queue requests with unknown results."""
+
+    def __init__(self, message: str, *, uncertain: bool, cause: Exception | None = None):
+        super().__init__(message)
+        self.uncertain = uncertain
+        status = getattr(getattr(cause, "response", None), "status_code", None)
+        self.status_code = status if isinstance(status, int) else None
+
+
 class JellyfinServiceClient:
     _REQUEST_ATTEMPTS = 3
     _REQUEST_RETRY_DELAY_SECONDS = 30
+    # Movie/Episode fields consumed by Jellyfin's ItemUpdateController, plus identity.
+    _DANMU_EDIT_FIELDS = frozenset({
+        "Id", "Type", "Path", "Name", "ForcedSortName", "OriginalTitle",
+        "CriticRating", "CommunityRating", "IndexNumber", "ParentIndexNumber",
+        "Overview", "Genres", "AirsAfterSeasonNumber", "AirsBeforeEpisodeNumber",
+        "AirsBeforeSeasonNumber", "Taglines", "Studios", "DateCreated", "EndDate",
+        "PremiereDate", "ProductionYear", "OfficialRating", "CustomRating", "Tags",
+        "ProductionLocations", "PreferredMetadataCountryCode", "PreferredMetadataLanguage",
+        "DisplayOrder", "AspectRatio", "LockData", "LockedFields", "ProviderIds",
+        "Video3DFormat", "People",
+    })
 
     def __init__(self, service: Any):
         self.service = service
@@ -508,7 +529,7 @@ class JellyfinServiceClient:
         return settings
 
     def danmu_item(self, item_id: str) -> dict[str, Any]:
-        # The single-item endpoint returns the editable DTO, not the limited list projection.
+        # Read the single-item DTO, then project its editable fields before posting.
         item = self._get_json(f"Items/{item_id}", {"userId": "[USER]"})
         if not isinstance(item, dict) or str(item.get("Id", "")) != item_id:
             raise RuntimeError("未获取到完整 Jellyfin 媒体条目")
@@ -532,22 +553,66 @@ class JellyfinServiceClient:
             self._danmu_supported_types = supported | {item["Type"]}
         return item
 
+    @classmethod
+    def _danmu_edit_payload(cls, item: dict[str, Any]) -> dict[str, Any]:
+        payload = {key: deepcopy(value) for key, value in item.items() if key in cls._DANMU_EDIT_FIELDS}
+        if isinstance(payload.get("People"), list):
+            payload["People"] = [
+                {key: value for key, value in person.items() if key in {"Name", "Role", "Type"}}
+                for person in payload["People"]
+            ]
+        if isinstance(payload.get("Studios"), list):
+            payload["Studios"] = [{"Name": studio["Name"]} for studio in payload["Studios"]]
+        return payload
+
     def set_danmu_id(self, item: dict[str, Any], provider_value: str) -> None:
-        current = self.danmu_item(str(item["Id"]))
-        if current != item:
-            raise RuntimeError("Jellyfin 元数据已发生变化，本轮不写入弹幕关联")
-        payload = deepcopy(current)
-        payload["ProviderIds"]["DanmuID"] = f"danmuapi:{provider_value}"
-        # Re-post the complete editable DTO; a ProviderIds-only body clears other metadata.
-        response = self.service.post_data(
-            self._url(f"Items/{item['Id']}"),
-            data=json.dumps(payload, ensure_ascii=False),
-            headers={"Content-Type": "application/json"},
-        )
-        self._json(response)
+        try:
+            current = self.danmu_item(str(item["Id"]))
+            payload = self._danmu_edit_payload(current)
+        except Exception as err:
+            raise DanmuSubmissionError(f"弹幕关联写入前检查失败，尚未提交：{err}", uncertain=False, cause=err) from err
+        if payload != self._danmu_edit_payload(item):
+            raise DanmuSubmissionError("Jellyfin 可编辑元数据已发生变化，本轮未写入弹幕关联", uncertain=False)
+        provider_id = f"danmuapi:{provider_value}"
+        payload["ProviderIds"]["DanmuID"] = provider_id
+        # Preserve editable metadata, never send display-only Trickplay/MediaSources/UserData.
+        try:
+            response = self.service.post_data(
+                self._url(f"Items/{item['Id']}"),
+                data=json.dumps(payload, ensure_ascii=False),
+                headers={"Content-Type": "application/json"},
+            )
+            self._json(response)
+        except Exception as err:
+            status = getattr(getattr(err, "response", None), "status_code", None)
+            if isinstance(status, int) and 400 <= status < 500 and status != 408:
+                raise DanmuSubmissionError(f"写入弹幕关联被拒绝：{err}", uncertain=False, cause=err) from err
+            # Server errors may occur before or after saving; one read avoids blind re-posting.
+            try:
+                saved = self._get_json(f"Items/{item['Id']}", {"userId": "[USER]"}, retry=False)
+            except Exception:
+                saved = None
+            readable = isinstance(saved, dict) and str(saved.get("Id")) == str(item["Id"]) and isinstance(saved.get("ProviderIds"), dict)
+            if readable and saved["ProviderIds"].get("DanmuID") != provider_id and isinstance(status, int) and status != 408:
+                raise DanmuSubmissionError(f"写入弹幕关联失败，回读未发现目标 DanmuID：{err}", uncertain=False, cause=err) from err
+            if readable and saved["ProviderIds"].get("DanmuID") == provider_id:
+                detail = "回读已发现目标 DanmuID，下载结果仍待确认"
+            elif readable:
+                # A timed-out request can still be running after this read returns.
+                detail = "回读暂未发现目标 DanmuID，请求是否完成仍待确认"
+            else:
+                detail = "无法回读确认写入结果"
+            raise DanmuSubmissionError(f"写入弹幕关联请求异常，{detail}：{err}", uncertain=True, cause=err) from err
 
     def request_danmu(self, item_id: str) -> None:
         # Used when the correct ID already exists and no metadata change is necessary.
-        response = self._get_json(f"api/danmu/{item_id}/refresh", retry=False)
+        try:
+            response = self._get_json(f"api/danmu/{item_id}/refresh", retry=False)
+        except Exception as err:
+            status = getattr(getattr(err, "response", None), "status_code", None)
+            rejected = isinstance(status, int) and 400 <= status < 500 and status != 408
+            raise DanmuSubmissionError(f"单项弹幕刷新请求失败：{err}", uncertain=not rejected, cause=err) from err
         if isinstance(response, dict) and response.get("success") is False:
-            raise RuntimeError("Danmu 插件未接受单项刷新请求")
+            raise DanmuSubmissionError("Danmu 插件未接受单项刷新请求", uncertain=False)
+        if not isinstance(response, dict) or response.get("success") is not True:
+            raise DanmuSubmissionError("Danmu 插件未返回有效的单项刷新队列确认", uncertain=True)
