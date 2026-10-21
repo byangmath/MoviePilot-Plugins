@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import re
+from threading import Lock
 from typing import Any, Callable
 from urllib.parse import quote, urlsplit, urlunsplit
 import unicodedata
@@ -14,6 +15,8 @@ import requests
 from .jellyfin_client import DanmuSubmissionError, JellyfinServiceClient
 from .models import EpisodeTarget, RunResult
 
+_RATE_LOCK = Lock()
+
 
 class DanmuMatchError(ValueError):
     """An ambiguous or incompatible match must not be automatically applied."""
@@ -23,12 +26,112 @@ class DanmuUnavailableError(RuntimeError):
     """A successful service response explicitly has no match or no comments."""
 
 
+class DanmuRateStateError(RuntimeError):
+    """Do not send requests when the durable rate window cannot be saved."""
+
+
+class DanmuRequestLimiter:
+    WINDOW_SECONDS = 61
+    SPACING_SECONDS = 21
+    CAPACITY = 3
+
+    def __init__(self, load: Callable[[], Any], save: Callable[[dict[str, Any]], Any],
+                 now: Callable[[], datetime] = datetime.now):
+        self.load, self.save, self.now = load, save, now
+        self.state: dict[str, Any] | None = None
+
+    def _state(self) -> dict[str, Any]:
+        if self.state is None:
+            try:
+                value = self.load()
+                if value is not None and not isinstance(value, dict):
+                    raise ValueError("invalid rate state")
+                self.state = dict(value or {})
+            except Exception as err:
+                raise DanmuRateStateError("读取弹幕限流状态失败，停止提交") from err
+        return self.state
+
+    def _save(self) -> None:
+        try:
+            if self.save(self._state()) is False:
+                raise ValueError("rate state not saved")
+        except Exception as err:
+            raise DanmuRateStateError("保存弹幕限流状态失败，停止提交") from err
+
+    def reserve(self, cost: int = 1, *, commit: bool = True) -> str | None:
+        with _RATE_LOCK:
+            self.state = None
+            return self._reserve(cost, commit=commit)
+
+    def _reserve(self, cost: int, *, commit: bool) -> str | None:
+        state, now = self._state(), self.now()
+        try:
+            if not 1 <= cost <= self.CAPACITY:
+                raise ValueError("invalid request cost")
+            events = [(datetime.fromisoformat(e["at"]), int(e["cost"]))
+                      for e in state.get("events", [])]
+            if any(not 1 <= cost <= self.CAPACITY for _, cost in events):
+                raise ValueError("invalid request cost")
+            events = sorted((at, weight) for at, weight in events
+                            if at > now - timedelta(seconds=self.WINDOW_SECONDS))
+            allowed = now
+            if state.get("cooldown_until"):
+                allowed = max(allowed, datetime.fromisoformat(state["cooldown_until"]))
+            if events:
+                allowed = max(allowed, events[-1][0] + timedelta(seconds=self.SPACING_SECONDS))
+            total = sum(weight for _, weight in events)
+            for at, weight in events:
+                if total + cost <= self.CAPACITY:
+                    break
+                allowed = max(allowed, at + timedelta(seconds=self.WINDOW_SECONDS))
+                total -= weight
+        except (KeyError, TypeError, ValueError) as err:
+            raise DanmuRateStateError("弹幕限流状态无效，停止提交") from err
+        if allowed > now:
+            return allowed.isoformat(timespec="seconds")
+        if not commit:
+            return None
+        state["events"] = [{"at": at.isoformat(), "cost": weight} for at, weight in events]
+        state["events"].append({"at": now.isoformat(), "cost": cost})
+        self._save()
+        return None
+
+    def succeeded(self) -> None:
+        with _RATE_LOCK:
+            self.state = None
+            state = self._state()
+            if state.get("failures") or state.get("cooldown_until") or state.get("events"):
+                self._finish_reservation(state)
+                state.update(failures=0, cooldown_until=None)
+                self._save()
+
+    def _finish_reservation(self, state: dict[str, Any]) -> None:
+        # Keep slow matching/download submissions from releasing their slot too early.
+        if state.get("events"):
+            state["events"] = [dict(event) for event in state["events"]]
+            state["events"][-1]["at"] = self.now().isoformat()
+
+    def failed(self, immediate: bool = False) -> None:
+        with _RATE_LOCK:
+            self.state = None
+            state = self._state()
+            self._finish_reservation(state)
+            try:
+                state["failures"] = int(state.get("failures", 0)) + 1
+            except (TypeError, ValueError) as err:
+                raise DanmuRateStateError("弹幕限流状态无效，停止提交") from err
+            if immediate or state["failures"] >= 3:
+                state["cooldown_until"] = (self.now() + timedelta(minutes=60)).isoformat(timespec="seconds")
+            self._save()
+
+
 class LogVarRequestError(RuntimeError):
     """Safe service failure text, without leaking the token-bearing request URL."""
 
-    def __init__(self, message: str, *, stop_immediately: bool = False):
+    def __init__(self, message: str, *, stop_immediately: bool = False, rate_limited: bool = False):
         super().__init__(message)
         self.stop_immediately = stop_immediately
+        self.rate_limited = rate_limited
 
 
 def safe_error(error: Exception) -> str:
@@ -107,7 +210,7 @@ class LogVarClient:
             hint = "，请检查 Token 或访问权限" if status in {401, 403} else ""
             raise LogVarRequestError(
                 f"LogVar 请求失败（HTTP {status or '请求异常'}）{hint}",
-                stop_immediately=not transient,
+                stop_immediately=not transient, rate_limited=status == 429,
             ) from None
         try:
             payload = response.json()
@@ -225,14 +328,17 @@ class DanmuMaintenance:
     RETRY_MINUTES = 60
     AUTO_DOWNLOAD_GRACE_MINUTES = 30
     MAX_SERVICE_FAILURES = 3
+    COMPLETE_RECHECK_MINUTES = 24 * 60
 
     def __init__(self, jellyfin: JellyfinServiceClient, logvar: LogVarClient, logger: Any,
-                 checkpoint: Callable[[dict[str, Any]], bool], dry_run: bool):
+                 checkpoint: Callable[[dict[str, Any]], bool], dry_run: bool,
+                 limiter: DanmuRequestLimiter | None = None):
         self.jellyfin = jellyfin
         self.logvar = logvar
         self.logger = logger
         self.checkpoint = checkpoint
         self.dry_run = dry_run
+        self.limiter = limiter
 
     @staticmethod
     def due(node: dict[str, Any]) -> bool:
@@ -285,6 +391,13 @@ class DanmuMaintenance:
             path = str(reorganizer.target_path(history) or "")
             if not path or item.get("status") in blocked or any(item.get(flag) for flag in ("scan_pending", "sidecar_pending", "cleanup_pending", "operation_intent")):
                 continue
+            node = item.get("danmu") or {}
+            if node.get("status") == "complete":
+                try:
+                    if datetime.fromisoformat(node["check_after"]) > datetime.now():
+                        continue
+                except (KeyError, TypeError, ValueError):
+                    pass
             # A preview path does not prove that the video was actually renamed.
             if not Path(path).is_file() and int(item.get("rename_attempts") or 0) > 0:
                 renamed_path = str(item.get("expected_path") or "")
@@ -316,7 +429,9 @@ class DanmuMaintenance:
                 if node.get("status") == "submitted":
                     result.danmu_completed.append(path)
                     self.logger.info(f"[最近媒体维护] 弹幕补全完成：{path}")
-                node.update(status="complete", error="")
+                node.update(status="complete", error="", unavailable_count=0,
+                            unavailable=False,
+                            check_after=self.after(self.COMPLETE_RECHECK_MINUTES))
                 continue
             if Path(path).with_suffix(".xml").exists():
                 if node.get("status") == "submitted" and xml_ready and int(node.get("confirmations", 0)) < 2:
@@ -342,6 +457,24 @@ class DanmuMaintenance:
         if not candidates:
             self._counts(state, result)
             return
+        if self.limiter and not self.dry_run:
+            # One dispatch per tick; deferred work resumes without a full media run.
+            first = candidates[0][3]
+            cost = 2 if first.get("verify_comments") or first.get("unavailable_count") else 1
+            try:
+                wait_until = self.limiter.reserve(cost, commit=False)
+            except DanmuRateStateError as err:
+                result.add_error(str(err))
+                self.logger.error(f"[最近媒体维护] {err}")
+                self._counts(state, result)
+                return
+            for _, _, _, waiting in candidates[1:] if not wait_until else candidates:
+                waiting.update(check_after=wait_until or (datetime.now() + timedelta(seconds=self.limiter.SPACING_SECONDS)).isoformat(timespec="seconds"),
+                               dispatch_pending=True)
+            if wait_until:
+                self._counts(state, result)
+                return
+            candidates = candidates[:1]
         targets = [EpisodeTarget(path, reorganizer.media_type(history)) for history, _, path, _ in candidates]
         try:
             matches = self.jellyfin.match_recent_media(targets, days, library_ids)
@@ -363,6 +496,12 @@ class DanmuMaintenance:
                 node["check_after"] = self.after(self.RETRY_MINUTES)
                 continue
             try:
+                if self.limiter and not self.dry_run:
+                    wait_until = self.limiter.reserve(2 if verify_comments else 1)
+                    if wait_until:
+                        node.update(check_after=wait_until, dispatch_pending=True)
+                        continue
+                node.pop("dispatch_pending", None)
                 items = matches.get(JellyfinServiceClient.path_key(path)) or []
                 if len(items) != 1:
                     raise RuntimeError("未在 Jellyfin 中唯一匹配到该视频")
@@ -393,6 +532,7 @@ class DanmuMaintenance:
                     availability_checks += 1
                     self.logvar.ensure_comments_available(match)
                     node["unavailable_count"] = 0
+                    node["unavailable"] = False
                     node["manual_recheck"] = False
                     node.pop("manual_rechecks_remaining", None)
                 service_failures = 0
@@ -419,9 +559,15 @@ class DanmuMaintenance:
                         if not (settings.get("DownloadOption") or {}).get("EnableAutoDownload"):
                             self.jellyfin.request_danmu(media.item_id)
                     result.danmu_submitted += 1
+                    if self.limiter:
+                        self.limiter.succeeded()
                     submission_failures = 0
                 except Exception as err:
+                    if isinstance(err, DanmuRateStateError):
+                        raise
                     submission_failures += 1
+                    if self.limiter:
+                        self.limiter.failed(getattr(err, "status_code", None) in {400, 401, 403, 404, 405, 422, 429})
                     rejected = isinstance(err, DanmuSubmissionError) and not err.uncertain
                     detail = safe_error(err)
                     if rejected:
@@ -450,9 +596,15 @@ class DanmuMaintenance:
                 if pause_submissions:
                     break
             except Exception as err:
+                if isinstance(err, DanmuRateStateError):
+                    result.add_error(str(err))
+                    self.logger.error(f"[最近媒体维护] {err}")
+                    break
                 node["attempts"] = int(node.get("attempts", 0)) + 1
                 detail = safe_error(err)
                 if isinstance(err, DanmuUnavailableError):
+                    if self.limiter:
+                        self.limiter.succeeded()
                     node["verify_comments"] = True
                     node["unavailable_count"] = int(node.get("unavailable_count", 0)) + 1
                     if node.get("manual_recheck"):
@@ -467,12 +619,15 @@ class DanmuMaintenance:
                     detail += "，已停止自动重试；手动重新处理仅复核可用性" if stopped else "，稍后复核可用性，暂不请求 Jellyfin 下载"
                     # Availability confirmations have their own budget, separate from download attempts.
                     node.update(error=detail, status="attention" if stopped else "retry",
-                                check_after=self.after(self.RETRY_MINUTES))
+                                check_after=self.after(self.RETRY_MINUTES), unavailable=True)
+                    result.danmu_unavailable += 1
                     self.logger.warning(f"[最近媒体维护] 弹幕暂不可用 {reorganizer.display_name(history)}：{detail}｜文件：{path}")
                 else:
                     self._fail(node, detail, terminal=isinstance(err, (DanmuMatchError, ValueError)))
-                result.add_error(f"弹幕补全 {reorganizer.display_name(history)}：{detail}", path)
+                    result.add_error(f"弹幕补全 {reorganizer.display_name(history)}：{detail}", path)
                 if isinstance(err, LogVarRequestError):
+                    if self.limiter:
+                        self.limiter.failed(err.stop_immediately or err.rate_limited)
                     service_failures += 1
                     if err.stop_immediately or service_failures >= self.MAX_SERVICE_FAILURES:
                         reason = "服务地址或权限异常" if err.stop_immediately else f"连续 {service_failures} 次服务请求失败"
@@ -488,6 +643,7 @@ class DanmuMaintenance:
         self._counts(state, result)
 
     def _fail(self, node: dict[str, Any], message: str, terminal: bool = False) -> None:
+        node["unavailable"] = False
         node.update(error=message, status="attention" if terminal or int(node.get("attempts", 0)) >= self.MAX_ATTEMPTS else "retry",
                     check_after=self.after(self.RETRY_MINUTES))
 
@@ -508,7 +664,9 @@ class DanmuMaintenance:
                     continue
                 xml_ready, ass_ready = cls.files(path, bool(node.get("to_ass")))
                 if xml_ready and ass_ready:
-                    node.update(status="complete", error="")
+                    node.update(status="complete", error="", unavailable_count=0,
+                                unavailable=False,
+                                check_after=cls.after(cls.COMPLETE_RECHECK_MINUTES))
                     result.danmu_completed.append(path)
                     logger.info(f"[最近媒体维护] 弹幕补全完成：{path}")
                 elif Path(path).with_suffix(".xml").exists():
@@ -541,5 +699,6 @@ class DanmuMaintenance:
             node = item.get("danmu") or {}
             if node.get("status") == "attention":
                 text = f"{node.get('label', '媒体')}｜文件：{node.get('path', '未知')}｜原因：{node.get('error', '未知')}"
-                if text not in result.danmu_attention:
-                    result.danmu_attention.append(text)
+                items = result.danmu_unavailable_items if node.get("unavailable") else result.danmu_attention
+                if text not in items:
+                    items.append(text)

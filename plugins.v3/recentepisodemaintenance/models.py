@@ -269,8 +269,10 @@ class RunResult:
     danmu_previewed: int = 0
     danmu_submitted: int = 0
     danmu_waiting: int = 0
+    danmu_unavailable: int = 0
     danmu_completed: list[str] = field(default_factory=list)
     danmu_attention: list[str] = field(default_factory=list)
+    danmu_unavailable_items: list[str] = field(default_factory=list)
     _skipped_keys: set[str] = field(default_factory=set, repr=False)
 
     def add_error(self, message: str, file_path: str | Path | None = None) -> None:
@@ -323,12 +325,14 @@ class RunResult:
                 f"当前范围内已完成 {self.queue_counts.get('complete', 0)} 条，"
                 f"需人工检查 {self.queue_counts.get('attention', 0)} 条；"
                 f"弹幕等待处理 {self.danmu_waiting} 项，"
-                f"弹幕需人工检查 {len(self.danmu_attention)} 项"
+                f"弹幕需人工检查 {len(self.danmu_attention)} 项，"
+                f"弹幕无资源已暂停 {len(self.danmu_unavailable_items)} 项"
             )
-        elif self.danmu_waiting or self.danmu_attention:
+        elif self.danmu_waiting or self.danmu_attention or self.danmu_unavailable_items:
             lines.append(
                 f"当前状态：弹幕等待处理 {self.danmu_waiting} 项，"
-                f"弹幕需人工检查 {len(self.danmu_attention)} 项"
+                f"弹幕需人工检查 {len(self.danmu_attention)} 项，"
+                f"弹幕无资源已暂停 {len(self.danmu_unavailable_items)} 项"
             )
         lines.extend(
             [
@@ -336,7 +340,7 @@ class RunResult:
                 f"重新整理试运行预览 {self.previewed} 条，成功 {self.reorganized} 项；"
                 f"元数据刷新试运行预览 {self.refresh_previewed} 项，成功 {self.refreshed} 项；"
                 f"弹幕试运行预览 {self.danmu_previewed} 项，提交 {self.danmu_submitted} 项，"
-                f"确认完成 {len(self.danmu_completed)} 项",
+                f"确认完成 {len(self.danmu_completed)} 项，暂不可用 {self.danmu_unavailable} 项",
                 f"匹配结果：匹配到 Jellyfin 媒体 {self.refresh_candidates} 项，"
                 f"跳过 {self.skipped} 项，失败 {self.failed} 项",
             ]
@@ -356,6 +360,9 @@ class RunResult:
         if self.danmu_attention:
             lines.append("弹幕需人工检查：")
             lines.extend(f"- {item}" for item in self.danmu_attention)
+        if self.danmu_unavailable_items:
+            lines.append("弹幕暂无资源（已暂停自动重试）：")
+            lines.extend(f"- {item}" for item in self.danmu_unavailable_items)
         if self.errors:
             lines.append("失败详情：")
             lines.extend(f"- {item}" for item in self.errors[:10])

@@ -37,11 +37,12 @@ except Exception:
 from .jellyfin_client import JellyfinServiceClient
 from .models import EpisodeItem, RunResult
 from .reorganizer import MoviePilotReorganizer
-from .danmu import DanmuMaintenance, LogVarClient
+from .danmu import DanmuMaintenance, DanmuRequestLimiter, DanmuRateStateError, LogVarClient
 
 
 class RecentEpisodeMaintenance(_PluginBase):
     _PROCESSING_STATE_KEY = "processing_state_v1"
+    _DANMU_RATE_STATE_KEY = "danmu_request_window_v1"
     _STATE_PENDING_REFRESH = "pending_refresh"
     _STATE_PENDING_REORGANIZE = "pending_reorganize"
     _STATE_MONITORING = "monitoring"
@@ -108,7 +109,7 @@ class RecentEpisodeMaintenance(_PluginBase):
     plugin_name = "最近媒体维护"
     plugin_desc = "维护 MoviePilot 最近整理入库的 Jellyfin 电影和剧集"
     plugin_icon = "https://raw.githubusercontent.com/byangmath/MoviePilot-Plugins/main/icons/recentepisodemaintenance.png"
-    plugin_version = "1.0.3"
+    plugin_version = "1.0.4"
     plugin_author = "byangmath"
     author_url = "https://github.com/byangmath"
     plugin_config_prefix = "recentepisodemaintenance_"
@@ -202,6 +203,14 @@ class RecentEpisodeMaintenance(_PluginBase):
                 "func": self.run_due_follow_up,
                 "kwargs": {},
             })
+            if getattr(self, "_enable_danmu", False) and not self._dry_run:
+                services.append({
+                    "id": "RecentEpisodeMaintenanceDanmuQueue",
+                    "name": "最近媒体维护弹幕队列",
+                    "trigger": IntervalTrigger(seconds=DanmuRequestLimiter.SPACING_SECONDS),
+                    "func": self.run_danmu_queue,
+                    "kwargs": {},
+                })
         return services
 
     @staticmethod
@@ -377,11 +386,13 @@ class RecentEpisodeMaintenance(_PluginBase):
             self._run_active = False
             self._pending_run = False
 
-    def run_once(self):
+    def run_once(self, follow_up_only: bool = False):
         self._ensure_run_state()
 
         with self._run_state_lock:
             if self._run_active:
+                if follow_up_only:
+                    return
                 self._pending_run = True
                 logger.info(
                     "[最近媒体维护] 已有任务正在运行，本次触发已排队，"
@@ -392,7 +403,10 @@ class RecentEpisodeMaintenance(_PluginBase):
 
         while True:
             try:
-                self._run_once()
+                if follow_up_only:
+                    self._run_once(follow_up_only=True)
+                else:
+                    self._run_once()
             except Exception as err:
                 logger.exception(f"[最近媒体维护] 运行异常：{err}")
                 if self._notify:
@@ -416,6 +430,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                     self._run_active = False
                     return
                 self._pending_run = False
+                follow_up_only = False
 
             logger.info("[最近媒体维护] 上一轮已结束，开始执行排队任务")
 
@@ -452,12 +467,72 @@ class RecentEpisodeMaintenance(_PluginBase):
         except Exception as err:
             logger.error(f"[最近媒体维护] 检查延迟复查任务失败：{err}")
             return
-        if not self._has_due_follow_up(processing_state):
+        if not self._has_due_follow_up(processing_state, include_danmu=False):
             return
         logger.info("[最近媒体维护] 检测到已到期的延迟复查任务，开始运行")
-        self.run_once()
+        self.run_once(follow_up_only=True)
 
-    def _run_once(self):
+    def run_danmu_queue(self):
+        if not self._enabled or self._dry_run or not getattr(self, "_enable_danmu", False):
+            return
+        self._ensure_run_state()
+        with self._run_state_lock:
+            if self._run_active:
+                return
+            self._run_active = True
+        try:
+            state = self._load_processing_state()
+            queued = {
+                key: item for key, item in state.items()
+                if (item.get("danmu") or {}).get("status") in {"ready", "retry"}
+                and DanmuMaintenance.due(item.get("danmu") or {})
+                and item.get("status") not in {self._STATE_PENDING_REFRESH, self._STATE_PENDING_REORGANIZE, self._STATE_ATTENTION}
+                and not any(item.get(flag) for flag in ("scan_pending", "sidecar_pending", "cleanup_pending", "operation_intent"))
+            }
+            if not queued:
+                return
+            first = min(
+                queued.values(),
+                key=lambda item: str((item.get("danmu") or {}).get("check_after") or ""),
+            )["danmu"]
+            cost = 2 if first.get("verify_comments") or first.get("unavailable_count") else 1
+            wait_until = self._danmu_request_limiter().reserve(cost, commit=False)
+            if wait_until:
+                for item in queued.values():
+                    item["danmu"].update(check_after=wait_until, dispatch_pending=True)
+                self._checkpoint_processing_state(state)
+                return
+            ids = {int(item["history_id"]) for item in queued.values() if item.get("history_id")}
+            if not ids:
+                return
+            reorganizer = MoviePilotReorganizer(logger=logger, dry_run=False)
+            histories = reorganizer.histories_by_ids(ids)
+            present = {int(history.id) for history in histories}
+            for key, item in queued.items():
+                if int(item.get("history_id") or 0) in ids - present:
+                    state.pop(key, None)
+            result = RunResult(operation_limit=max(int(self._max_items), 1))
+            histories.sort(key=lambda history: str(
+                (state.get(reorganizer.processing_key(history), {}).get("danmu") or {}).get("check_after") or ""
+            ))
+            if histories:
+                self._maintain_danmu(histories[:1], reorganizer, state, result)
+            if result.operations_used or result.failed or result.danmu_unavailable or result.danmu_completed:
+                self._finish_run(result, state)
+            else:
+                self._checkpoint_processing_state(state)
+        except Exception as err:
+            from .danmu import safe_error
+            logger.error(f"[最近媒体维护] 弹幕队列检查失败：{safe_error(err)}")
+        finally:
+            with self._run_state_lock:
+                pending_run = self._pending_run
+                self._pending_run = False
+                self._run_active = False
+            if pending_run:
+                self.run_once()
+
+    def _run_once(self, follow_up_only: bool = False):
         operation_limit = max(int(self._max_items), 1)
         result = RunResult(operation_limit=operation_limit)
         if not self._enable_refresh and not self._enable_reorganize and not getattr(self, "_enable_danmu", False):
@@ -483,15 +558,27 @@ class RecentEpisodeMaintenance(_PluginBase):
             return
         try:
             stored_state = self._load_processing_state()
-            history_pool = reorganizer.recent_histories(
-                days=self._days,
-                tracked_history_ids=self._tracked_history_ids(stored_state),
-                preferred_history_ids=self._protected_history_ids(stored_state),
-            )
+            if follow_up_only:
+                ids = {
+                    int(item["history_id"]) for item in stored_state.values()
+                    if item.get("history_id")
+                    and self._has_due_follow_up({"item": item}, include_danmu=False)
+                }
+                history_pool = reorganizer.histories_by_ids(ids)
+                present = {int(history.id) for history in history_pool}
+                stored_state = {key: item for key, item in stored_state.items()
+                                if int(item.get("history_id") or 0) not in ids - present}
+            else:
+                history_pool = reorganizer.recent_histories(
+                    days=self._days,
+                    tracked_history_ids=self._tracked_history_ids(stored_state),
+                    preferred_history_ids=self._protected_history_ids(stored_state),
+                )
             histories, processing_state, selection = self._select_histories(
                 histories=history_pool,
                 reorganizer=reorganizer,
                 state=stored_state,
+                follow_up_only=follow_up_only,
             )
             result.reorganize_candidates = len(histories)
             result.history_details = {
@@ -520,7 +607,8 @@ class RecentEpisodeMaintenance(_PluginBase):
                 )
             }
             logger.info(
-                f"[最近媒体维护] 查询 MP 最近 {self._days} 天成功视频整理记录，"
+                ("[最近媒体维护] 按历史 ID 查询到期复查记录，" if follow_up_only else
+                 f"[最近媒体维护] 查询 MP 最近 {self._days} 天成功视频整理记录，") +
                 f"共 {len(history_pool)} 条；本轮最多执行 {operation_limit} 次操作，"
                 f"检查 {len(histories)} 条视频记录"
                 f"（待复查 {selection['pending']} 条，新记录 {selection['new']} 条，"
@@ -554,7 +642,8 @@ class RecentEpisodeMaintenance(_PluginBase):
                  else "[最近媒体维护] 当前时间范围内没有到期待处理的整理记录")
                 + waiting_text
             )
-            self._maintain_danmu(history_pool, reorganizer, processing_state, result)
+            if not follow_up_only:
+                self._maintain_danmu(history_pool, reorganizer, processing_state, result)
             self._finish_run(result, processing_state)
             return
 
@@ -1308,6 +1397,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                             sidecar_pending=False,
                             sidecar_attempts=sidecar_attempts,
                         )
+                        self._report_reorganized(processing_state[processing_key], expected_path, result)
                         logger.info(
                             f"[最近媒体维护] 刮削完成 {label}：重新整理附件已补齐｜"
                             f"文件：{Path(expected_path).name}"
@@ -1799,6 +1889,9 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 sidecar_attempts=next_sidecar_attempts,
                                 **cleanup_updates,
                             )
+                            if not sidecar_pending:
+                                processing_state[processing_key]["rename_report_pending"] = True
+                                processing_state[processing_key]["rename_reported"] = False
                             self._clear_operation_intent(
                                 processing_state,
                                 {processing_key},
@@ -1940,8 +2033,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                 attempts = int(item.get("attempts") or 1)
                 missing = missing_sidecars.get(processing_key)
                 if not missing:
-                    result.reorganized += 1
-                    result.add_reorganized_title(str(target or "未知文件"))
+                    self._report_reorganized(processing_state[processing_key], target, result)
                     self._mark_processing_state(
                         processing_state,
                         {processing_key},
@@ -2088,9 +2180,22 @@ class RecentEpisodeMaintenance(_PluginBase):
                 "完成清理前不触发 Jellyfin 媒体库扫描"
             )
 
-        if not state_persistence_failed:
+        if not state_persistence_failed and not follow_up_only:
             self._maintain_danmu(history_pool, reorganizer, processing_state, result, client)
         self._finish_run(result, processing_state)
+
+    @staticmethod
+    def _report_reorganized(item: dict[str, Any], target: Any, result: RunResult) -> None:
+        if item.pop("rename_report_pending", False):
+            item["rename_reported"] = True
+            result.reorganized += 1
+            result.add_reorganized_title(str(target or "未知文件"))
+
+    def _danmu_request_limiter(self) -> DanmuRequestLimiter:
+        return DanmuRequestLimiter(
+            lambda: self.get_data(self._DANMU_RATE_STATE_KEY),
+            lambda value: self.save_data(self._DANMU_RATE_STATE_KEY, value),
+        )
 
     def _maintain_danmu(
         self, histories: list[Any], reorganizer: MoviePilotReorganizer,
@@ -2112,13 +2217,19 @@ class RecentEpisodeMaintenance(_PluginBase):
                         item["danmu_only"] = True
             DanmuMaintenance(
                 client, logvar, logger, self._checkpoint_processing_state, self._dry_run,
+                limiter=self._danmu_request_limiter(),
             ).run(histories, reorganizer, state, result, self._days, self._library_ids)
         except Exception as err:
             # Network exceptions can embed the configured server's API key in their URL.
             from .danmu import safe_error
             result.add_error(f"弹幕补全失败：{safe_error(err)}")
             logger.error(f"[最近媒体维护] 弹幕补全失败：{safe_error(err)}")
-            for item in state.values():
+            if isinstance(err, DanmuRateStateError):
+                return
+            requested_keys = {reorganizer.processing_key(history) for history in histories}
+            for key, item in state.items():
+                if key not in requested_keys:
+                    continue
                 node = item.get("danmu") or {}
                 if node.get("status") in {"ready", "retry"} and DanmuMaintenance.due(node):
                     attempts = int(node.get("attempts", 0)) + 1
@@ -2126,6 +2237,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                         attempts=attempts,
                         status="attention" if attempts >= DanmuMaintenance.MAX_ATTEMPTS else "retry",
                         error="弹幕服务或配置检查失败，请检查本轮日志",
+                        unavailable=False,
                         check_after=DanmuMaintenance.after(DanmuMaintenance.RETRY_MINUTES),
                     )
             DanmuMaintenance._counts(state, result)
@@ -2468,6 +2580,7 @@ class RecentEpisodeMaintenance(_PluginBase):
         histories: list[Any],
         reorganizer: MoviePilotReorganizer,
         state: dict[str, dict[str, Any]] | None = None,
+        follow_up_only: bool = False,
     ) -> tuple[list[Any], dict[str, dict[str, Any]], dict[str, Any]]:
         state = dict(state) if isinstance(state, dict) else self._load_processing_state()
         keyed_histories = [
@@ -2484,7 +2597,7 @@ class RecentEpisodeMaintenance(_PluginBase):
         state = {
             key: value
             for key, value in state.items()
-            if key in active_keys and isinstance(value, dict)
+            if (follow_up_only or key in active_keys) and isinstance(value, dict)
         }
         for history, key in keyed_histories:
             state_item = dict(state.get(key) or {})
@@ -2494,6 +2607,11 @@ class RecentEpisodeMaintenance(_PluginBase):
             history_date = getattr(history, "date", None)
             if history_date:
                 state_item["history_date"] = str(history_date)
+            state_item["label"] = reorganizer.display_name(history)
+            state_item["path"] = str(reorganizer.target_path(history) or "未知文件")
+            if (state_item.get("sidecar_pending") and int(state_item.get("rename_attempts") or 0) > 0
+                    and "rename_reported" not in state_item):
+                state_item["rename_report_pending"] = True
             state[key] = state_item
         recovered_intents = self._recover_operation_intents(state)
         if recovered_intents:
@@ -2599,7 +2717,7 @@ class RecentEpisodeMaintenance(_PluginBase):
         operation_limit = max(int(self._max_items), 1)
         limit = max(operation_limit, operation_limit * self._INSPECTION_MULTIPLIER)
         selected: list[tuple[Any, str]] = []
-        other_items = self._interleave_queue_items(monitoring, new_items)
+        other_items = [] if follow_up_only else self._interleave_queue_items(monitoring, new_items)
         if pending and other_items:
             other_reserve = min(len(other_items), max(1, limit // 4)) if limit > 1 else 0
             selected.extend(pending[:max(limit - other_reserve, 0)])
@@ -2993,7 +3111,7 @@ class RecentEpisodeMaintenance(_PluginBase):
             )
         return not due_checks or any(due_checks)
 
-    def _has_due_follow_up(self, state: dict[str, dict[str, Any]]) -> bool:
+    def _has_due_follow_up(self, state: dict[str, dict[str, Any]], include_danmu: bool = True) -> bool:
         pending_statuses = {
             self._STATE_PENDING_REFRESH,
             self._STATE_PENDING_REORGANIZE,
@@ -3001,7 +3119,7 @@ class RecentEpisodeMaintenance(_PluginBase):
         for state_item in state.values():
             if not isinstance(state_item, dict):
                 continue
-            if getattr(self, "_enable_danmu", False) and DanmuMaintenance.due(state_item.get("danmu") or {}):
+            if include_danmu and getattr(self, "_enable_danmu", False) and DanmuMaintenance.due(state_item.get("danmu") or {}):
                 return True
             if state_item.get("status") not in pending_statuses:
                 continue
@@ -3243,6 +3361,7 @@ class RecentEpisodeMaintenance(_PluginBase):
     ) -> None:
         if processing_state is not None:
             self._refresh_result_queue_counts(result, processing_state)
+            DanmuMaintenance._counts(processing_state, result)
         if (
             processing_state is not None
             and not self._dry_run
@@ -3299,7 +3418,8 @@ class RecentEpisodeMaintenance(_PluginBase):
             elif status == self._STATE_ATTENTION:
                 counts["attention"] += 1
                 name, file_path = result.history_details.get(
-                    key, (f"整理记录 {item.get('history_id') or key}", "未知文件")
+                    key, (item.get("label") or f"整理记录 {item.get('history_id') or key}",
+                          item.get("path") or "未知文件")
                 )
                 result.attention_items.append(
                     self._attention_record_detail(item, name, file_path)

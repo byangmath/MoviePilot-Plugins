@@ -36,6 +36,8 @@ https://github.com/byangmath/MoviePilot-Plugins
 
 LogVar 地址填写 MoviePilot 容器可访问的入口。它可以不同于 Jellyfin Danmu 中的地址，但两个入口须连接同一服务、共用媒体 ID；连接连续失败时会暂停本轮后续弹幕请求，避免逐条等待超时。
 
+正式弹幕补全使用持久化限流队列：普通任务约每 21 秒提交一项，每个滑动分钟最多预留 3 次弹幕内容请求；需要先复核内容再下载的任务会预留两次额度。剩余任务自动继续，不占用线程长时间等待，不调用 MoviePilot 整理预览。此限制只约束本插件，无法限制 Jellyfin 自动下载或其他客户端的请求。已完成弹幕每日复核，明确暂无匹配或弹幕的记录单独统计，不再计为执行失败。
+
 详细配置说明和推荐测试步骤见：[最近媒体维护插件说明](plugins.v3/recentepisodemaintenance/README.md)
 
 ## 使用建议

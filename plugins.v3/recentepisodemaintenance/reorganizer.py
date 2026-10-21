@@ -126,6 +126,25 @@ class MoviePilotReorganizer:
             preferred_history_ids=preferred_history_ids,
         )
 
+    def histories_by_ids(self, history_ids: set[int]) -> list[Any]:
+        """Read only queued records, without scanning the recent-history window."""
+        if not self._history_available():
+            raise RuntimeError("当前 MoviePilot 未找到兼容的整理历史查询接口")
+        candidates: list[Any] = []
+        seen: set[int] = set()
+        ids = sorted(history_ids)
+        for start in range(0, len(ids), 200):
+            batch = tuple(ids[start:start + 200])
+            page = self._list_transfer_history(
+                filters={"ids": batch, "status": True, "media_types": ("电影", "电视剧"),
+                         "require_media_identity": True},
+                page={"page": 1, "count": len(batch), "sort": {"field": "date", "direction": "desc"}},
+            )
+            for history in self._page_items(page):
+                if int(getattr(history, "id", 0) or 0) in history_ids:
+                    self._append_history(candidates, seen, history)
+        return [history for history in candidates if self._is_video_history(history)]
+
     def _select_primary_histories(
         self,
         candidates: list[Any],

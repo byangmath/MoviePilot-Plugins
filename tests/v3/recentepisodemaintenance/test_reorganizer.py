@@ -8,6 +8,52 @@ from recentepisodemaintenance.reorganizer import MoviePilotReorganizer
 from recentepisodemaintenance import RecentEpisodeMaintenance
 
 
+def test_targeted_history_query_preserves_multiple_video_records_for_same_episode():
+    reorganizer = MoviePilotReorganizer(logger=None)
+    videos = [history(history_id=i, dest=f"/library/{i}.mkv", source=f"/source/{i}.mkv",
+                      date="2026-10-20 00:00:00") for i in (1, 2, 3)]
+    queries = []
+    def query(*, filters, page):
+        queries.append((filters, page))
+        return {"items": videos}
+    reorganizer._list_transfer_history = query
+    assert reorganizer.histories_by_ids({1, 2}) == videos[:2]
+    assert queries[0][0]["ids"] == (1, 2)
+    assert "date" not in queries[0][0]
+    assert reorganizer.histories_by_ids(set()) == []
+    assert len(queries) == 1
+
+
+def test_short_follow_up_never_selects_monitoring_or_new_records():
+    plugin = RecentEpisodeMaintenance()
+    plugin._max_items = 10
+    reorganizer = MoviePilotReorganizer(logger=None)
+    items = [history(history_id=i, dest=f"/library/{i}.mkv", source=f"/source/{i}.mkv",
+                     date="2026-10-20 00:00:00", download_hash=str(i)) for i in (1, 2, 3)]
+    keys = [reorganizer.processing_key(item) for item in items]
+    state = {keys[0]: {"status": "pending_refresh", "refresh_check_after": "2000-01-01T00:00:00"},
+             keys[1]: {"status": "monitoring", "next_preview_at": "2000-01-01T00:00:00"},
+             "unqueried": {"status": "complete", "history_id": 99}}
+    selected, saved, _ = plugin._select_histories(items, reorganizer, state, follow_up_only=True)
+    assert selected == items[:1]
+    assert saved["unqueried"] == state["unqueried"]
+
+
+def test_pending_legacy_rename_gets_a_completion_receipt():
+    plugin = RecentEpisodeMaintenance()
+    plugin._max_items = 1
+    reorganizer = MoviePilotReorganizer(logger=None)
+    item = history(history_id=1, dest="/library/video.mkv", source="/source/video.mkv", date="2026-10-20")
+    key = reorganizer.processing_key(item)
+    state = {key: {"status": "pending_reorganize", "sidecar_pending": True, "rename_attempts": 1}}
+    _, saved, _ = plugin._select_histories([item], reorganizer, state)
+    assert saved[key]["rename_report_pending"]
+    saved[key]["rename_report_pending"] = False
+    saved[key]["rename_reported"] = True
+    _, saved, _ = plugin._select_histories([item], reorganizer, saved)
+    assert not saved[key]["rename_report_pending"]
+
+
 def history(
     *,
     history_id: int,

@@ -535,7 +535,7 @@ def test_follow_up_service_runs_only_when_delayed_work_is_due(monkeypatch):
     assert plugin._FOLLOW_UP_POLL_MINUTES == 10
 
     runs = []
-    plugin.run_once = lambda: runs.append("run")
+    plugin.run_once = lambda **kwargs: runs.append(kwargs)
     stored = {
         "episode": {
             "status": plugin._STATE_PENDING_REFRESH,
@@ -549,7 +549,40 @@ def test_follow_up_service_runs_only_when_delayed_work_is_due(monkeypatch):
 
     stored["episode"]["refresh_check_after"] = "2000-01-01T00:00:00"
     plugin.run_due_follow_up()
-    assert runs == ["run"]
+    assert runs == [{"follow_up_only": True}]
+
+
+@pytest.mark.parametrize("enabled,dry_run,expected", [(True, False, True), (True, True, False), (False, False, False)])
+def test_danmu_dispatch_service_is_only_enabled_for_real_downloads(monkeypatch, enabled, dry_run, expected):
+    monkeypatch.setattr(plugin_module, "IntervalTrigger", lambda **kwargs: kwargs)
+    plugin = RecentEpisodeMaintenance()
+    plugin._enabled = True
+    plugin._cron = ""
+    plugin._enable_danmu = enabled
+    plugin._dry_run = dry_run
+    services = plugin.get_service()
+    dispatch = [service for service in services if service["id"] == "RecentEpisodeMaintenanceDanmuQueue"]
+    assert bool(dispatch) is expected
+    if expected:
+        assert dispatch[0]["trigger"] == {"seconds": 21}
+
+
+def test_overlapping_follow_up_does_not_request_a_full_run():
+    plugin = RecentEpisodeMaintenance()
+    plugin._ensure_run_state()
+    plugin._run_active = True
+    plugin.run_once(follow_up_only=True)
+    assert not plugin._pending_run
+
+
+def test_rename_completion_is_reported_once_without_another_operation():
+    item = {"rename_report_pending": True}
+    first, second = RunResult(), RunResult()
+    RecentEpisodeMaintenance._report_reorganized(item, "/library/new.mkv", first)
+    RecentEpisodeMaintenance._report_reorganized(item, "/library/new.mkv", second)
+    assert first.reorganized == 1 and second.reorganized == 0
+    assert first.operations_used == second.operations_used == 0
+    assert item["rename_reported"] and not item.get("rename_report_pending")
 
 
 def test_operation_intents_are_recovered_by_operation_stage():
@@ -697,7 +730,9 @@ def test_manual_attention_retry_is_selected_immediately_without_restarting_coold
     assert selection["cleanup_waiting"] == 0
     assert selection["refresh_waiting"] == 0
     assert plugin._has_due_follow_up(final_state)
-    assert final_state["5"] == state["5"] | {"history_id": 5}
+    assert final_state["5"] == state["5"] | {
+        "history_id": 5, "label": "Video 5", "path": str(Path("/library/video5.mkv")),
+    }
 
 
 def test_pending_library_scan_is_retried_before_episode_processing(monkeypatch):
@@ -1292,16 +1327,19 @@ def test_unconfirmed_transfer_never_waits_for_scrape_or_counts_success(tmp_path,
         assert saved[-1]["episode"]["status"] == plugin._STATE_PENDING_REORGANIZE
 
 
+@pytest.mark.parametrize("delayed_sidecars", [False, True])
 def test_reorganized_record_is_rechecked_by_jellyfin_before_completion(
     tmp_path,
     monkeypatch,
+    delayed_sidecars,
 ):
     old_media = tmp_path / "Show S01E01 - Old Title.mkv"
     new_media = tmp_path / "Show S01E01 - New Title.mkv"
     old_media.write_bytes(b"old")
     new_media.write_bytes(b"new")
     new_media.with_suffix(".nfo").write_text("metadata", encoding="utf-8")
-    new_media.with_suffix(".jpg").write_bytes(b"image")
+    if not delayed_sidecars:
+        new_media.with_suffix(".jpg").write_bytes(b"image")
     history = SimpleNamespace(
         id=1,
         date="2026-07-22 00:00:00",
@@ -1413,13 +1451,38 @@ def test_reorganized_record_is_rechecked_by_jellyfin_before_completion(
     plugin._get_jellyfin_client = lambda: client
     monkeypatch.setattr(plugin_module, "MoviePilotReorganizer", FakeReorganizer)
 
+    results = []
+    finish = plugin._finish_run
+    plugin._finish_run = lambda result, state: (results.append(deepcopy(result)), finish(result, state))
+    if delayed_sidecars:
+        plugin._wait_for_reorganized_sidecars = lambda _: {"episode": ["图片"]}
     plugin._run_once()
 
     assert FakeReorganizer.reorganize_calls == 1
     assert FakeClient.refresh_calls == 0
     assert saved[-1]["episode"]["status"] == plugin._STATE_PENDING_REORGANIZE
-    assert saved[-1]["episode"]["sidecar_pending"] is False
+    assert saved[-1]["episode"]["sidecar_pending"] is delayed_sidecars
     assert saved[-1]["episode"]["refresh_attempts"] == 0
+
+    if delayed_sidecars:
+        assert results[-1].reorganized == 0
+        assert saved[-1]["episode"]["rename_report_pending"]
+        new_media.with_suffix(".jpg").write_bytes(b"image")
+        history.dest = episode.path = str(new_media)
+        saved[-1]["episode"]["sidecar_check_after"] = "2000-01-01T00:00:00"
+        FakeReorganizer.histories_by_ids = lambda _, ids: [history] if ids == {1} else []
+        FakeReorganizer.recent_histories = lambda *_args, **_kwargs: pytest.fail("follow-up must not scan recent history")
+        plugin._maintain_danmu = lambda *_args: pytest.fail("media follow-up must not scan Danmu")
+        plugin._run_once(follow_up_only=True)
+        assert results[-1].reorganized == 1
+        assert results[-1].operations_used == 0
+        assert results[-1].reorganized_titles == [str(new_media)]
+        assert not saved[-1]["episode"].get("rename_report_pending")
+        assert FakeReorganizer.reorganize_calls == 1
+        return
+
+    assert results[-1].reorganized == 1
+    assert not saved[-1]["episode"].get("rename_report_pending")
 
     history.dest = str(new_media)
     episode.path = str(new_media)

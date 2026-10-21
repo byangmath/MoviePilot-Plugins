@@ -1,5 +1,5 @@
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 from types import SimpleNamespace
@@ -10,7 +10,8 @@ import recentepisodemaintenance as plugin_module
 
 from recentepisodemaintenance import RecentEpisodeMaintenance
 from recentepisodemaintenance.danmu import (
-    DanmuMaintenance, DanmuMatchError, DanmuUnavailableError, LogVarClient, LogVarRequestError, api_base, safe_error,
+    DanmuMaintenance, DanmuMatchError, DanmuUnavailableError, DanmuRequestLimiter,
+    DanmuRateStateError, LogVarClient, LogVarRequestError, api_base, safe_error,
 )
 from recentepisodemaintenance.jellyfin_client import DanmuSubmissionError, JellyfinServiceClient
 from recentepisodemaintenance.models import EpisodeItem, RunResult
@@ -521,6 +522,7 @@ def test_empty_source_stops_automatically_and_manual_retry_does_not_reset_eviden
         assert node["unavailable_count"] == number
         assert node["status"] == ("retry" if number < 3 else "attention")
         assert result.operations_used == result.danmu_submitted == 0
+        assert result.failed == 0 and result.danmu_unavailable == 1
     assert "已停止自动重试" in node["error"] and "返回 0 条" in node["error"]
     before = len(run.logvar.session.calls)
     run.run([h], MoviePilotReorganizer, state, RunResult(operation_limit=1), 15, [])
@@ -1161,8 +1163,237 @@ def test_danmu_only_main_workflow_never_previews_and_prunes_deleted_history(tmp_
         return True
     plugin._save_processing_state = save
     plugin._get_jellyfin_client = lambda: jf
+    rate_state = {}
+    plugin.get_data = lambda _: deepcopy(rate_state) or None
+    plugin.save_data = lambda _, value: rate_state.update(deepcopy(value))
     plugin._run_once()
     assert "deleted" not in state
     node = state[MoviePilotReorganizer.processing_key(h)]
     assert node.get("status") != "complete"
     assert node["danmu"]["status"] == "submitted" and jf.writes == ["71"]
+
+
+def limiter_store(clock):
+    store = {}
+    def save(value):
+        store.clear()
+        store.update(deepcopy(value))
+    def factory():
+        return DanmuRequestLimiter(lambda: deepcopy(store) or None, save, lambda: clock[0])
+    return store, factory
+
+
+def test_durable_rate_window_spaces_submissions_across_instances():
+    clock = [datetime(2026, 10, 20, 0, 0)]
+    store, factory = limiter_store(clock)
+    first, second = factory(), factory()
+    assert first.reserve() is None
+    assert second.reserve() == "2026-10-20T00:00:21"
+    for second_number in (21, 42):
+        clock[0] = clock[0].replace(second=second_number)
+        assert factory().reserve() is None
+    clock[0] = datetime(2026, 10, 20, 0, 1)
+    assert first.reserve() == "2026-10-20T00:01:03"
+    assert len(store["events"]) == 3
+    clock[0] += timedelta(seconds=3)
+    assert second.reserve() is None
+    assert len(store["events"]) == 3
+
+
+def test_content_probe_and_download_share_rate_capacity():
+    clock = [datetime(2026, 10, 20)]
+    store, factory = limiter_store(clock)
+    assert factory().reserve(2) is None
+    clock[0] += timedelta(seconds=21)
+    assert factory().reserve(2) == "2026-10-20T00:01:01"
+    assert factory().reserve(1) is None
+    clock[0] += timedelta(seconds=21)
+    assert factory().reserve(1) == "2026-10-20T00:01:01"
+    assert sum(event["cost"] for event in store["events"]) == 3
+
+
+def test_slow_requests_keep_their_rate_reservation_after_completion():
+    clock = [datetime(2026, 10, 20)]
+    store, factory = limiter_store(clock)
+    assert factory().reserve(2) is None
+    clock[0] += timedelta(seconds=90)
+    factory().succeeded()
+    assert factory().reserve() == "2026-10-20T00:01:51"
+    clock[0] += timedelta(seconds=21)
+    assert factory().reserve() is None
+    clock[0] += timedelta(seconds=21)
+    assert factory().reserve() == "2026-10-20T00:02:31"
+
+
+@pytest.mark.parametrize("value", [[], {"events": [{"at": "bad", "cost": 1}]},
+                                      {"events": [{"at": "2026-10-20", "cost": 0}]}])
+def test_invalid_rate_state_fails_closed(value):
+    limiter = DanmuRequestLimiter(lambda: value, lambda _: pytest.fail("must not save invalid data"))
+    with pytest.raises(DanmuRateStateError):
+        limiter.reserve()
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_rate_checkpoint_failure_prevents_submission(tmp_path, raises):
+    path = tmp_path / "video.mp4"
+    path.touch()
+    run, jf = runner(path)
+    def save(_):
+        if raises:
+            raise OSError("database unavailable")
+        return False
+    run.limiter = DanmuRequestLimiter(lambda: None, save)
+    state, result = {}, RunResult(operation_limit=10)
+    run.run([history(str(path))], MoviePilotReorganizer, state, result, 15, [])
+    assert not jf.writes and not run.logvar.session.calls
+    assert result.failed == 1
+    assert next(iter(state.values()))["danmu"]["attempts"] == 0
+
+
+def test_rate_circuit_survives_worker_runs_and_resets_after_success():
+    clock = [datetime(2026, 10, 20)]
+    store, factory = limiter_store(clock)
+    for _ in range(3):
+        factory().failed()
+    assert factory().reserve() == "2026-10-20T01:00:00"
+    clock[0] += timedelta(hours=1)
+    assert factory().reserve() is None
+    factory().succeeded()
+    assert store["failures"] == 0 and store["cooldown_until"] is None
+    factory().failed(immediate=True)
+    assert factory().reserve() == "2026-10-20T02:00:00"
+
+
+def test_rate_deferred_items_are_not_attempted_or_matched(tmp_path):
+    path = tmp_path / "video.mp4"
+    path.touch()
+    h = history(str(path))
+    clock = [datetime.now()]
+    _, factory = limiter_store(clock)
+    run, jf = runner(path)
+    run.limiter = factory()
+    assert run.limiter.reserve() is None
+    state, result = {}, RunResult(operation_limit=10)
+    run.run([h], MoviePilotReorganizer, state, result, 15, [])
+    node = state[MoviePilotReorganizer.processing_key(h)]["danmu"]
+    assert node["dispatch_pending"] and node["attempts"] == 0
+    assert result.operations_used == result.failed == 0
+    assert not jf.match_calls and not jf.writes and not run.logvar.session.calls
+    node["check_after"] = "2000-01-01T00:00:00"
+    clock[0] += timedelta(seconds=21)
+    run.run([h], MoviePilotReorganizer, state, result, 15, [])
+    assert jf.writes == ["71"] and node["attempts"] == 1
+
+
+def test_rate_limited_batch_sends_only_one_and_queues_the_rest(tmp_path):
+    path = tmp_path / "video.mp4"
+    path.touch()
+    items = [history(str(path), id=i) for i in (1, 2, 3)]
+    run, jf = runner(path)
+    _, factory = limiter_store([datetime.now()])
+    run.limiter = factory()
+    state, result = {}, RunResult(operation_limit=10)
+    run.run(items, MoviePilotReorganizer, state, result, 15, [])
+    assert jf.writes == ["71"] and result.danmu_submitted == 1
+    waiting = [item["danmu"] for item in state.values() if item["danmu"]["status"] != "submitted"]
+    assert len(waiting) == 2
+    assert all(node["dispatch_pending"] and node["attempts"] == 0 for node in waiting)
+
+
+def test_completed_danmu_is_not_reopened_until_daily_check(tmp_path, monkeypatch):
+    path = tmp_path / "video.mp4"
+    path.touch()
+    h = history(str(path))
+    run, jf = runner(path)
+    state = {MoviePilotReorganizer.processing_key(h): {"danmu": {
+        "status": "complete", "path": str(path), "check_after": DanmuMaintenance.after(1440),
+    }}}
+    monkeypatch.setattr(run, "files", lambda *_: pytest.fail("daily check not yet due"))
+    result = RunResult(operation_limit=1)
+    run.run([h], MoviePilotReorganizer, state, result, 15, [])
+    assert result.danmu_checked == 0 and jf.match_calls == 0
+
+
+def test_unavailable_attention_is_separate_from_failures():
+    state = {"a": {"danmu": {"status": "attention", "unavailable": True, "label": "No data"}},
+             "b": {"danmu": {"status": "attention", "label": "Invalid match"}}}
+    result = RunResult()
+    DanmuMaintenance._counts(state, result)
+    assert len(result.danmu_unavailable_items) == len(result.danmu_attention) == 1
+    assert "No data" in result.danmu_unavailable_items[0]
+    assert "Invalid match" in result.danmu_attention[0]
+    assert result.failed == 0
+
+
+def test_danmu_queue_worker_only_reads_queued_ids_and_prunes_deleted(monkeypatch):
+    h = history("/library/video.mp4")
+    key = MoviePilotReorganizer.processing_key(h)
+    state = {
+        key: {"history_id": 1, "status": "complete", "danmu": {"status": "ready"}},
+        "deleted": {"history_id": 2, "status": "complete", "danmu": {"status": "retry"}},
+        "monitor": {"history_id": 3, "status": "monitoring"},
+        "busy": {"history_id": 4, "status": "pending_refresh", "danmu": {"status": "ready"}},
+    }
+    queries, maintained, saves = [], [], []
+    def by_ids(ids):
+        queries.append(ids)
+        return [h]
+    fake = SimpleNamespace(histories_by_ids=by_ids, processing_key=MoviePilotReorganizer.processing_key)
+    monkeypatch.setattr(plugin_module, "MoviePilotReorganizer", lambda **_: fake)
+    plugin = RecentEpisodeMaintenance()
+    plugin._enabled = plugin._enable_danmu = True
+    plugin._dry_run = False
+    plugin._max_items = 10
+    plugin.get_data = lambda _: None
+    plugin._load_processing_state = lambda: deepcopy(state)
+    plugin._checkpoint_processing_state = lambda value: saves.append(deepcopy(value)) or True
+    plugin._maintain_danmu = lambda histories, *_: maintained.append(histories)
+    plugin.run_danmu_queue()
+    assert queries == [{1, 2}] and maintained == [[h]]
+    assert "deleted" not in saves[-1] and "monitor" in saves[-1] and "busy" in saves[-1]
+    assert not plugin._run_active
+
+
+def test_idle_or_overlapping_danmu_worker_does_not_query_mp(monkeypatch):
+    monkeypatch.setattr(plugin_module, "MoviePilotReorganizer", lambda **_: pytest.fail("no MP call"))
+    plugin = RecentEpisodeMaintenance()
+    plugin._enabled = plugin._enable_danmu = True
+    plugin._dry_run = False
+    plugin._load_processing_state = lambda: {}
+    plugin.run_danmu_queue()
+    plugin._run_active = True
+    plugin.run_danmu_queue()
+    assert not plugin._pending_run
+
+
+def test_cooling_danmu_worker_does_not_query_mp_or_jellyfin(monkeypatch):
+    monkeypatch.setattr(plugin_module, "MoviePilotReorganizer", lambda **_: pytest.fail("no MP query during cooldown"))
+    plugin = RecentEpisodeMaintenance()
+    plugin._enabled = plugin._enable_danmu = True
+    plugin._dry_run = False
+    clock = [datetime.now()]
+    _, factory = limiter_store(clock)
+    factory().failed(immediate=True)
+    plugin._danmu_request_limiter = factory
+    plugin._get_jellyfin_client = lambda: pytest.fail("no Jellyfin request during cooldown")
+    state = {"key": {"history_id": 1, "status": "complete", "danmu": {"status": "retry", "attempts": 1}}}
+    plugin._load_processing_state = lambda: deepcopy(state)
+    saved = []
+    plugin._checkpoint_processing_state = lambda value: saved.append(deepcopy(value)) or True
+    plugin.run_danmu_queue()
+    node = saved[-1]["key"]["danmu"]
+    assert node["attempts"] == 1 and node["dispatch_pending"]
+    assert datetime.fromisoformat(node["check_after"]) > clock[0] + timedelta(minutes=59)
+
+
+def test_http_429_pauses_dispatch_across_runs(tmp_path):
+    path = tmp_path / "video.mp4"
+    path.touch()
+    run, jf = runner(path)
+    _, factory = limiter_store([datetime.now()])
+    run.limiter = factory()
+    run.logvar.session.failure = requests.HTTPError(response=SimpleNamespace(status_code=429))
+    result, state = RunResult(operation_limit=10), {}
+    run.run([history(str(path))], MoviePilotReorganizer, state, result, 15, [])
+    assert result.failed == 1 and not jf.writes
+    assert datetime.fromisoformat(factory().reserve()) > datetime.now() + timedelta(minutes=59)
