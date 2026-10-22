@@ -256,10 +256,12 @@ class RunResult:
     refresh_previewed: int = 0
     reorganized: int = 0
     refreshed: int = 0
+    refresh_confirmed: int = 0
     skipped: int = 0
     failed: int = 0
     errors: list[str] = field(default_factory=list)
     refreshed_titles: list[str] = field(default_factory=list)
+    refresh_confirmed_titles: list[str] = field(default_factory=list)
     reorganized_titles: list[str] = field(default_factory=list)
     failed_titles: list[str] = field(default_factory=list)
     attention_items: list[str] = field(default_factory=list)
@@ -338,7 +340,8 @@ class RunResult:
             [
                 f"操作统计：刷新、重新整理和弹幕补全 {self.operations_used}/{self.operation_limit} 次；"
                 f"重新整理试运行预览 {self.previewed} 条，成功 {self.reorganized} 项；"
-                f"元数据刷新试运行预览 {self.refresh_previewed} 项，成功 {self.refreshed} 项；"
+                f"元数据刷新试运行预览 {self.refresh_previewed} 项，提交 {self.refreshed} 项，"
+                f"标题确认 {self.refresh_confirmed} 项；"
                 f"弹幕试运行预览 {self.danmu_previewed} 项，提交 {self.danmu_submitted} 项，"
                 f"确认完成 {len(self.danmu_completed)} 项，暂不可用 {self.danmu_unavailable} 项",
                 f"匹配结果：匹配到 Jellyfin 媒体 {self.refresh_candidates} 项，"
@@ -346,8 +349,11 @@ class RunResult:
             ]
         )
         if self.refreshed_titles:
-            lines.append("元数据刷新成功媒体：")
+            lines.append("元数据刷新已提交媒体（等待标题确认）：")
             lines.extend(f"- {title}" for title in self.refreshed_titles)
+        if self.refresh_confirmed_titles:
+            lines.append("刷新后标题已确认媒体（不代表图片等全部刮削成功）：")
+            lines.extend(f"- {title}" for title in self.refresh_confirmed_titles)
         if self.reorganized_titles:
             lines.append("重新整理成功媒体：")
             lines.extend(f"- {title}" for title in self.reorganized_titles)

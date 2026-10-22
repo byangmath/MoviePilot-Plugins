@@ -1325,6 +1325,24 @@ def test_unavailable_attention_is_separate_from_failures():
     assert result.failed == 0
 
 
+@pytest.mark.parametrize("error,marker,expected", [
+    ("LogVar 已匹配到媒体，但当前来源返回 0 条弹幕；累计确认 8 次", None, True),
+    ("LogVar 尚未匹配到目标媒体；累计确认 3 次", None, True),
+    ("LogVar 请求失败（HTTP 429）", None, False),
+    ("弹幕目录暂不可访问", None, False),
+    ("LogVar 尚未匹配到目标媒体", False, False),
+])
+def test_legacy_no_data_classification_uses_current_evidence_not_only_counter(error, marker, expected):
+    node = {"status": "attention", "error": error, "unavailable_count": 8}
+    if marker is not None:
+        node["unavailable"] = marker
+    result = RunResult()
+    DanmuMaintenance._counts({"old": {"danmu": node}}, result)
+    assert bool(result.danmu_unavailable_items) is expected
+    assert bool(result.danmu_attention) is not expected
+    assert "unavailable" not in node if marker is None else node["unavailable"] is marker
+
+
 def test_danmu_queue_worker_only_reads_queued_ids_and_prunes_deleted(monkeypatch):
     h = history("/library/video.mp4")
     key = MoviePilotReorganizer.processing_key(h)

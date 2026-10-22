@@ -585,6 +585,49 @@ def test_rename_completion_is_reported_once_without_another_operation():
     assert item["rename_reported"] and not item.get("rename_report_pending")
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+def test_refresh_title_confirmation_is_once_only_across_state_reload(legacy):
+    item = {"status": "pending_refresh", "refresh_attempts": 1}
+    if not legacy:
+        item["refresh_confirmation_pending"] = True
+    state = {"episode": item}
+    first = RunResult()
+    RecentEpisodeMaintenance._confirm_refresh_title(state, {"episode"}, first, "/library/video.mp4")
+    assert first.refresh_confirmed == 1 and first.refreshed == 0
+    assert first.operations_used == 0
+    restored = deepcopy(state)
+    second = RunResult()
+    RecentEpisodeMaintenance._confirm_refresh_title(restored, {"episode"}, second, "/library/video.mp4")
+    assert second.refresh_confirmed == 0
+    assert restored["episode"]["refresh_confirmation_pending"] is False
+
+
+def test_post_rename_scan_is_not_counted_as_a_submitted_metadata_refresh():
+    state = {"episode": {"status": "pending_refresh", "had_action": True, "refresh_attempts": 0}}
+    result = RunResult()
+    RecentEpisodeMaintenance._confirm_refresh_title(state, {"episode"}, result, "/library/video.mp4")
+    assert result.refresh_confirmed == 0
+
+
+def test_refresh_summary_does_not_claim_scrape_success_on_submission():
+    result = RunResult(refreshed=1)
+    result.add_refreshed_title("/library/submitted.mkv")
+    summary = result.summary()
+    assert "提交 1 项，标题确认 0 项" in summary
+    assert "元数据刷新已提交媒体（等待标题确认）" in summary
+    assert "元数据刷新成功媒体" not in summary
+    confirmed = RunResult(refresh_confirmed=1, refresh_confirmed_titles=["/library/confirmed.mkv"])
+    assert "标题确认 1 项" in confirmed.summary()
+    assert "不代表图片等全部刮削成功" in confirmed.summary()
+
+
+def test_legacy_placeholder_submission_uses_one_of_three_attempts():
+    state = {"episode": {"status": "monitoring", "placeholder_refresh_done": True}}
+    assert RecentEpisodeMaintenance._refresh_attempts_for_keys(state, {"episode"}) == 1
+    state["episode"]["refresh_attempts"] = 3
+    assert RecentEpisodeMaintenance._refresh_attempts_for_keys(state, {"episode"}) == 3
+
+
 def test_operation_intents_are_recovered_by_operation_stage():
     plugin = RecentEpisodeMaintenance()
     state = {
@@ -941,7 +984,8 @@ def test_failed_intent_checkpoint_prevents_external_operations(monkeypatch):
     assert FakeReorganizer.reorganize_calls == 0
 
 
-def test_formal_jellyfin_title_waits_for_fresh_moviepilot_preview(monkeypatch):
+@pytest.mark.parametrize("enable_reorganize", [False, True])
+def test_formal_jellyfin_title_waits_for_fresh_moviepilot_preview(monkeypatch, enable_reorganize):
     history = SimpleNamespace(
         id=1,
         date="2999-07-24 12:00:00",
@@ -1026,7 +1070,7 @@ def test_formal_jellyfin_title_waits_for_fresh_moviepilot_preview(monkeypatch):
 
     plugin = RecentEpisodeMaintenance()
     plugin._enable_refresh = True
-    plugin._enable_reorganize = False
+    plugin._enable_reorganize = enable_reorganize
     plugin._scan_after_reorganize = False
     plugin._cleanup_old_sidecars = True
     plugin._refresh_mode = "all"
@@ -1058,6 +1102,9 @@ def test_formal_jellyfin_title_waits_for_fresh_moviepilot_preview(monkeypatch):
     plugin._save_processing_state = save_state
     plugin._get_jellyfin_client = FakeClient
     monkeypatch.setattr(plugin_module, "MoviePilotReorganizer", FakeReorganizer)
+    results = []
+    finish = plugin._finish_run
+    plugin._finish_run = lambda result, state=None: (results.append(deepcopy(result)), finish(result, state))
 
     plugin._run_once()
 
@@ -1101,21 +1148,43 @@ def test_formal_jellyfin_title_waits_for_fresh_moviepilot_preview(monkeypatch):
     assert FakeClient.refresh_calls == 1
     assert FakeReorganizer.preview_calls == 1
     assert saved[-1]["episode"]["status"] == plugin._STATE_PENDING_REFRESH
-    assert saved[-1]["episode"]["placeholder_refresh_done"] is True
+    assert saved[-1]["episode"]["placeholder_refresh_done"] is False
+    assert saved[-1]["episode"]["refresh_confirmation_pending"] is True
+    assert results[-1].refreshed == 1 and results[-1].refresh_confirmed == 0
+
+    plugin._run_once()
+    assert FakeClient.refresh_calls == 1
 
     saved[-1]["episode"]["refresh_check_after"] = "2000-01-01T00:00:00"
     plugin._run_once()
 
-    assert FakeClient.refresh_calls == 1
+    assert FakeClient.refresh_calls == 2
     assert FakeReorganizer.preview_calls == 1
+    assert saved[-1]["episode"]["status"] == plugin._STATE_PENDING_REFRESH
+
+    saved[-1]["episode"]["refresh_check_after"] = "2000-01-01T00:00:00"
+    plugin._run_once()
+    assert FakeClient.refresh_calls == 3
+    saved[-1]["episode"]["refresh_check_after"] = "2000-01-01T00:00:00"
+    plugin._run_once()
+    assert FakeClient.refresh_calls == 3
+    assert saved[-1]["episode"]["status"] == plugin._STATE_ATTENTION
+
+    episode.name = "黑夜女神"
+    assert plugin._retry_attention_records() == 1
+    plugin._run_once()
+    assert FakeClient.refresh_calls == 3
     assert saved[-1]["episode"]["status"] == plugin._STATE_MONITORING
+
+    assert results[-1].refreshed == 0 and results[-1].refresh_confirmed == 1
 
     history.date = "2000-01-01 00:00:00"
     saved[-1]["episode"]["next_preview_at"] = "2000-01-01T00:00:00"
     plugin._run_once()
 
-    assert FakeClient.refresh_calls == 1
+    assert FakeClient.refresh_calls == 3
     assert FakeReorganizer.preview_calls == 2
+    assert results[-1].refresh_confirmed == 0
     assert saved[-1]["episode"]["status"] == plugin._STATE_COMPLETE
     assert (
         saved[-1]["episode"]["completion_reason"]

@@ -690,7 +690,20 @@ class DanmuMaintenance:
         return changed
 
     @staticmethod
-    def _counts(state: dict[str, Any], result: RunResult) -> None:
+    def is_unavailable(node: dict[str, Any]) -> bool:
+        if "unavailable" in node:
+            return node["unavailable"] is True
+        try:
+            recorded = int(node.get("unavailable_count") or 0) > 0
+        except (TypeError, ValueError):
+            return False
+        # Older releases recorded the evidence but did not write the classification flag.
+        return recorded and str(node.get("error") or "").startswith((
+            "LogVar 已匹配到媒体，但当前来源返回 0 条弹幕", "LogVar 尚未匹配到目标媒体",
+        ))
+
+    @classmethod
+    def _counts(cls, state: dict[str, Any], result: RunResult) -> None:
         result.danmu_waiting = sum(
             (item.get("danmu") or {}).get("status") in {"ready", "retry", "submitted"}
             for item in state.values()
@@ -699,6 +712,6 @@ class DanmuMaintenance:
             node = item.get("danmu") or {}
             if node.get("status") == "attention":
                 text = f"{node.get('label', '媒体')}｜文件：{node.get('path', '未知')}｜原因：{node.get('error', '未知')}"
-                items = result.danmu_unavailable_items if node.get("unavailable") else result.danmu_attention
+                items = result.danmu_unavailable_items if cls.is_unavailable(node) else result.danmu_attention
                 if text not in items:
                     items.append(text)

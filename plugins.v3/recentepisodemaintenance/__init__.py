@@ -109,7 +109,7 @@ class RecentEpisodeMaintenance(_PluginBase):
     plugin_name = "最近媒体维护"
     plugin_desc = "维护 MoviePilot 最近整理入库的 Jellyfin 电影和剧集"
     plugin_icon = "https://raw.githubusercontent.com/byangmath/MoviePilot-Plugins/main/icons/recentepisodemaintenance.png"
-    plugin_version = "1.0.4"
+    plugin_version = "1.0.5"
     plugin_author = "byangmath"
     author_url = "https://github.com/byangmath"
     plugin_config_prefix = "recentepisodemaintenance_"
@@ -946,6 +946,7 @@ class RecentEpisodeMaintenance(_PluginBase):
 
                     post_reorganize_wait_reason = ""
                     refresh_confirmation_waiting = False
+                    state_items = [processing_state.get(key) or {} for key in episode_history_keys]
                     if self._scan_after_reorganize:
                         state_items = [
                             processing_state.get(key) or {}
@@ -976,6 +977,14 @@ class RecentEpisodeMaintenance(_PluginBase):
                             post_reorganize_wait_reason = (
                                 "等待扫描后的元数据确认时间"
                             )
+                    if not post_reorganize_wait_reason and any(
+                        item.get("status") == self._STATE_PENDING_REFRESH
+                        and item.get("refresh_check_after")
+                        and not self._timestamp_is_due(item.get("refresh_check_after"))
+                        for item in state_items
+                    ):
+                        refresh_confirmation_waiting = True
+                        post_reorganize_wait_reason = "等待元数据刷新后的标题确认时间"
                     if post_reorganize_wait_reason:
                         waiting_targets = (
                             episode_target_keys.get(episode.item_id)
@@ -1006,7 +1015,6 @@ class RecentEpisodeMaintenance(_PluginBase):
                         placeholder_preview
                         and episode.title_is_unreliable()
                         and not episode.placeholder_title_matches_path(expected_path)
-                        and not placeholder_refresh_done
                     )
                     if placeholder_preview and not placeholder_refresh_needed:
                         placeholder_targets = (
@@ -1015,6 +1023,8 @@ class RecentEpisodeMaintenance(_PluginBase):
                         )
                         result.add_skipped(*placeholder_targets)
                         deferred_reorganize_targets.update(placeholder_targets)
+                        if not self._dry_run:
+                            self._confirm_refresh_title(processing_state, episode_history_keys, result, episode_file)
                         placeholder_completed = all(
                             self._history_window_expired(
                                 processing_state.get(key) or {}
@@ -1080,6 +1090,8 @@ class RecentEpisodeMaintenance(_PluginBase):
                             *(episode_target_keys.get(episode.item_id) or {episode.item_id})
                         )
                         prefix = "试运行" if self._dry_run else ""
+                        if not self._dry_run:
+                            self._confirm_refresh_title(processing_state, episode_history_keys, result, episode_file)
                         logger.info(
                             f"[最近媒体维护] {prefix}跳过 {episode_label}："
                             f"标题一致，无需刷新元数据｜文件：{episode_file}"
@@ -1110,7 +1122,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                     ):
                         message = (
                             f"{episode_label} 已连续刷新 {refresh_attempts} 次，"
-                            "Jellyfin 标题仍与 MoviePilot 预览不一致，"
+                            "Jellyfin 标题仍异常或与 MoviePilot 预览不一致，"
                             "已停止自动刷新；请检查 Jellyfin 元数据和 NFO"
                         )
                         result.add_error(message, episode_file)
@@ -1200,7 +1212,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                         result.refreshed += 1
                         result.add_refreshed_title(str(episode_file))
                         refresh_reason = (
-                            "MP 和 Jellyfin 标题均不可靠，已提交唯一一次"
+                            "MP 和 Jellyfin 标题均不可靠，已提交有限重试的"
                             "元数据和图片刷新"
                             if placeholder_refresh_needed
                             else "标题不一致，已提交元数据和图片刷新"
@@ -1221,9 +1233,11 @@ class RecentEpisodeMaintenance(_PluginBase):
                             refresh_check_after=self._refresh_recheck_at(),
                             refresh_attempts=refresh_attempts + 1,
                             placeholder_refresh_done=(
-                                True if placeholder_refresh_needed else None
+                                False if placeholder_refresh_needed else None
                             ),
                         )
+                        for key in episode_history_keys:
+                            processing_state[key]["refresh_confirmation_pending"] = True
                         self._clear_operation_intent(
                             processing_state,
                             episode_history_keys,
@@ -1236,7 +1250,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                             state_persistence_failed = True
                         for refresh_target in refresh_targets:
                             deferred_reorganize_reasons[refresh_target] = (
-                                "占位标题已提交唯一一次元数据刷新，等待确认"
+                                "占位标题已提交元数据刷新，30 分钟后确认，异常时有限重试"
                                 if placeholder_refresh_needed
                                 else "标题不一致，本轮已提交元数据刷新，等待确认"
                             )
@@ -2953,6 +2967,7 @@ class RecentEpisodeMaintenance(_PluginBase):
             if operation == "refresh":
                 item["status"] = self._STATE_PENDING_REFRESH
                 item["had_action"] = True
+                item["refresh_confirmation_pending"] = True
                 item["refresh_check_after"] = self._intent_refresh_check_after(
                     intent.get("prepared_at")
                 )
@@ -3319,6 +3334,7 @@ class RecentEpisodeMaintenance(_PluginBase):
             elif attention_stage == "refresh":
                 item["status"] = self._STATE_PENDING_REFRESH
                 item["refresh_attempts"] = 0
+                item["placeholder_refresh_done"] = False
                 item["refresh_check_after"] = retry_at
             else:
                 item["status"] = (
@@ -3512,6 +3528,30 @@ class RecentEpisodeMaintenance(_PluginBase):
         return False
 
     @staticmethod
+    def _confirm_refresh_title(
+        state: dict[str, dict[str, Any]], keys: set[str], result: RunResult, file_path: Any,
+    ) -> None:
+        pending = any(
+            (state.get(key) or {}).get("refresh_confirmation_pending")
+            or ("refresh_confirmation_pending" not in (state.get(key) or {})
+                and (state.get(key) or {}).get("status") == RecentEpisodeMaintenance._STATE_PENDING_REFRESH
+                and int((state.get(key) or {}).get("refresh_attempts") or 0) > 0)
+            for key in keys
+        )
+        if not pending:
+            return
+        for key in keys:
+            item = state.get(key) or {}
+            item["refresh_confirmation_pending"] = False
+            item["refresh_confirmed_at"] = datetime.now().isoformat(timespec="seconds")
+            state[key] = item
+        path = str(file_path or "未知文件")
+        if path not in result.refresh_confirmed_titles:
+            result.refresh_confirmed += 1
+            result.refresh_confirmed_titles.append(path)
+        logger.info(f"[最近媒体维护] 刷新后标题已确认｜文件：{path}；仅确认标题，不代表图片等全部刮削成功")
+
+    @staticmethod
     def _refresh_attempts_for_keys(
         state: dict[str, dict[str, Any]],
         keys: set[str],
@@ -3522,6 +3562,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                 attempts = max(
                     attempts,
                     int((state.get(key) or {}).get("refresh_attempts") or 0),
+                    int(bool((state.get(key) or {}).get("placeholder_refresh_done"))),
                 )
             except (TypeError, ValueError):
                 continue
