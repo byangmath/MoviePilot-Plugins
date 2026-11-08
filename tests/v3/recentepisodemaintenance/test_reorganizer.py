@@ -1,4 +1,6 @@
 from datetime import datetime
+from contextlib import contextmanager
+from contextvars import ContextVar
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -6,6 +8,65 @@ import pytest
 
 from recentepisodemaintenance.reorganizer import MoviePilotReorganizer
 from recentepisodemaintenance import RecentEpisodeMaintenance
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_v3_fresh_context_only_wraps_preview_and_is_restored(fail):
+    active = ContextVar("test_fresh", default=False)
+    calls = []
+    @contextmanager
+    def fresh():
+        token = active.set(True)
+        try:
+            yield
+        finally:
+            active.reset(token)
+
+    class TransferChain:
+        def manual_transfer(self, *, preview=False, reorganize=False, report_results=False, **kwargs):
+            calls.append((preview, active.get()))
+            assert "cache" not in kwargs
+            assert kwargs["scrape"]
+            assert kwargs["background"] is False
+            if fail:
+                raise RuntimeError("provider unavailable")
+            if preview:
+                assert not reorganize
+                return True, {"items": [{"success": True, "target": "/library/New.mkv"}]}
+            return True, {"items": [{"source": kwargs["fileitem"].path,
+                                      "state": "completed", "target": "/library/New.mkv"}]}
+
+    reorganizer = MoviePilotReorganizer(logger=None, dry_run=False)
+    reorganizer._fresh_context = fresh
+    reorganizer._transfer_chain_cls = TransferChain
+    reorganizer._file_item_cls = SimpleNamespace
+    reorganizer._episode_format_cls = SimpleNamespace
+    reorganizer._media_type_cls = SimpleNamespace(MOVIE="movie", TV="tv")
+    video = history(history_id=1, source="/source/old.mkv", dest="/library/Old.mkv", date="2026-11-08")
+    operation = reorganizer.reorganize(video)
+    assert operation.success is not fail
+    assert not active.get()
+    assert calls == ([(True, True)] if fail else [(True, True), (False, False)])
+
+
+def test_v3_missing_fresh_support_warns_once_and_keeps_safe_preview():
+    warnings, calls = [], []
+    class TransferChain:
+        def manual_transfer(self, *, preview=False, **kwargs):
+            calls.append(preview)
+            return True, {"items": [{"success": True, "target": "/library/New.mkv"}]}
+    reorganizer = MoviePilotReorganizer(logger=SimpleNamespace(warning=warnings.append))
+    reorganizer._fresh_context = None
+    reorganizer._transfer_chain_cls = TransferChain
+    reorganizer._file_item_cls = SimpleNamespace
+    reorganizer._episode_format_cls = SimpleNamespace
+    reorganizer._media_type_cls = SimpleNamespace(MOVIE="movie", TV="tv")
+    video = history(history_id=1, source="/source/old.mkv", dest="/library/Old.mkv", date="2026-11-08")
+    assert reorganizer.preview(video).success
+    assert reorganizer.preview(video).success
+    assert calls == [True, True]
+    assert len(warnings) == 1
+    assert "普通整理预览" in warnings[0]
 
 
 def test_targeted_history_query_preserves_multiple_video_records_for_same_episode():

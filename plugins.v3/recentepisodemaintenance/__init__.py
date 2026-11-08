@@ -58,6 +58,8 @@ class RecentEpisodeMaintenance(_PluginBase):
     _OLD_SIDECAR_VERIFY_MINUTES = 10
     _OLD_SIDECAR_MAX_PASSES = 2
     _REFRESH_RECHECK_MINUTES = 30
+    _PREVIEW_CACHE_MINUTES = 30
+    _PREVIEW_RETRY_MINUTES = 60
     _FOLLOW_UP_POLL_MINUTES = 10
     _MONITOR_INTERVAL_HOURS = (24, 48, 72)
     _INSPECTION_MULTIPLIER = 5
@@ -109,7 +111,7 @@ class RecentEpisodeMaintenance(_PluginBase):
     plugin_name = "最近媒体维护"
     plugin_desc = "维护 MoviePilot 最近整理入库的 Jellyfin 电影和剧集"
     plugin_icon = "https://raw.githubusercontent.com/byangmath/MoviePilot-Plugins/main/icons/recentepisodemaintenance.png"
-    plugin_version = "1.0.5"
+    plugin_version = "1.0.6"
     plugin_author = "byangmath"
     author_url = "https://github.com/byangmath"
     plugin_config_prefix = "recentepisodemaintenance_"
@@ -766,27 +768,30 @@ class RecentEpisodeMaintenance(_PluginBase):
             history_keys_by_target.setdefault(target_key, set()).add(processing_key)
 
             state_item = processing_state.get(processing_key) or {}
-            status = state_item.get("status")
             cached_path = state_item.get("expected_path")
-            placeholder_cache_expired = (
-                status == self._STATE_PENDING_REFRESH
-                and EpisodeItem.path_title_is_placeholder(cached_path)
-                and self._history_window_expired(state_item)
-            )
-            if (
-                cached_path
-                and not placeholder_cache_expired
-                and status in {
-                    self._STATE_PENDING_REFRESH,
-                    self._STATE_PENDING_REORGANIZE,
-                }
-            ):
+            if self._can_reuse_processing_preview(state_item):
                 expected_paths[processing_key] = Path(str(cached_path))
+                logger.debug(
+                    f"[最近媒体维护] 复用 MP 预览 {reorganizer.display_name(history)}："
+                    f"{'保留已提交整理目标' if self._preview_target_is_committed(state_item) else '缓存未过期'}｜"
+                    f"预览时间：{state_item.get('previewed_at') or '未知'}"
+                )
                 continue
 
+            if cached_path:
+                logger.info(
+                    f"[最近媒体维护] 重新获取 MP 预览 {reorganizer.display_name(history)}："
+                    f"旧预览时间：{state_item.get('previewed_at') or '未知'}｜"
+                    f"旧预览文件：{Path(str(cached_path)).name}"
+                )
             preview = reorganizer.preview(history)
             if preview.success and preview.target:
                 expected_paths[processing_key] = preview.target
+                if cached_path and not self._same_path(cached_path, preview.target):
+                    logger.info(
+                        f"[最近媒体维护] MP 预览已变化 {reorganizer.display_name(history)}："
+                        f"{self._file_change_details(cached_path, preview.target)}"
+                    )
                 if not self._dry_run:
                     self._cache_processing_preview(
                         processing_state,
@@ -811,6 +816,13 @@ class RecentEpisodeMaintenance(_PluginBase):
                     self._STATE_PENDING_REFRESH
                     if self._enable_refresh
                     else self._STATE_PENDING_REORGANIZE,
+                )
+                processing_state[processing_key]["preview_check_after"] = (
+                    datetime.now() + timedelta(minutes=self._PREVIEW_RETRY_MINUTES)
+                ).isoformat(timespec="seconds")
+                logger.info(
+                    f"[最近媒体维护] 预览重试已延后 {reorganizer.display_name(history)}："
+                    f"{self._PREVIEW_RETRY_MINUTES} 分钟后重试，不计入 Jellyfin 刷新次数"
                 )
 
         if not self._enable_refresh:
@@ -1140,6 +1152,8 @@ class RecentEpisodeMaintenance(_PluginBase):
                         logger.error(
                             f"[最近媒体维护] 停止刷新 {episode_label}："
                             f"连续刷新 {refresh_attempts} 次后标题仍不一致｜"
+                            f"Jellyfin 标题：{episode.name or '空标题'}｜"
+                            f"MP 预览：{Path(expected_path).name}｜"
                             f"文件：{episode_file}"
                         )
                         continue
@@ -1223,7 +1237,8 @@ class RecentEpisodeMaintenance(_PluginBase):
                         )
                         logger.info(
                             f"[最近媒体维护] 刷新 {episode_label}："
-                            f"{refresh_reason}｜文件：{episode_file}"
+                            f"{refresh_reason}｜Jellyfin 标题：{episode.name or '空标题'}｜"
+                            f"MP 预览：{Path(expected_path).name}｜文件：{episode_file}"
                         )
                         self._mark_processing_state(
                             processing_state,
@@ -3107,6 +3122,8 @@ class RecentEpisodeMaintenance(_PluginBase):
         *,
         cleanup_enabled: bool,
     ) -> bool:
+        if state_item.get("preview_check_after") and not self._preview_target_is_committed(state_item):
+            return self._timestamp_is_due(state_item["preview_check_after"])
         if state_item.get("operation_intent") or state_item.get("scan_pending"):
             return True
         if state_item.get("sidecar_pending"):
@@ -3137,6 +3154,10 @@ class RecentEpisodeMaintenance(_PluginBase):
             if include_danmu and getattr(self, "_enable_danmu", False) and DanmuMaintenance.due(state_item.get("danmu") or {}):
                 return True
             if state_item.get("status") not in pending_statuses:
+                continue
+            if state_item.get("preview_check_after") and not self._preview_target_is_committed(state_item):
+                if self._timestamp_is_due(state_item["preview_check_after"]):
+                    return True
                 continue
             if state_item.get("operation_intent") or state_item.get("scan_pending"):
                 return True
@@ -3323,6 +3344,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                 retried += int(danmu_retried)
                 continue
             attention_stage = self._attention_stage(item)
+            item.pop("preview_check_after", None)
             if attention_stage == "cleanup":
                 item["status"] = self._STATE_PENDING_REORGANIZE
                 item["cleanup_passes"] = 0
@@ -3336,6 +3358,10 @@ class RecentEpisodeMaintenance(_PluginBase):
                 item["refresh_attempts"] = 0
                 item["placeholder_refresh_done"] = False
                 item["refresh_check_after"] = retry_at
+                if not self._preview_target_is_committed(item):
+                    item.pop("expected_path", None)
+                    item.pop("previewed_at", None)
+                    item.pop("preview_refresh_attempts", None)
             else:
                 item["status"] = (
                     self._STATE_PENDING_REFRESH
@@ -3344,7 +3370,8 @@ class RecentEpisodeMaintenance(_PluginBase):
                 )
                 item["rename_attempts"] = 0
             item["updated_at"] = retry_at
-            item.pop("operation_intent", None)
+            if attention_stage != "refresh":
+                item.pop("operation_intent", None)
             item.pop("attention_stage", None)
             state[key] = item
             retried += 1
@@ -3493,6 +3520,38 @@ class RecentEpisodeMaintenance(_PluginBase):
         return JellyfinServiceClient.path_key(left) == JellyfinServiceClient.path_key(right)
 
     @staticmethod
+    def _preview_target_is_committed(item: dict[str, Any]) -> bool:
+        # Pending filesystem work must continue against its submitted target.
+        return any(item.get(key) for key in (
+            "operation_intent", "sidecar_pending", "cleanup_pending", "scan_pending",
+            "rename_report_pending",
+        ))
+
+    def _can_reuse_processing_preview(self, item: dict[str, Any]) -> bool:
+        cached_path = item.get("expected_path")
+        if not cached_path:
+            return False
+        if self._preview_target_is_committed(item):
+            return True
+        if item.get("status") not in {
+            self._STATE_PENDING_REFRESH, self._STATE_PENDING_REORGANIZE,
+        }:
+            return False
+        if (item.get("status") == self._STATE_PENDING_REFRESH
+                and int(item.get("refresh_attempts") or 0) >= self._MAX_REFRESH_ATTEMPTS
+                and item.get("preview_refresh_attempts") != item.get("refresh_attempts")):
+            return False
+        if (EpisodeItem.path_title_is_placeholder(cached_path)
+                and self._history_window_expired(item)):
+            return False
+        try:
+            previewed = datetime.fromisoformat(str(item.get("previewed_at") or ""))
+            age = datetime.now(previewed.tzinfo) - previewed
+        except (TypeError, ValueError, OverflowError):
+            return False
+        return timedelta(0) <= age < timedelta(minutes=self._PREVIEW_CACHE_MINUTES)
+
+    @staticmethod
     def _cache_processing_preview(
         state: dict[str, dict[str, Any]],
         keys: set[str],
@@ -3503,6 +3562,8 @@ class RecentEpisodeMaintenance(_PluginBase):
             item = dict(state.get(key) or {})
             item["expected_path"] = str(expected_path)
             item["previewed_at"] = previewed_at
+            item["preview_refresh_attempts"] = int(item.get("refresh_attempts") or 0)
+            item.pop("preview_check_after", None)
             if not EpisodeItem.path_title_is_placeholder(expected_path):
                 item.pop("placeholder_refresh_done", None)
             state[key] = item

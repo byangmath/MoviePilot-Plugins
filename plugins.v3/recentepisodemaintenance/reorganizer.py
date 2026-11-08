@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import datetime, timedelta
 import inspect
 from pathlib import Path
@@ -30,6 +31,8 @@ class MoviePilotReorganizer:
     def __init__(self, logger: Any, dry_run: bool = True):
         self.logger = logger
         self.dry_run = dry_run
+        self._fresh_context = _first_import([("app.runtime.cache", "fresh")])
+        self._fresh_warning_logged = False
         self._list_transfer_history = _first_import([
             ("app.sdk.queries", "list_transfer_history"),
         ])
@@ -468,26 +471,40 @@ class MoviePilotReorganizer:
         )
         season = self._season_number(getattr(history, "seasons", None))
         episode_format = self._episode_format(history)
-        state, result = self._transfer_chain_cls().manual_transfer(
-            fileitem=fileitem,
-            target_storage=getattr(history, "dest_storage", None),
-            media_source=media_source,
-            media_id=media_id,
-            mtype=mtype,
-            season=season,
-            epformat=episode_format,
-            episode_group=getattr(history, "episode_group", None),
-            transfer_type=getattr(history, "mode", None),
-            scrape=True,
-            force=bool(getattr(history, "status", False)),
-            background=False,
-            downloader=getattr(history, "downloader", None),
-            download_hash=getattr(history, "download_hash", None),
-            preview=preview,
-            sync_extra_files=True,
-            reorganize=not preview,
-            **({"report_results": True} if not preview else {}),
-        )
+        context = nullcontext()
+        if preview:
+            if callable(self._fresh_context):
+                context = self._fresh_context()
+                if self.logger:
+                    self.logger.debug("[最近媒体维护] MP 整理预览使用调用范围内的定向缓存刷新")
+            elif not self._fresh_warning_logged:
+                self._fresh_warning_logged = True
+                if self.logger:
+                    self.logger.warning(
+                        "[最近媒体维护] 当前 MoviePilot 未提供定向缓存刷新入口，"
+                        "使用普通整理预览，数据可能仍来自 MP 缓存"
+                    )
+        with context:
+            state, result = self._transfer_chain_cls().manual_transfer(
+                fileitem=fileitem,
+                target_storage=getattr(history, "dest_storage", None),
+                media_source=media_source,
+                media_id=media_id,
+                mtype=mtype,
+                season=season,
+                epformat=episode_format,
+                episode_group=getattr(history, "episode_group", None),
+                transfer_type=getattr(history, "mode", None),
+                scrape=True,
+                force=bool(getattr(history, "status", False)),
+                background=False,
+                downloader=getattr(history, "downloader", None),
+                download_hash=getattr(history, "download_hash", None),
+                preview=preview,
+                sync_extra_files=True,
+                reorganize=not preview,
+                **({"report_results": True} if not preview else {}),
+            )
         data = result if isinstance(result, dict) else None
         message = result.get("message") if isinstance(result, dict) else result
         if not preview:

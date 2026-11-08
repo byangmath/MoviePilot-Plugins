@@ -1,4 +1,5 @@
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,6 +14,145 @@ from recentepisodemaintenance.models import (
     RunResult,
 )
 import recentepisodemaintenance as plugin_module
+
+
+@pytest.mark.parametrize("age,valid", [
+    (None, False), ("bad timestamp", False), (31, False), (30, False),
+    (-1, False), (0, True), (29, True),
+])
+def test_preview_cache_has_bounded_lifetime(age, valid):
+    plugin = RecentEpisodeMaintenance()
+    plugin._days = 15
+    item = {"status": "pending_refresh", "expected_path": "/library/Show S01E01 - Title.mkv"}
+    if isinstance(age, int):
+        item["previewed_at"] = (datetime.now() - timedelta(minutes=age)).isoformat()
+    elif age:
+        item["previewed_at"] = age
+    assert plugin._can_reuse_processing_preview(item) is valid
+    assert not plugin._can_reuse_processing_preview({**item, "expected_path": ""})
+
+
+def test_preview_cache_accepts_timezone_aware_timestamps():
+    item = {"status": "pending_reorganize", "expected_path": "/library/Title.mkv",
+            "previewed_at": datetime.now(timezone.utc).isoformat()}
+    assert RecentEpisodeMaintenance()._can_reuse_processing_preview(item)
+
+
+def test_refresh_cap_allows_one_preview_revalidation_without_resetting_attempts():
+    plugin = RecentEpisodeMaintenance()
+    state = {"episode": {"status": "pending_refresh", "refresh_attempts": 3}}
+    for title in ("Old", "Changed", "Changed Again"):
+        plugin._cache_processing_preview(state, {"episode"}, f"/library/Show S01E01 - {title}.mkv")
+        assert state["episode"]["refresh_attempts"] == 3
+        assert state["episode"]["preview_refresh_attempts"] == 3
+        assert plugin._can_reuse_processing_preview(state["episode"])
+    state["episode"]["preview_refresh_attempts"] = 2
+    assert not plugin._can_reuse_processing_preview(state["episode"])
+
+
+@pytest.mark.parametrize("status", ["pending_refresh", "pending_reorganize"])
+def test_preview_backoff_applies_to_both_queues_but_not_pending_file_recovery(status):
+    plugin = RecentEpisodeMaintenance()
+    item = {"status": status, "refresh_attempts": 3,
+            "preview_check_after": "2999-01-01T00:00:00",
+            "refresh_check_after": "2000-01-01T00:00:00"}
+    assert not plugin._pending_state_has_due_work(item, cleanup_enabled=True)
+    assert not plugin._has_due_follow_up({"episode": item})
+    item["preview_check_after"] = "2000-01-01T00:00:00"
+    assert plugin._pending_state_has_due_work(item, cleanup_enabled=True)
+    assert plugin._has_due_follow_up({"episode": item})
+    item["preview_check_after"] = "2999-01-01T00:00:00"
+    item["operation_intent"] = {"stage": "reorganize"}
+    assert plugin._pending_state_has_due_work(item, cleanup_enabled=True)
+    assert plugin._has_due_follow_up({"episode": item})
+    state = {"episode": item}
+    plugin._cache_processing_preview(state, {"episode"}, "/library/Title.mkv")
+    assert "preview_check_after" not in state["episode"]
+    assert state["episode"]["refresh_attempts"] == 3
+
+
+@pytest.mark.parametrize("pending", ["sidecar_pending", "cleanup_pending", "scan_pending",
+                                   "operation_intent", "rename_report_pending"])
+def test_manual_refresh_retry_preserves_committed_target(pending):
+    plugin = RecentEpisodeMaintenance()
+    item = {"status": "attention", "attention_stage": "refresh", "refresh_attempts": 3,
+            "expected_path": "/library/Submitted.mkv", "previewed_at": "2000-01-01T00:00:00",
+            pending: {"stage": "reorganize"} if pending == "operation_intent" else True}
+    assert plugin._can_reuse_processing_preview(item)
+    saved = []
+    plugin._load_processing_state = lambda: {"episode": deepcopy(item)}
+    plugin._save_processing_state = lambda state: saved.append(deepcopy(state)) or True
+    assert plugin._retry_attention_records() == 1
+    assert saved[-1]["episode"]["expected_path"] == item["expected_path"]
+    assert saved[-1]["episode"]["previewed_at"] == item["previewed_at"]
+    if pending == "operation_intent":
+        assert saved[-1]["episode"][pending] == item[pending]
+
+
+@pytest.mark.parametrize("outcome", ["matches", "mismatch", "failed"])
+def test_stale_refresh_preview_is_rechecked_before_confirmation_or_cap(monkeypatch, outcome):
+    current = "/library/Show S01E182 - Correct Title.mkv"
+    history = SimpleNamespace(id=182, date="2999-01-01 00:00:00", dest=current)
+    calls = []
+    def preview(_history):
+        calls.append("preview")
+        return OperationResult(success=outcome != "failed", message="preview failed",
+                               target=Path(current) if outcome == "matches" else Path("/library/Show S01E182 - Other.mkv"))
+    fake = SimpleNamespace(
+        recent_histories=lambda **kwargs: [history], processing_key=lambda _: "episode",
+        target_path=lambda _: Path(current), display_name=lambda _: "Show S01E182",
+        episode_target=lambda _: EpisodeTarget(path=current), preview=preview,
+    )
+    episode = EpisodeItem(item_id="jf", name="Correct Title", series_name="Show",
+                          season_number=1, episode_number=182, path=current)
+    client = SimpleNamespace(libraries=lambda: [], path_key=JellyfinServiceClient.path_key,
+        match_recent_episodes=lambda **kwargs: {JellyfinServiceClient.path_key(current): [episode]},
+        refresh_episode=lambda **kwargs: calls.append("refresh"))
+    monkeypatch.setattr(plugin_module, "MoviePilotReorganizer", lambda **kwargs: fake)
+    plugin = RecentEpisodeMaintenance()
+    plugin._enable_refresh = True
+    plugin._enable_reorganize = False
+    plugin._max_items, plugin._days = 10, 15
+    plugin._scan_after_reorganize = False
+    plugin._dry_run, plugin._notify = False, False
+    plugin._library_ids = []
+    plugin._refresh_mode, plugin._replace_images = "all", True
+    plugin._get_jellyfin_client = lambda: client
+    initial = {"episode": {"status": "pending_refresh", "history_id": 182,
+        "history_date": history.date, "refresh_attempts": 3, "had_action": True,
+        "refresh_confirmation_pending": True, "refresh_check_after": "2000-01-01T00:00:00",
+        "expected_path": "/library/Show S01E182 - Stale Title.mkv",
+        "previewed_at": "2000-01-01T00:00:00"}}
+    saved, results = [], []
+    plugin._load_processing_state = lambda: deepcopy(saved[-1] if saved else initial)
+    plugin._save_processing_state = lambda state: saved.append(deepcopy(state)) or True
+    finish = plugin._finish_run
+    plugin._finish_run = lambda result, state: (results.append(result), finish(result, state))
+    plugin._run_once()
+    assert calls == ["preview"]
+    item = saved[-1]["episode"]
+    if outcome == "matches":
+        assert item["status"] == "complete"
+        assert Path(item["expected_path"]) == Path(current)
+        assert results[-1].refresh_confirmed == 1
+        assert results[-1].refreshed == 0
+    elif outcome == "mismatch":
+        assert item["status"] == "attention"
+        assert item["refresh_attempts"] == 3
+        assert item["expected_path"].endswith("Other.mkv")
+    else:
+        assert item["status"] == "pending_refresh"
+        assert item["refresh_attempts"] == 3
+        assert results[-1].failed
+        assert not plugin._has_due_follow_up(saved[-1])
+        assert not plugin._pending_state_has_due_work(item, cleanup_enabled=True)
+        plugin._run_once()
+        assert calls == ["preview"]
+        saved[-1]["episode"]["preview_check_after"] = "2000-01-01T00:00:00"
+        assert plugin._has_due_follow_up(saved[-1])
+        plugin._run_once()
+        assert calls == ["preview", "preview"]
+        assert saved[-1]["episode"]["refresh_attempts"] == 3
 
 
 def test_skipped_count_is_unique_per_episode():
@@ -697,6 +837,8 @@ def test_retry_attention_records_resets_the_failed_stage():
             "attention_stage": "refresh",
             "refresh_attempts": 3,
             "refresh_check_after": "2999-01-01T00:00:00",
+            "expected_path": "/library/Show S01E182 - Old Title.mkv",
+            "previewed_at": "2026-01-01T00:00:00",
         },
         "complete": {
             "status": plugin._STATE_COMPLETE,
@@ -724,6 +866,8 @@ def test_retry_attention_records_resets_the_failed_stage():
     assert state["rename"]["rename_attempts"] == 0
     assert state["refresh"]["status"] == plugin._STATE_PENDING_REFRESH
     assert state["refresh"]["refresh_attempts"] == 0
+    assert "expected_path" not in state["refresh"]
+    assert "previewed_at" not in state["refresh"]
     assert plugin._timestamp_is_due(state["refresh"]["refresh_check_after"])
     assert state["complete"]["status"] == plugin._STATE_COMPLETE
 
@@ -1088,6 +1232,7 @@ def test_formal_jellyfin_title_waits_for_fresh_moviepilot_preview(monkeypatch, e
             "history_date": history.date,
             "expected_path": str(expected_path),
             "had_action": True,
+            "previewed_at": datetime.now().isoformat(),
             "refresh_check_after": "2000-01-01T00:00:00",
         }
     }
@@ -1183,7 +1328,8 @@ def test_formal_jellyfin_title_waits_for_fresh_moviepilot_preview(monkeypatch, e
     plugin._run_once()
 
     assert FakeClient.refresh_calls == 3
-    assert FakeReorganizer.preview_calls == 2
+    # The cap and manual retry both revalidate, before the final monitoring check.
+    assert FakeReorganizer.preview_calls == 4
     assert results[-1].refresh_confirmed == 0
     assert saved[-1]["episode"]["status"] == plugin._STATE_COMPLETE
     assert (
@@ -1647,6 +1793,10 @@ def test_cleanup_verification_does_not_block_post_scan_metadata_check(
         def reorganize(self, **_kwargs):
             type(self).reorganize_calls += 1
             raise AssertionError("metadata confirmation must not reorganize the file")
+
+        @staticmethod
+        def preview(_history):
+            return OperationResult(success=True, target=new_media)
 
     episode = EpisodeItem(
         item_id="jf-1",
