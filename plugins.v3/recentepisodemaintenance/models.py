@@ -96,6 +96,7 @@ class EpisodeItem:
     path: str = ""
     provider_ids: dict[str, Any] = field(default_factory=dict)
     item_type: str = "Episode"
+    primary_image_tag: str = ""
 
     @classmethod
     def from_jellyfin(cls, item: dict[str, Any]) -> "EpisodeItem":
@@ -109,6 +110,7 @@ class EpisodeItem:
             path=item.get("Path") or "",
             provider_ids=item.get("ProviderIds") or {},
             item_type=item.get("Type") or "Episode",
+            primary_image_tag=(item.get("ImageTags") or {}).get("Primary") or "",
         )
 
     @property
@@ -257,6 +259,9 @@ class RunResult:
     reorganized: int = 0
     refreshed: int = 0
     refresh_confirmed: int = 0
+    artwork_previewed: int = 0
+    artwork_completed: int = 0
+    artwork_attempts: int = 0
     skipped: int = 0
     failed: int = 0
     errors: list[str] = field(default_factory=list)
@@ -338,7 +343,9 @@ class RunResult:
             )
         lines.extend(
             [
-                f"操作统计：刷新、重新整理和弹幕补全 {self.operations_used}/{self.operation_limit} 次；"
+                f"操作统计：刷新、重新整理和弹幕补全"
+                f"{'及剧照补全' if self.artwork_attempts else ''} "
+                f"{self.operations_used}/{self.operation_limit} 次；"
                 f"重新整理试运行预览 {self.previewed} 条，成功 {self.reorganized} 项；"
                 f"元数据刷新试运行预览 {self.refresh_previewed} 项，提交 {self.refreshed} 项，"
                 f"标题确认 {self.refresh_confirmed} 项；"
@@ -348,6 +355,9 @@ class RunResult:
                 f"跳过 {self.skipped} 项，失败 {self.failed} 项",
             ]
         )
+        if self.artwork_attempts:
+            lines.append(f"剧照补全：尝试 {self.artwork_attempts} 项，试运行预览 {self.artwork_previewed} 项，"
+                         f"完成 {self.artwork_completed} 项")
         if self.refreshed_titles:
             lines.append("元数据刷新已提交媒体（等待标题确认）：")
             lines.extend(f"- {title}" for title in self.refreshed_titles)

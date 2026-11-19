@@ -35,9 +35,10 @@ except Exception:
     MediaServerHelper = None
 
 from .jellyfin_client import JellyfinServiceClient
+from .artwork import EpisodeArtwork, SeasonKey
 from .models import EpisodeItem, RunResult
 from .reorganizer import MoviePilotReorganizer
-from .danmu import DanmuMaintenance, DanmuRequestLimiter, DanmuRateStateError, LogVarClient
+from .danmu import DanmuMaintenance, DanmuRequestLimiter, DanmuRateStateError, LogVarClient, safe_error
 
 
 class RecentEpisodeMaintenance(_PluginBase):
@@ -61,8 +62,11 @@ class RecentEpisodeMaintenance(_PluginBase):
     _PREVIEW_CACHE_MINUTES = 30
     _PREVIEW_RETRY_MINUTES = 60
     _FOLLOW_UP_POLL_MINUTES = 10
-    _MONITOR_INTERVAL_HOURS = (24, 48, 72)
-    _INSPECTION_MULTIPLIER = 5
+    _MONITOR_INTERVAL_HOURS = (24, 48, 72, 168)
+    _DEFAULT_INSPECTION_LIMIT = 100
+    _FOLLOW_UP_INSPECTION_LIMIT = 50
+    _HISTORY_RECHECK_MINUTES = 60
+    _MAX_HISTORY_RECHECKS = 3
     _STATE_SAVE_ATTEMPTS = 3
     _STATE_SAVE_RETRY_SECONDS = 2
     _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".avif"}
@@ -103,15 +107,10 @@ class RecentEpisodeMaintenance(_PluginBase):
         "return prefix + `自定义计划（${value}）`;"
         "})() }}"
     )
-    _REFRESH_MODE_OPTIONS = [
-        {"title": "扫描新的和有修改的文件", "value": "scan"},
-        {"title": "搜索缺少的元数据", "value": "missing"},
-        {"title": "覆盖所有元数据", "value": "all"},
-    ]
     plugin_name = "最近媒体维护"
     plugin_desc = "维护 MoviePilot 最近整理入库的 Jellyfin 电影和剧集"
     plugin_icon = "https://raw.githubusercontent.com/byangmath/MoviePilot-Plugins/main/icons/recentepisodemaintenance.png"
-    plugin_version = "1.0.6"
+    plugin_version = "1.0.7"
     plugin_author = "byangmath"
     author_url = "https://github.com/byangmath"
     plugin_config_prefix = "recentepisodemaintenance_"
@@ -126,27 +125,20 @@ class RecentEpisodeMaintenance(_PluginBase):
         self._cron = config.get("cron") or "0 4 * * *"
         self._days = int(config.get("days") or 7)
         self._max_items = int(config.get("max_items") or 20)
+        try:
+            self._max_checks = max(1, int(config.get("max_checks") or self._DEFAULT_INSPECTION_LIMIT))
+        except (TypeError, ValueError):
+            self._max_checks = self._DEFAULT_INSPECTION_LIMIT
         self._dry_run = bool(config.get("dry_run", True))
         self._notify = bool(config.get("notify", False))
-        self._enable_refresh = bool(config.get("enable_refresh", True))
-        self._enable_reorganize = bool(config.get("enable_reorganize", False))
+        self._enable_refresh = True
+        self._enable_artwork = True
+        self._enable_reorganize = True
+        self._cleanup_old_sidecars = True
+        self._skip_same_name = True
+        self._scan_after_reorganize = True
         self._enable_danmu = bool(config.get("enable_danmu", False))
         self._danmu_api_url = str(config.get("danmu_api_url") or "").strip()
-        self._scan_after_reorganize = bool(config.get("scan_after_reorganize", True))
-        self._cleanup_old_sidecars = bool(config.get("cleanup_old_sidecars", True))
-        self._skip_same_name = bool(config.get("skip_same_name", True))
-        self._refresh_mode = str(config.get("refresh_mode") or "all")
-        if self._refresh_mode not in {"scan", "missing", "all"}:
-            self._refresh_mode = "all"
-        self._replace_images = bool(config.get("replace_images", True))
-        refresh_defaults = {
-            "refresh_mode": self._refresh_mode,
-            "replace_images": self._replace_images,
-        }
-        for key, value in refresh_defaults.items():
-            if key not in config or config.get(key) is None or (key == "refresh_mode" and config.get(key) != value):
-                config[key] = value
-                config_changed = True
         self._media_server_name = config.get("media_server_name") or self._first_jellyfin_service_name()
         library_ids_selection = self._library_ids_selection(config.get("library_ids"))
         self._library_ids = self._normalize_values(library_ids_selection)
@@ -236,11 +228,25 @@ class RecentEpisodeMaintenance(_PluginBase):
                             self._switch("enabled", "启用插件", 6, "开启后按执行周期自动运行"),
                             self._switch("run_once", "立即运行一次", 6, "保存配置后执行一次，随后自动关闭"),
                             self._switch(
+                                "notify",
+                                "运行完成后发送通知",
+                                6,
+                                "每次完整运行结束后通过 MoviePilot 消息渠道发送结果；"
+                                "无到期任务的轻量检查不发送",
+                            ),
+                            self._switch(
+                                "dry_run",
+                                "试运行模式",
+                                6,
+                                "只查询、匹配和预览，不刷新元数据或修改文件",
+                            ),
+                            self._switch(
                                 "retry_attention",
                                 "重新处理需人工检查记录",
-                                6,
+                                12,
                                 "重置全部人工检查记录的对应重试次数并立即重新入队，保存后自动关闭",
                             ),
+                            self._attention_panel(),
                             self._text(
                                 "cron",
                                 "执行周期",
@@ -258,44 +264,13 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 "max_items",
                                 "单次最大处理数量",
                                 6,
-                                "限制每轮刷新、重新整理和弹幕补全的合计操作数；媒体维护与弹幕补全分别最多检查该数量五倍的记录",
+                                "限制每轮刷新、重新整理、剧照和弹幕补全的合计操作数",
                             ),
-                            self._switch(
-                                "dry_run",
-                                "试运行模式",
+                            self._number(
+                                "max_checks",
+                                "单次最大媒体检查数量",
                                 6,
-                                "只查询、匹配和预览，不刷新元数据或修改文件",
-                            ),
-                            self._switch(
-                                "notify",
-                                "运行完成后发送通知",
-                                6,
-                                "每次完整运行结束后通过 MoviePilot 消息渠道发送结果；"
-                                "无到期任务的轻量检查不发送",
-                            ),
-                            self._switch(
-                                "enable_refresh",
-                                "刷新最近整理媒体元数据",
-                                6,
-                                "Jellyfin 标题与 MoviePilot 当前整理预览中的媒体标题不一致时刷新元数据",
-                            ),
-                            self._switch(
-                                "enable_reorganize",
-                                "重命名最近整理媒体文件",
-                                6,
-                                "按原整理记录重新整理，使当前命名规则生效",
-                            ),
-                            self._switch(
-                                "scan_after_reorganize",
-                                "整理后扫描媒体库",
-                                6,
-                                "重新整理成功后通知 Jellyfin 扫描媒体库",
-                            ),
-                            self._switch(
-                                "cleanup_old_sidecars",
-                                "清理旧名称附件",
-                                6,
-                                "确认新视频、NFO 和图片就绪后，延迟清理本次重命名留下的旧名称附件",
+                                "限制完整运行的标题和整理预览检查数，默认 100 条，不增加写操作上限",
                             ),
                             self._switch(
                                 "enable_danmu", "补全缺失弹幕", 6,
@@ -307,12 +282,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 "http://服务器IP:9321 或 https://域名/Token", 6,
                                 "填写 MP 可访问的 LogVar 基础地址，可包含 Token 路径；与 Jellyfin Danmu "
                                 "可使用不同网络入口，但须连接同一服务并共用媒体 ID，不要添加 /api/v2 等接口路径",
-                            ),
-                            self._switch(
-                                "skip_same_name",
-                                "跳过命名未变化的文件",
-                                6,
-                                "按当前命名规则预览，若生成的文件路径与上次整理结果相同，则跳过。",
+                                show="{{ model.enable_danmu === true }}",
                             ),
                         ],
                     },
@@ -335,20 +305,6 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 multiple=True,
                                 hint="限制 Jellyfin 条目匹配范围；选择全部则包含电影库和剧集库",
                             ),
-                            self._select(
-                                "refresh_mode",
-                                "刷新模式",
-                                self._REFRESH_MODE_OPTIONS,
-                                12,
-                                clearable=False,
-                                hint="控制 Jellyfin 如何查找或替换元数据",
-                            ),
-                            self._switch(
-                                "replace_images",
-                                "替换现有图片",
-                                12,
-                                "完整刷新时重新下载并替换现有图片",
-                            ),
                         ],
                     },
                 ],
@@ -360,19 +316,13 @@ class RecentEpisodeMaintenance(_PluginBase):
             "cron": "0 4 * * *",
             "days": 7,
             "max_items": 20,
+            "max_checks": self._DEFAULT_INSPECTION_LIMIT,
             "dry_run": True,
             "notify": False,
-            "enable_refresh": True,
-            "enable_reorganize": False,
             "enable_danmu": False,
             "danmu_api_url": "",
-            "scan_after_reorganize": True,
-            "cleanup_old_sidecars": True,
-            "skip_same_name": True,
             "media_server_name": self._media_server_name or default_media_server,
             "library_ids": self._library_ids_selection(self._library_ids),
-            "refresh_mode": "all",
-            "replace_images": True,
         }
 
     def stop_service(self):
@@ -537,9 +487,11 @@ class RecentEpisodeMaintenance(_PluginBase):
     def _run_once(self, follow_up_only: bool = False):
         operation_limit = max(int(self._max_items), 1)
         result = RunResult(operation_limit=operation_limit)
-        if not self._enable_refresh and not self._enable_reorganize and not getattr(self, "_enable_danmu", False):
+        artwork_enabled = getattr(self, "_enable_artwork", False) and not follow_up_only
+        metadata_enabled = self._enable_refresh or self._enable_reorganize
+        if not metadata_enabled and not getattr(self, "_enable_danmu", False) and not artwork_enabled:
             logger.warning("[最近媒体维护] 未启用任何功能")
-            result.add_error("未启用元数据刷新、重新整理或弹幕补全功能")
+            result.add_error("未启用元数据刷新、重新整理、剧照或弹幕补全功能")
             self._finish_run(result)
             return
 
@@ -567,15 +519,16 @@ class RecentEpisodeMaintenance(_PluginBase):
                     and self._has_due_follow_up({"item": item}, include_danmu=False)
                 }
                 history_pool = reorganizer.histories_by_ids(ids)
-                present = {int(history.id) for history in history_pool}
-                stored_state = {key: item for key, item in stored_state.items()
-                                if int(item.get("history_id") or 0) not in ids - present}
             else:
+                ids = self._tracked_history_ids(stored_state)
                 history_pool = reorganizer.recent_histories(
                     days=self._days,
-                    tracked_history_ids=self._tracked_history_ids(stored_state),
+                    tracked_history_ids=ids,
                     preferred_history_ids=self._protected_history_ids(stored_state),
                 )
+            history_pool, stored_state = self._reconcile_missing_histories(
+                history_pool, stored_state, ids, reorganizer, follow_up_only,
+            )
             histories, processing_state, selection = self._select_histories(
                 histories=history_pool,
                 reorganizer=reorganizer,
@@ -636,16 +589,23 @@ class RecentEpisodeMaintenance(_PluginBase):
             self._finish_run(result)
             return
 
-        if not histories or (not self._enable_refresh and not self._enable_reorganize):
+        if not histories or not metadata_enabled:
             waiting_text = self._waiting_records_text(selection)
             logger.info(
-                ("[最近媒体维护] 仅检查缺失弹幕，不调用 MP 整理预览"
-                 if not self._enable_refresh and not self._enable_reorganize
+                ("[最近媒体维护] 仅检查已启用的附件补全功能，不调用 MP 整理预览"
+                 if not metadata_enabled and artwork_enabled
+                 else "[最近媒体维护] 仅检查缺失弹幕，不调用 MP 整理预览"
+                 if not metadata_enabled
                  else "[最近媒体维护] 当前时间范围内没有到期待处理的整理记录")
                 + waiting_text
             )
             if not follow_up_only:
                 self._maintain_danmu(history_pool, reorganizer, processing_state, result)
+            if artwork_enabled:
+                self._maintain_episode_artwork(
+                    history_pool, reorganizer, processing_state, result,
+                    inspected=set() if metadata_enabled else None,
+                )
             self._finish_run(result, processing_state)
             return
 
@@ -761,6 +721,8 @@ class RecentEpisodeMaintenance(_PluginBase):
         history_keys_by_target: dict[str, set[str]] = {}
         expected_paths: dict[str, Path] = {}
         preview_failed_keys: set[str] = set()
+        previewed_seasons: set[SeasonKey] = set()
+        artwork_matches: dict[str, list[EpisodeItem]] = {}
         state_persistence_failed = False
         for history in histories:
             processing_key = reorganizer.processing_key(history)
@@ -787,6 +749,8 @@ class RecentEpisodeMaintenance(_PluginBase):
             preview = reorganizer.preview(history)
             if preview.success and preview.target:
                 expected_paths[processing_key] = preview.target
+                if artwork_enabled and (identity := EpisodeArtwork.identity(history)):
+                    previewed_seasons.add(identity[0])
                 if cached_path and not self._same_path(cached_path, preview.target):
                     logger.info(
                         f"[最近媒体维护] MP 预览已变化 {reorganizer.display_name(history)}："
@@ -878,6 +842,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                         days=self._days,
                         library_ids=self._library_ids,
                     )
+                    artwork_matches = matches
                 except Exception as err:
                     matching_failed = True
                     matches = {}
@@ -923,7 +888,6 @@ class RecentEpisodeMaintenance(_PluginBase):
                     )
 
                 result.refresh_candidates = len(matched_episodes)
-                metadata_mode, image_mode, replace_metadata, replace_images = self._refresh_options()
                 for episode in matched_episodes.values():
                     episode_history_keys = self._history_keys_for_episode(
                         episode.item_id,
@@ -935,7 +899,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                         expected_paths,
                     )
                     episode_label = episode.media_label
-                    episode_file = expected_path or episode.path or "未知文件"
+                    episode_file = episode.path or "未知文件"
                     if not expected_path:
                         result.add_error(f"{episode_label}：缺少 MP 整理预览", episode_file)
                         missing_preview_targets = (
@@ -1143,6 +1107,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                             episode_history_keys,
                             self._STATE_ATTENTION,
                             attention_stage="refresh",
+                            attention_detail=f"Jellyfin 标题：{episode.name or '空'}；已刷新 {refresh_attempts} 次",
                             refresh_attempts=refresh_attempts,
                         )
                         for refresh_target in refresh_targets:
@@ -1215,13 +1180,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                         break
                     result.operations_used += 1
                     try:
-                        client.refresh_episode(
-                            item_id=episode.item_id,
-                            metadata_mode=metadata_mode,
-                            image_mode=image_mode,
-                            replace_metadata=replace_metadata,
-                            replace_images=replace_images,
-                        )
+                        client.refresh_episode(item_id=episode.item_id)
                         result.actions_submitted += 1
                         result.refreshed += 1
                         result.add_refreshed_title(str(episode_file))
@@ -1596,6 +1555,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                                     cleanup_old_media_path=cleanup_old_media_path,
                                     cleanup_passes=next_cleanup_pass,
                                     attention_stage="cleanup",
+                                    attention_detail="；".join(cleanup_issues),
                                 )
                                 self._clear_operation_intent(
                                     processing_state,
@@ -1991,6 +1951,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                                 {processing_key},
                                 self._STATE_ATTENTION if operation.requires_review else self._STATE_PENDING_REORGANIZE,
                                 attention_stage="transfer" if operation.requires_review else None,
+                                attention_detail=operation.message if operation.requires_review else None,
                             )
                             self._clear_operation_intent(
                                 processing_state,
@@ -2096,6 +2057,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                         None if exhausted else self._sidecar_recheck_at()
                     ),
                     attention_stage=("transfer" if missing_video else "sidecar") if exhausted else None,
+                    attention_detail=f"重新整理后仍缺少{missing_text}" if exhausted else None,
                 )
                 if exhausted:
                     message = (
@@ -2211,7 +2173,88 @@ class RecentEpisodeMaintenance(_PluginBase):
 
         if not state_persistence_failed and not follow_up_only:
             self._maintain_danmu(history_pool, reorganizer, processing_state, result, client)
+            if artwork_enabled:
+                self._maintain_episode_artwork(
+                    history_pool, reorganizer, processing_state, result,
+                    inspected=set(expected_paths), previewed_seasons=previewed_seasons,
+                    client=client, matches=artwork_matches,
+                )
         self._finish_run(result, processing_state)
+
+    def _maintain_episode_artwork(
+        self, histories, reorganizer, state, result, *, inspected,
+        previewed_seasons=None, client=None, matches=None,
+    ) -> None:
+        candidates = []
+        for history in histories:
+            key = reorganizer.processing_key(history)
+            item = state.get(key) or {}
+            due = item.get("artwork_check_after")
+            if item.get("artwork_done") or self._history_window_expired(item):
+                continue
+            if due and not self._timestamp_is_due(due):
+                continue
+            if not due and inspected is not None and key not in inspected:
+                continue
+            if any(item.get(flag) for flag in ("scan_pending", "sidecar_pending", "cleanup_pending")):
+                continue
+            identity = EpisodeArtwork.identity(history)
+            target = MoviePilotReorganizer.media_target(history)
+            if not identity or not target:
+                continue
+            expected = item.get("expected_path")
+            if self._enable_reorganize and expected and not self._same_path(expected, target.path):
+                continue
+            candidates.append((key, due, identity, target, str(getattr(history, "title", "") or "")))
+        if not candidates or result.operations_used >= result.operation_limit:
+            return
+        candidates.sort(key=lambda entry: (not entry[1], entry[1] or ""))
+        candidates = candidates[:getattr(self, "_max_checks", self._DEFAULT_INSPECTION_LIMIT)]
+        client = client or self._get_jellyfin_client()
+        if not client:
+            return
+        matched = dict(matches or {})
+        missing_matches = [target for _, _, _, target, _ in candidates if client.path_key(target.path) not in matched]
+        if missing_matches:
+            try:
+                matched.update(client.match_recent_media(missing_matches, days=self._days, library_ids=self._library_ids))
+            except Exception as err:
+                logger.warning("[最近媒体维护] 剧照匹配失败：%s", type(err).__name__)
+        artwork = EpisodeArtwork(previewed_seasons or set())
+        retry_at = (datetime.now() + timedelta(days=1)).isoformat(timespec="seconds")
+        for key, _, (season, number), target, title in candidates:
+            if result.operations_used >= result.operation_limit:
+                break
+            entries = matched.get(client.path_key(target.path)) or []
+            if not self._dry_run:
+                state.setdefault(key, {})["artwork_check_after"] = retry_at
+            if len(entries) != 1:
+                continue
+            episode = entries[0]
+            if not episode.is_episode or episode.season_number != season[1] or episode.episode_number != number:
+                continue
+            tmdb_id = next((v for k, v in episode.provider_ids.items() if k.casefold() == "tmdb"), None)
+            if (not tmdb_id and client.path_key(episode.path) != client.path_key(target.path)
+                    and (not title or title.casefold() != episode.series_name.casefold())):
+                continue
+            try:
+                if not episode.primary_image_tag and not client.has_primary_image(episode.item_id):
+                    still = artwork.still_path(season, number, tmdb_id)
+                    if not still:
+                        continue
+                    result.operations_used += 1
+                    result.artwork_attempts += 1
+                    if self._dry_run:
+                        result.artwork_previewed += 1
+                        continue
+                    if client.add_primary_image_if_missing(episode.item_id, artwork.download(still)):
+                        result.artwork_completed += 1
+                        logger.info("[最近媒体维护] 单集剧照补全完成：%s", episode.media_label)
+                if not self._dry_run:
+                    state[key].pop("artwork_check_after", None)
+                    state[key]["artwork_done"] = True
+            except Exception as err:
+                logger.warning("[最近媒体维护] 单集剧照检查失败 %s：%s", episode.media_label, type(err).__name__)
 
     @staticmethod
     def _report_reorganized(item: dict[str, Any], target: Any, result: RunResult) -> None:
@@ -2280,16 +2323,6 @@ class RecentEpisodeMaintenance(_PluginBase):
         post_message = getattr(self, "post_message", None)
         if callable(post_message):
             post_message(mtype=MessageType.Plugin, title=title, text=text)
-
-    def _refresh_options(self) -> tuple[str, str, bool, bool]:
-        if self._refresh_mode == "scan":
-            return "Default", "Default", False, False
-        return (
-            "FullRefresh",
-            "FullRefresh",
-            self._refresh_mode == "all",
-            self._replace_images,
-        )
 
     @classmethod
     def _wait_for_reorganized_sidecars(
@@ -2604,6 +2637,126 @@ class RecentEpisodeMaintenance(_PluginBase):
             return f"文件：{current}"
         return f"原文件：{current}｜新文件：{target}"
 
+    @staticmethod
+    def _committed_history_target(item: dict[str, Any]) -> str:
+        intent = item.get("operation_intent") or {}
+        if isinstance(intent, dict) and intent.get("operation") == "reorganize":
+            return str(intent.get("expected_path") or item.get("expected_path") or "")
+        if any(item.get(flag) for flag in (
+            "sidecar_pending", "cleanup_pending", "scan_pending", "rename_report_pending",
+        )):
+            return str(item.get("expected_path") or "")
+        return ""
+
+    def _reconcile_missing_histories(
+        self,
+        histories: list[Any],
+        state: dict[str, dict[str, Any]],
+        requested_ids: set[int],
+        reorganizer: MoviePilotReorganizer,
+        follow_up_only: bool,
+    ) -> tuple[list[Any], dict[str, dict[str, Any]]]:
+        by_id = {int(history.id): history for history in histories if getattr(history, "id", None)}
+        state = dict(state)
+        missing = requested_ids - by_id.keys()
+        protected = {}
+        for key, item in list(state.items()):
+            if not isinstance(item, dict):
+                continue
+            history_id = int(item.get("history_id") or 0)
+            if history_id not in missing:
+                if history_id in by_id and item.get("history_lookup_attempts"):
+                    state[key] = {k: v for k, v in item.items()
+                                  if k not in {"history_lookup_attempts", "history_recheck_after"}}
+                continue
+            if target := self._committed_history_target(item):
+                protected[key] = target
+            elif follow_up_only:
+                state.pop(key)
+        due = {
+            key: target for key, target in protected.items()
+            if state[key].get("status") != self._STATE_ATTENTION
+            and self._timestamp_is_due(state[key].get("history_recheck_after"))
+        }
+        candidates = reorganizer.replacement_history_candidates(set(due.values())) if due else []
+        matches = {}
+        for key, target in due.items():
+            newer_at_target = [
+                history for history in candidates
+                if int(history.id) > int(state[key]["history_id"])
+                and self._same_path(reorganizer.target_path(history), target)
+            ]
+            # Even a matching transfer is unsafe if another newer record claims its file.
+            matches[key] = (
+                newer_at_target if len(newer_at_target) == 1
+                and reorganizer.matches_replacement_history(
+                    newer_at_target[0], key, state[key], target,
+                ) else []
+            )
+        claimed = {}
+        for histories_for_key in matches.values():
+            for history in histories_for_key:
+                history_id = int(history.id)
+                claimed[history_id] = claimed.get(history_id, 0) + 1
+        rebound_keys = set()
+        for key, hits in matches.items():
+            item = dict(state[key])
+            old_id = item["history_id"]
+            if len(hits) == 1:
+                history = hits[0]
+                new_id = int(history.id)
+                new_key = reorganizer.processing_key(history)
+                if claimed[new_id] == 1 and (new_key == key or new_key not in state):
+                    item["history_id"] = new_id
+                    item.pop("history_lookup_attempts", None)
+                    item.pop("history_recheck_after", None)
+                    state.pop(key)
+                    state[new_key] = item
+                    protected.pop(key)
+                    by_id[new_id] = history
+                    rebound_keys.add(new_key)
+                    logger.info(
+                        f"[最近媒体维护] 已续接 MP 整理历史 {old_id} → {new_id}："
+                        f"{reorganizer.display_name(history)}｜目标文件：{due[key]}"
+                    )
+                    continue
+            attempts = int(item.get("history_lookup_attempts") or 0) + 1
+            item["history_lookup_attempts"] = attempts
+            if attempts >= self._MAX_HISTORY_RECHECKS:
+                item["history_resume_status"] = item.get("status")
+                item["status"] = self._STATE_ATTENTION
+                item["attention_stage"] = "history"
+                item.pop("history_recheck_after", None)
+                action = "已转人工检查"
+            else:
+                item["history_recheck_after"] = (
+                    datetime.now() + timedelta(minutes=self._HISTORY_RECHECK_MINUTES)
+                ).isoformat(timespec="seconds")
+                action = f"{self._HISTORY_RECHECK_MINUTES} 分钟后复查"
+            state[key] = item
+            logger.warning(
+                f"[最近媒体维护] 旧整理历史 {old_id} 已不可用，未找到唯一的新历史；"
+                f"保留未完成状态，{action}｜目标文件：{due[key]}"
+            )
+        if not protected and not rebound_keys:
+            return histories, state
+        # Do not use another transfer's current file to resume a committed operation.
+        blocked_paths = {JellyfinServiceClient.path_key(path) for path in protected.values()}
+        rebound_media = {tuple(key.split("|", 3)[:3]) for key in rebound_keys}
+        selected = []
+        for history in by_id.values():
+            key = reorganizer.processing_key(history)
+            if (key in protected
+                    or JellyfinServiceClient.path_key(reorganizer.target_path(history)) in blocked_paths):
+                continue
+            if key in rebound_keys:
+                if int(history.id) != state[key]["history_id"]:
+                    continue
+            elif not follow_up_only and tuple(key.split("|", 3)[:3]) in rebound_media:
+                continue
+            selected.append(history)
+        return selected, state
+
     def _select_histories(
         self,
         histories: list[Any],
@@ -2626,7 +2779,9 @@ class RecentEpisodeMaintenance(_PluginBase):
         state = {
             key: value
             for key, value in state.items()
-            if (follow_up_only or key in active_keys) and isinstance(value, dict)
+            if isinstance(value, dict) and (
+                follow_up_only or key in active_keys or self._committed_history_target(value)
+            )
         }
         for history, key in keyed_histories:
             state_item = dict(state.get(key) or {})
@@ -2638,6 +2793,10 @@ class RecentEpisodeMaintenance(_PluginBase):
                 state_item["history_date"] = str(history_date)
             state_item["label"] = reorganizer.display_name(history)
             state_item["path"] = str(reorganizer.target_path(history) or "未知文件")
+            for field in ("src", "src_storage", "dest_storage", "download_hash"):
+                if value := getattr(history, field, None):
+                    field_name = "source" if field == "src" else field
+                    state_item[f"history_{field_name}"] = str(value)
             if (state_item.get("sidecar_pending") and int(state_item.get("rename_attempts") or 0) > 0
                     and "rename_reported" not in state_item):
                 state_item["rename_report_pending"] = True
@@ -2720,6 +2879,9 @@ class RecentEpisodeMaintenance(_PluginBase):
         pending.sort(
             key=lambda item: (
                 not bool((state.get(item[1]) or {}).get("scan_pending")),
+                not bool(self._committed_history_target(state[item[1]])
+                         or state[item[1]].get("refresh_confirmation_pending")
+                         or state[item[1]].get("refresh_check_after")),
                 str((state.get(item[1]) or {}).get("updated_at") or ""),
             )
         )
@@ -2743,10 +2905,11 @@ class RecentEpisodeMaintenance(_PluginBase):
             key=lambda item: str((state.get(item[1]) or {}).get("next_preview_at") or "")
         )
 
-        operation_limit = max(int(self._max_items), 1)
-        limit = max(operation_limit, operation_limit * self._INSPECTION_MULTIPLIER)
+        limit = getattr(self, "_max_checks", self._DEFAULT_INSPECTION_LIMIT)
+        if follow_up_only:
+            limit = min(limit, self._FOLLOW_UP_INSPECTION_LIMIT)
         selected: list[tuple[Any, str]] = []
-        other_items = [] if follow_up_only else self._interleave_queue_items(monitoring, new_items)
+        other_items = [] if follow_up_only else self._interleave_queue_items(new_items, monitoring)
         if pending and other_items:
             other_reserve = min(len(other_items), max(1, limit // 4)) if limit > 1 else 0
             selected.extend(pending[:max(limit - other_reserve, 0)])
@@ -2975,6 +3138,8 @@ class RecentEpisodeMaintenance(_PluginBase):
         recovered = 0
         for key, value in list(state.items()):
             item = dict(value) if isinstance(value, dict) else {}
+            if item.get("history_lookup_attempts"):
+                continue
             intent = item.get("operation_intent")
             if not isinstance(intent, dict):
                 continue
@@ -3122,6 +3287,8 @@ class RecentEpisodeMaintenance(_PluginBase):
         *,
         cleanup_enabled: bool,
     ) -> bool:
+        if not self._timestamp_is_due(state_item.get("history_recheck_after")):
+            return False
         if state_item.get("preview_check_after") and not self._preview_target_is_committed(state_item):
             return self._timestamp_is_due(state_item["preview_check_after"])
         if state_item.get("operation_intent") or state_item.get("scan_pending"):
@@ -3154,6 +3321,8 @@ class RecentEpisodeMaintenance(_PluginBase):
             if include_danmu and getattr(self, "_enable_danmu", False) and DanmuMaintenance.due(state_item.get("danmu") or {}):
                 return True
             if state_item.get("status") not in pending_statuses:
+                continue
+            if not self._timestamp_is_due(state_item.get("history_recheck_after")):
                 continue
             if state_item.get("preview_check_after") and not self._preview_target_is_committed(state_item):
                 if self._timestamp_is_due(state_item["preview_check_after"]):
@@ -3345,7 +3514,11 @@ class RecentEpisodeMaintenance(_PluginBase):
                 continue
             attention_stage = self._attention_stage(item)
             item.pop("preview_check_after", None)
-            if attention_stage == "cleanup":
+            if attention_stage == "history":
+                item["status"] = item.pop("history_resume_status", None) or self._STATE_PENDING_REORGANIZE
+                item.pop("history_recheck_after", None)
+                item.pop("history_lookup_attempts", None)
+            elif attention_stage == "cleanup":
                 item["status"] = self._STATE_PENDING_REORGANIZE
                 item["cleanup_passes"] = 0
                 item["cleanup_check_after"] = retry_at
@@ -3370,9 +3543,10 @@ class RecentEpisodeMaintenance(_PluginBase):
                 )
                 item["rename_attempts"] = 0
             item["updated_at"] = retry_at
-            if attention_stage != "refresh":
+            if attention_stage not in {"refresh", "history"}:
                 item.pop("operation_intent", None)
             item.pop("attention_stage", None)
+            item.pop("attention_detail", None)
             state[key] = item
             retried += 1
         if not retried:
@@ -3389,7 +3563,7 @@ class RecentEpisodeMaintenance(_PluginBase):
     @staticmethod
     def _attention_stage(item: dict[str, Any]) -> str:
         stage = str(item.get("attention_stage") or "")
-        if stage in {"sidecar", "cleanup", "refresh", "rename", "transfer"}:
+        if stage in {"sidecar", "cleanup", "refresh", "rename", "transfer", "history"}:
             return stage
         if item.get("sidecar_pending"):
             return "sidecar"
@@ -3415,19 +3589,121 @@ class RecentEpisodeMaintenance(_PluginBase):
         if self._notify and result.should_notify():
             self._post_message("最近媒体维护完成", result.summary())
 
-    def _attention_record_detail(
-        self, item: dict[str, Any], name: str, file_path: str
-    ) -> str:
-        reasons = {
+    def _attention_reason(self, item: dict[str, Any]) -> str:
+        return {
             "cleanup": "旧名称附件清理失败",
             "sidecar": "刮削附件多次补齐失败",
             "refresh": "连续刷新后标题仍不一致",
             "rename": "多次重命名后路径仍变化",
             "transfer": "MP 整理结果尚未确认，请检查整理队列后再决定是否重试",
+            "history": "旧整理历史已失效，未能唯一关联新历史；附件处理已暂停",
+        }[self._attention_stage(item)]
+
+    def _attention_target_line(self, item: dict[str, Any], file_path: str) -> str:
+        committed = self._committed_history_target(item)
+        target = committed or item.get("expected_path")
+        if not target or self._same_path(file_path, target):
+            return ""
+        label = "已提交目标" if committed else "MP 预览目标"
+        return f"{label}：{target}"
+
+    def _attention_record_detail(
+        self, item: dict[str, Any], name: str, file_path: str
+    ) -> str:
+        detail = f"{name}：{self._attention_reason(item)}｜当前记录文件：{file_path or '未知文件'}"
+        if item.get("attention_detail"):
+            detail += f"｜详情：{item['attention_detail']}"
+        if target_line := self._attention_target_line(item, file_path):
+            detail += f"｜{target_line}"
+        return detail
+
+    def _attention_table_rows(self, state: dict[str, dict[str, Any]]) -> list[dict[str, str]]:
+        rows: list[dict[str, str]] = []
+        for key, item in state.items():
+            if not isinstance(item, dict):
+                continue
+            name = item.get("label") or f"整理记录 {item.get('history_id') or key}"
+            path = item.get("path") or "未知文件"
+            if item.get("status") == self._STATE_ATTENTION:
+                reason = self._attention_reason(item)
+                if item.get("attention_detail"):
+                    reason += f"\n{item['attention_detail']}"
+                target = self._attention_target_line(item, path)
+                rows.append({"name": name, "kind": "整理与元数据",
+                             "issue": reason, "review": "不适用",
+                             "path": f"{path}\n{target}" if target else path})
+            danmu = item.get("danmu")
+            if isinstance(danmu, dict) and danmu.get("status") == "attention":
+                unavailable = DanmuMaintenance.is_unavailable(danmu)
+                issue = str(danmu.get("error") or "未知原因")
+                review = "不适用"
+                if unavailable:
+                    issue, marker, history = issue.partition("；累计确认")
+                    if marker:
+                        review = "累计确认" + history.replace("；本次手动复核", "\n本次手动复核")
+                for separator in ("｜查询：", "｜来源："):
+                    issue = issue.replace(separator, "\n" + separator[1:])
+                rows.append({"name": danmu.get("label") or name,
+                             "kind": "弹幕无资源已暂停" if unavailable else "弹幕需人工检查",
+                             "issue": issue, "review": review, "path": danmu.get("path") or path})
+        return [{key: safe_error(RuntimeError(value)) for key, value in row.items()} for row in rows]
+
+    @staticmethod
+    def _attention_table(rows: list[dict[str, str]]) -> dict[str, Any]:
+        columns = (("name", "媒体", 2), ("kind", "问题类型", 2),
+                   ("issue", "具体问题", 3), ("review", "处理记录", 2), ("path", "文件路径", 3))
+
+        def render_row(values: dict[str, str], header: bool = False) -> dict[str, Any]:
+            style = {"minWidth": "52rem", "flexWrap": "nowrap",
+                     "borderBottom": "1px solid rgba(var(--v-theme-on-surface), 0.16)"}
+            if header:
+                style.update(position="sticky", top="0", zIndex="1", fontWeight="600",
+                             background="rgb(var(--v-theme-surface))")
+            return {"component": "VRow", "props": {"role": "row", "no-gutters": True, "style": style},
+                    "content": [{
+                        "component": "VCol", "text": values[key],
+                        "props": {"cols": width, "role": "columnheader" if header else "cell", "style": {
+                            "whiteSpace": "pre-line", "overflowWrap": "anywhere", "padding": "0.65rem 0.75rem",
+                        }},
+                    } for key, _, width in columns]}
+
+        return {
+            "component": "VCol",
+            "props": {"role": "table", "aria-label": "需人工检查记录", "tabindex": 0,
+                      "style": {"padding": "0", "maxHeight": "22rem", "maxWidth": "100%", "overflow": "auto"}},
+            "content": [render_row({key: title for key, title, _ in columns}, header=True),
+                        *(render_row(row) for row in rows)],
         }
-        reason = reasons[self._attention_stage(item)]
-        target = item.get("expected_path") or file_path or "未知文件"
-        return f"{name}：{reason}｜文件：{target}"
+
+    def _attention_panel(self) -> dict[str, Any]:
+        title = "需人工检查列表及具体问题"
+        try:
+            state = self._load_processing_state()
+        except Exception:
+            body = {"component": "VAlert", "props": {"type": "warning", "density": "compact", "variant": "tonal"},
+                    "text": "暂无法读取人工检查记录，请稍后重新打开配置。"}
+        else:
+            rows = self._attention_table_rows(state)
+            title += f"（{len(rows)} 项）"
+            body = self._attention_table(rows) if rows else {
+                "component": "VAlert", "props": {"type": "info", "density": "compact", "variant": "tonal"},
+                "text": "暂无需要人工检查的记录。",
+            }
+        return {
+            "component": "VCol",
+            "props": {"cols": 12},
+            "content": [{
+                "component": "VExpansionPanels",
+                "props": {"variant": "accordion"},
+                "content": [{
+                    "component": "VExpansionPanel",
+                    "content": [
+                        {"component": "VExpansionPanelTitle", "text": title},
+                        {"component": "VExpansionPanelText", "content": [body]},
+                    ],
+                }],
+            }],
+        }
 
     def _refresh_result_queue_counts(
         self,
@@ -3551,8 +3827,9 @@ class RecentEpisodeMaintenance(_PluginBase):
             return False
         return timedelta(0) <= age < timedelta(minutes=self._PREVIEW_CACHE_MINUTES)
 
-    @staticmethod
+    @classmethod
     def _cache_processing_preview(
+        cls,
         state: dict[str, dict[str, Any]],
         keys: set[str],
         expected_path: Any,
@@ -3560,6 +3837,10 @@ class RecentEpisodeMaintenance(_PluginBase):
         previewed_at = datetime.now().isoformat(timespec="seconds")
         for key in keys:
             item = dict(state.get(key) or {})
+            if (item.get("status") == cls._STATE_MONITORING
+                    and item.get("expected_path")
+                    and not cls._same_path(item["expected_path"], expected_path)):
+                item.pop("monitoring_checks", None)
             item["expected_path"] = str(expected_path)
             item["previewed_at"] = previewed_at
             item["preview_refresh_attempts"] = int(item.get("refresh_attempts") or 0)
@@ -3754,6 +4035,7 @@ class RecentEpisodeMaintenance(_PluginBase):
         cleanup_check_after: str | None = None,
         cleanup_passes: int | None = None,
         attention_stage: str | None = None,
+        attention_detail: str | None = None,
         placeholder_refresh_done: bool | None = None,
         completion_reason: str | None = None,
     ) -> None:
@@ -3815,8 +4097,11 @@ class RecentEpisodeMaintenance(_PluginBase):
                     attention_stage
                     or RecentEpisodeMaintenance._attention_stage(item)
                 )
+                if attention_detail:
+                    item["attention_detail"] = safe_error(RuntimeError(attention_detail))
             else:
                 item.pop("attention_stage", None)
+                item.pop("attention_detail", None)
             if cleanup_pending is False:
                 for cleanup_key in (
                     "cleanup_pending",
@@ -3989,7 +4274,9 @@ class RecentEpisodeMaintenance(_PluginBase):
         }
 
     @staticmethod
-    def _text(model: str, label: str, placeholder: str, cols: int, hint: str = "") -> dict[str, Any]:
+    def _text(
+        model: str, label: str, placeholder: str, cols: int, hint: str = "", *, show: str | None = None,
+    ) -> dict[str, Any]:
         props: dict[str, Any] = {
             "model": model,
             "label": label,
@@ -3998,9 +4285,12 @@ class RecentEpisodeMaintenance(_PluginBase):
         if hint:
             props["hint"] = hint
             props["persistent-hint"] = True
+        column: dict[str, Any] = {"cols": cols}
+        if show:
+            column["show"] = show
         return {
             "component": "VCol",
-            "props": {"cols": cols},
+            "props": column,
             "content": [{
                 "component": "VTextField",
                 "props": props,

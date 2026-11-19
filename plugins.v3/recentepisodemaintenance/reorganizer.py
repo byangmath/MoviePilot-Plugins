@@ -148,6 +148,73 @@ class MoviePilotReorganizer:
                     self._append_history(candidates, seen, history)
         return [history for history in candidates if self._is_video_history(history)]
 
+    def replacement_history_candidates(
+        self, target_paths: set[str]
+    ) -> list[Any]:
+        """Look for recently submitted targets without collapsing duplicate histories."""
+        targets = {self._path_key(path) for path in target_paths}
+        cutoff = datetime.now() - timedelta(days=2)
+        candidates = []
+        seen_ids: set[int] = set()
+        for page_number in range(1, 6):
+            page = self._list_transfer_history(
+                filters={"status": True, "media_types": ("电影", "电视剧"),
+                         "require_media_identity": True},
+                page={"page": page_number, "count": 200,
+                      "sort": {"field": "date", "direction": "desc"}},
+            )
+            for history in self._page_items(page):
+                date = self._history_date(history)
+                if date is not None and date < cutoff:
+                    return candidates
+                if (self._is_video_history(history)
+                        and self._path_key(self._history_target(history)) in targets):
+                    self._append_history(candidates, seen_ids, history)
+            if not self._page_has_next(page):
+                return candidates
+        # A truncated search cannot establish that a candidate is unique.
+        return []
+
+    @classmethod
+    def matches_replacement_history(
+        cls, history: Any, key: str, state_item: dict[str, Any], target: str,
+    ) -> bool:
+        media = cls._episode_key(history)
+        if (not getattr(history, "media_id", None)
+                or tuple(key.split("|", 3)[:3]) != media):
+            return False
+        if int(getattr(history, "id", 0) or 0) <= int(state_item.get("history_id") or 0):
+            return False
+        if not cls._same_path(cls._history_target(history), target):
+            return False
+        storage = state_item.get("history_dest_storage")
+        if storage and storage != getattr(history, "dest_storage", None):
+            return False
+        old_hash = state_item.get("history_download_hash")
+        new_hash = getattr(history, "download_hash", None)
+        if old_hash and new_hash and old_hash != new_hash:
+            return False
+        new_source = getattr(history, "src", None)
+        if not new_source:
+            return False
+        old_source = state_item.get("history_source")
+        if old_source:
+            old_storage = state_item.get("history_src_storage")
+            if (cls._same_path(new_source, old_source)
+                    and (not old_storage or old_storage == getattr(history, "src_storage", None))):
+                return True
+        elif cls.processing_key(history) == key:
+            # Legacy state may only have a transfer hash or source path in the key.
+            transfer_identity = key.split("|", 3)[-1]
+            if not transfer_identity.startswith("history:"):
+                return True
+        # For move transfers MP uses the old library video as the new input.
+        return bool(
+            "move" in str(getattr(history, "mode", "") or "")
+            and cls._same_path(new_source, state_item.get("path"))
+            and (not storage or storage == getattr(history, "src_storage", None))
+        )
+
     def _select_primary_histories(
         self,
         candidates: list[Any],
@@ -726,7 +793,7 @@ class MoviePilotReorganizer:
         )
 
     @classmethod
-    def _same_path(cls, left: Path | None, right: Path | None) -> bool:
+    def _same_path(cls, left: Path | str | None, right: Path | str | None) -> bool:
         if not left or not right:
             return False
         return cls._path_key(left) == cls._path_key(right)

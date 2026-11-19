@@ -1,9 +1,31 @@
+from urllib.parse import parse_qs, urlsplit
+
 import pytest
 
 import recentepisodemaintenance.jellyfin_client as client_module
 from recentepisodemaintenance import RecentEpisodeMaintenance
 from recentepisodemaintenance.jellyfin_client import JellyfinServiceClient
 from recentepisodemaintenance.models import EpisodeTarget
+
+
+def test_refresh_replaces_all_metadata_and_images():
+    requests = []
+
+    class Service:
+        def post_data(self, url):
+            requests.append(url)
+            return {}
+
+    JellyfinServiceClient(Service()).refresh_episode("episode")
+    url, = requests
+    assert urlsplit(url).path.endswith("Items/episode/Refresh")
+    assert parse_qs(urlsplit(url).query) == {
+        "MetadataRefreshMode": ["FullRefresh"],
+        "ImageRefreshMode": ["FullRefresh"],
+        "ReplaceAllMetadata": ["true"],
+        "ReplaceAllImages": ["true"],
+        "api_key": ["[APIKEY]"],
+    }
 
 
 class UnavailableService:

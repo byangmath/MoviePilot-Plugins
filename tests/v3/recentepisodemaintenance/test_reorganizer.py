@@ -100,6 +100,117 @@ def test_short_follow_up_never_selects_monitoring_or_new_records():
     assert saved["unqueried"] == state["unqueried"]
 
 
+@pytest.mark.parametrize("follow_up_only", [True, False])
+@pytest.mark.parametrize("mode", ["link", "move"])
+def test_committed_rename_rebinds_to_replacement_history(follow_up_only, mode):
+    plugin = RecentEpisodeMaintenance()
+    reorganizer = MoviePilotReorganizer(logger=None)
+    old = history(history_id=40, source="/source/video.mkv",
+                  dest="/library/Old.mkv", date="2026-11-08")
+    new = history(history_id=41, source=old.dest if mode == "move" else old.src,
+                  dest="/library/New.mkv", date=datetime.now().isoformat())
+    old.mode = new.mode = mode
+    if mode == "move":
+        old.download_hash = new.download_hash = ""
+    key = reorganizer.processing_key(old)
+    new_key = reorganizer.processing_key(new)
+    state = {key: {
+        "status": "pending_reorganize", "history_id": old.id, "path": old.dest,
+        "history_source": old.src, "history_src_storage": "local", "history_dest_storage": "local",
+        "expected_path": new.dest, "sidecar_pending": True, "rename_report_pending": True,
+        "cleanup_pending": True, "old_sidecars": ["/library/Old.nfo"],
+        "sidecar_check_after": "2000-01-01T00:00:00", "history_lookup_attempts": 1,
+    }}
+    calls = []
+    def query(*, filters, page):
+        calls.append(page["page"])
+        return {"items": [new]}
+
+    reorganizer._list_transfer_history = query
+    pool, saved = plugin._reconcile_missing_histories(
+        [] if follow_up_only else [new], state, {old.id}, reorganizer, follow_up_only,
+    )
+    selected, saved, _ = plugin._select_histories(pool, reorganizer, saved, follow_up_only)
+    assert calls == [1]
+    assert selected == [new]
+    assert set(saved) == {new_key}
+    assert saved[new_key]["history_id"] == new.id
+    assert saved[new_key]["sidecar_pending"] and saved[new_key]["rename_report_pending"]
+    assert saved[new_key]["cleanup_pending"] and saved[new_key]["old_sidecars"] == ["/library/Old.nfo"]
+    assert "history_lookup_attempts" not in saved[new_key]
+    assert state[key]["history_id"] == old.id
+
+
+@pytest.mark.parametrize("conflict", ["duplicate", "wrong_source", "wrong_media", "overwritten"])
+def test_missing_history_preserves_state_and_quarantines_unsafe_candidates(conflict):
+    plugin = RecentEpisodeMaintenance()
+    reorganizer = MoviePilotReorganizer(logger=None)
+    old = history(history_id=1, source="/source/video.mkv", dest="/library/Old.mkv", date="2026-11-08")
+    new = history(history_id=2, source=old.src, dest="/library/New.mkv", date=datetime.now().isoformat())
+    candidates = [new]
+    if conflict in {"duplicate", "overwritten"}:
+        candidates.append(SimpleNamespace(**{**vars(new), "id": 3,
+            "src": new.src if conflict == "duplicate" else "/source/other.mkv"}))
+    elif conflict == "wrong_source":
+        new.src = "/source/other.mkv"
+    else:
+        new.media_id = "456"
+    key = reorganizer.processing_key(old)
+    state = {key: {
+        "status": "pending_reorganize", "history_id": old.id, "history_source": old.src,
+        "path": old.dest, "expected_path": new.dest, "sidecar_pending": True,
+        "sidecar_check_after": "2000-01-01T00:00:00",
+        "operation_intent": {"operation": "reorganize", "expected_path": new.dest},
+    }}
+    lookups = []
+    reorganizer.replacement_history_candidates = (
+        lambda paths: lookups.append(paths) or candidates
+    )
+    for attempt in range(1, 4):
+        pool, state = plugin._reconcile_missing_histories(candidates, state, {old.id}, reorganizer, False)
+        assert pool == []
+        assert state[key]["history_id"] == old.id
+        assert state[key]["history_lookup_attempts"] == attempt
+        _, state, _ = plugin._select_histories(pool, reorganizer, state)
+        assert state[key]["sidecar_pending"] and state[key]["operation_intent"]
+        if attempt < 3:
+            assert not plugin._has_due_follow_up(state)
+            plugin._reconcile_missing_histories([], state, {old.id}, reorganizer, True)
+            assert len(lookups) == attempt
+            state[key]["history_recheck_after"] = "2000-01-01T00:00:00"
+            assert plugin._has_due_follow_up(state)
+    assert state[key]["status"] == "attention"
+    assert state[key]["attention_stage"] == "history"
+    plugin._load_processing_state = lambda: state
+    plugin._save_processing_state = lambda _: True
+    assert plugin._retry_attention_records() == 1
+    assert state[key]["status"] == "pending_reorganize"
+    assert state[key]["operation_intent"]
+    assert "history_lookup_attempts" not in state[key]
+
+
+def test_follow_up_still_removes_deleted_uncommitted_media():
+    plugin = RecentEpisodeMaintenance()
+    state = {"removed": {"history_id": 1, "status": "pending_refresh", "expected_path": "/library/New.mkv"}}
+    pool, saved = plugin._reconcile_missing_histories([], state, {1}, SimpleNamespace(), True)
+    assert pool == []
+    assert saved == {}
+
+
+def test_truncated_history_lookup_never_selects_a_potentially_ambiguous_target():
+    reorganizer = MoviePilotReorganizer(logger=None)
+    video = history(history_id=2, source="/source/video.mkv",
+                    dest="/library/New.mkv", date=datetime.now().isoformat())
+    pages = []
+    def query(*, filters, page):
+        pages.append(page["page"])
+        return {"items": [video] if len(pages) == 1 else [], "has_next": True}
+
+    reorganizer._list_transfer_history = query
+    assert reorganizer.replacement_history_candidates({video.dest}) == []
+    assert pages == [1, 2, 3, 4, 5]
+
+
 def test_pending_legacy_rename_gets_a_completion_receipt():
     plugin = RecentEpisodeMaintenance()
     plugin._max_items = 1
@@ -249,6 +360,7 @@ def test_movie_history_uses_movie_type_without_season_or_episode():
 def test_attachment_histories_do_not_consume_video_inspection_limit():
     plugin = RecentEpisodeMaintenance()
     plugin._max_items = 1
+    plugin._max_checks = 5
     reorganizer = MoviePilotReorganizer(logger=None)
     candidates = []
 
@@ -550,7 +662,7 @@ def test_verified_monitoring_uses_adaptive_intervals():
         due = datetime.fromisoformat(state["episode"]["next_preview_at"])
         observed_hours.append(round((due - before).total_seconds() / 3600))
 
-    assert observed_hours == [24, 48, 72, 72]
+    assert observed_hours == [24, 48, 72, 168]
     assert state["episode"]["monitoring_checks"] == 4
 
 
@@ -659,6 +771,7 @@ def test_due_cleanup_and_refresh_wait_are_selected_independently():
 def test_due_monitoring_records_are_not_starved_by_new_records():
     plugin = RecentEpisodeMaintenance()
     plugin._max_items = 1
+    plugin._max_checks = 5
     reorganizer = MoviePilotReorganizer(logger=None)
     due_items = []
     stored_state = {}
@@ -698,6 +811,7 @@ def test_due_monitoring_records_are_not_starved_by_new_records():
 
     assert any(item in selected for item in due_items)
     assert any(item in selected for item in new_items)
+    assert selected[0] == new_items[0]
     assert selection["monitoring"] > 0
     assert selection["monitoring_queued"] > 0
     assert selection["new_queued"] > 0
@@ -706,6 +820,7 @@ def test_due_monitoring_records_are_not_starved_by_new_records():
 def test_pending_library_scan_has_priority_over_regular_pending_records():
     plugin = RecentEpisodeMaintenance()
     plugin._max_items = 1
+    plugin._max_checks = 5
     reorganizer = MoviePilotReorganizer(logger=None)
     histories = []
     stored_state = {}
@@ -804,7 +919,7 @@ def test_selection_lists_attention_records_with_reason_and_path():
     assert selection["attention"] == 1
     assert selection["attention_items"] == [
         "测试剧 S01E01：刮削附件多次补齐失败｜"
-        "文件：/library/show/Season 01/测试剧 S01E01.mkv"
+        f"当前记录文件：{Path(video.dest)}"
     ]
 
 
@@ -824,7 +939,7 @@ def test_selection_describes_refresh_attention_records():
             "status": plugin._STATE_ATTENTION,
             "attention_stage": "refresh",
             "refresh_attempts": 3,
-            "expected_path": "/library/show/Season 01/测试剧 S01E01.mkv",
+            "expected_path": "/library/show/Season 01/测试剧 S01E01 - 新标题.mkv",
         }
     }
 
@@ -836,7 +951,8 @@ def test_selection_describes_refresh_attention_records():
     assert selected == []
     assert selection["attention_items"] == [
         "测试剧 S01E01：连续刷新后标题仍不一致｜"
-        "文件：/library/show/Season 01/测试剧 S01E01.mkv"
+        f"当前记录文件：{Path(video.dest)}｜"
+        "MP 预览目标：/library/show/Season 01/测试剧 S01E01 - 新标题.mkv"
     ]
 
 def test_selection_defers_pending_sidecars_until_recheck_time():

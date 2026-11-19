@@ -835,11 +835,14 @@ def test_form_exposes_disabled_danmu_and_persistent_hints():
     plugin._jellyfin_service_options = lambda: []
     plugin._library_options = lambda: []
     form, defaults = plugin.get_form()
-    fields = [child["content"][0]["props"] for row in form[0]["content"] for child in row["content"]]
+    columns = [child for row in form[0]["content"] for child in row["content"]]
+    fields = {child["content"][0]["props"].get("model"): child for child in columns}
     assert defaults["enable_danmu"] is False and defaults["danmu_api_url"] == ""
     for model in ("enable_danmu", "danmu_api_url"):
-        field = next(field for field in fields if field["model"] == model)
+        field = fields[model]["content"][0]["props"]
         assert field["persistent-hint"] is True and "LogVar" in field["hint"]
+    assert "show" not in fields["enable_danmu"]["props"]
+    assert fields["danmu_api_url"]["props"]["show"] == "{{ model.enable_danmu === true }}"
 
 
 def test_incomplete_metadata_is_never_posted():

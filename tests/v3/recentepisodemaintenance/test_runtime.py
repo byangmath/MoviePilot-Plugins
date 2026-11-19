@@ -16,6 +16,119 @@ from recentepisodemaintenance.models import (
 import recentepisodemaintenance as plugin_module
 
 
+@pytest.mark.parametrize("legacy_mode", ["scan", "missing", "all"])
+def test_fixed_maintenance_features_ignore_legacy_switches(monkeypatch, legacy_mode):
+    removed = {
+        "enable_refresh", "enable_reorganize", "cleanup_old_sidecars",
+        "enable_artwork", "skip_same_name",
+        "scan_after_reorganize",
+    }
+    plugin = RecentEpisodeMaintenance()
+    monkeypatch.setattr(plugin, "_jellyfin_service_options", lambda: [])
+    monkeypatch.setattr(plugin, "_library_options", lambda: [])
+    monkeypatch.setattr(plugin, "update_config", lambda _: pytest.fail("unexpected config write"), raising=False)
+    config = dict.fromkeys(removed, False) | {
+        "media_server_name": "Jellyfin", "library_ids": plugin._library_ids_selection(None),
+        "refresh_mode": legacy_mode, "replace_images": False, "dry_run": True,
+        "enable_danmu": False,
+    }
+    plugin.init_plugin(config)
+    assert all(getattr(plugin, f"_{key}") is True for key in removed)
+    assert plugin._dry_run and not plugin._enable_danmu
+
+    form, defaults = plugin.get_form()
+    fields = set(form_models(form)) - {None}
+    assert (removed | {"refresh_mode", "replace_images"}).isdisjoint(fields | defaults.keys())
+    assert {"dry_run", "enable_danmu"} <= fields
+
+
+def form_models(form):
+    return [child["content"][0]["props"].get("model")
+            for row in form[0]["content"] for child in row["content"]]
+
+
+def attention_panel_content(panel):
+    panels = panel["content"][0]
+    assert panels["component"] == "VExpansionPanels"
+    assert not ({"model", "modelValue", "model-value"} & panels["props"].keys())
+    heading, body = panels["content"][0]["content"]
+    return heading["text"], body["content"][0]
+
+
+def test_config_attention_panel_lists_issues_without_retrying(monkeypatch):
+    plugin = RecentEpisodeMaintenance()
+    plugin._media_server_name = "Jellyfin"
+    plugin._library_ids = []
+    state = {
+        "episode": {
+            "status": "attention", "attention_stage": "sidecar", "attention_detail": "重新整理后仍缺少图片",
+            "label": "剧集 S01E01", "path": "/media/episode.mkv", "expected_path": "/media/renamed.mkv",
+            "danmu": {"status": "attention", "label": "剧集 S01E01", "path": "/media/episode.mkv",
+                      "error": "提交后未生成 XML：https://example.test/secret-path"},
+        },
+        "unavailable": {"danmu": {"status": "attention", "unavailable": True, "label": "另一集",
+                                  "error": "返回 0 条弹幕｜查询：另一集｜来源：平台；累计确认无匹配或无弹幕 16 次"
+                                           "；本次手动复核剩余 0 次，已停止自动重试；手动重新处理仅复核可用性"}},
+        "legacy": {"danmu": {"status": "attention", "unavailable_count": 3, "label": "旧记录",
+                             "error": "LogVar 尚未匹配到目标媒体｜查询：旧记录"
+                                      "；累计确认无匹配或无弹幕 3 次，已停止自动重试；手动重新处理仅复核可用性"}},
+        "pending": {"status": "pending_refresh", "label": "排队中"},
+    }
+    previous = deepcopy(state)
+    monkeypatch.setattr(plugin, "_jellyfin_service_options", lambda: [])
+    monkeypatch.setattr(plugin, "_library_options", lambda: [])
+    monkeypatch.setattr(plugin, "_load_processing_state", lambda: state)
+    monkeypatch.setattr(plugin, "_retry_attention_records", lambda: pytest.fail("config read retried tasks"))
+    monkeypatch.setattr(plugin, "_save_processing_state", lambda _: pytest.fail("config read wrote state"))
+    form, defaults = plugin.get_form()
+    assert form_models(form)[:6] == ["enabled", "run_once", "notify", "dry_run", "retry_attention", None]
+    title, table = attention_panel_content(form[0]["content"][0]["content"][5])
+    assert title.endswith("（4 项）")
+    assert table["props"]["role"] == "table"
+    headers, media, danmu, unavailable, legacy = (
+        [cell["text"] for cell in row["content"]] for row in table["content"]
+    )
+    assert headers == ["媒体", "问题类型", "具体问题", "处理记录", "文件路径"]
+    assert media == ["剧集 S01E01", "整理与元数据", "刮削附件多次补齐失败\n重新整理后仍缺少图片", "不适用",
+                     "/media/episode.mkv\nMP 预览目标：/media/renamed.mkv"]
+    assert danmu[1:] == ["弹幕需人工检查", "提交后未生成 XML：[地址已隐藏]", "不适用", "/media/episode.mkv"]
+    assert unavailable[1:4] == ["弹幕无资源已暂停", "返回 0 条弹幕\n查询：另一集\n来源：平台",
+                               "累计确认无匹配或无弹幕 16 次\n本次手动复核剩余 0 次，已停止自动重试；手动重新处理仅复核可用性"]
+    assert legacy[1:4] == ["弹幕无资源已暂停", "LogVar 尚未匹配到目标媒体\n查询：旧记录",
+                          "累计确认无匹配或无弹幕 3 次，已停止自动重试；手动重新处理仅复核可用性"]
+    assert defaults["retry_attention"] is False and state == previous
+
+
+def test_attention_table_keeps_all_rows_in_scrollable_view():
+    rows = [{"name": str(i), "kind": "弹幕", "issue": "下载失败", "review": "不适用",
+             "path": "/" + "long-path/" * 40}
+            for i in range(20)]
+    table = RecentEpisodeMaintenance._attention_table(rows)
+    assert table["props"]["style"]["overflow"] == "auto"
+    assert table["props"]["style"]["maxHeight"] == "22rem"
+    header, *rendered = table["content"]
+    assert header["props"]["style"]["position"] == "sticky"
+    assert len(rendered) == len(rows) and all(row["component"] == "VRow" for row in rendered)
+    last_path = rendered[-1]["content"][-1]
+    assert last_path["text"] == rows[-1]["path"]
+    assert last_path["props"]["style"]["overflowWrap"] == "anywhere"
+
+
+def test_attention_panel_distinguishes_empty_and_unreadable_state(monkeypatch):
+    plugin = RecentEpisodeMaintenance()
+    monkeypatch.setattr(plugin, "_load_processing_state", lambda: {})
+    title, body = attention_panel_content(plugin._attention_panel())
+    assert title == "需人工检查列表及具体问题（0 项）"
+    assert body["text"] == "暂无需要人工检查的记录。"
+
+    def unavailable():
+        raise RuntimeError("storage error")
+
+    monkeypatch.setattr(plugin, "_load_processing_state", unavailable)
+    title, body = attention_panel_content(plugin._attention_panel())
+    assert "0 项" not in title and "暂无法读取" in body["text"]
+
+
 @pytest.mark.parametrize("age,valid", [
     (None, False), ("bad timestamp", False), (31, False), (30, False),
     (-1, False), (0, True), (29, True),
@@ -116,7 +229,6 @@ def test_stale_refresh_preview_is_rechecked_before_confirmation_or_cap(monkeypat
     plugin._scan_after_reorganize = False
     plugin._dry_run, plugin._notify = False, False
     plugin._library_ids = []
-    plugin._refresh_mode, plugin._replace_images = "all", True
     plugin._get_jellyfin_client = lambda: client
     initial = {"episode": {"status": "pending_refresh", "history_id": 182,
         "history_date": history.date, "refresh_attempts": 3, "had_action": True,
@@ -446,8 +558,8 @@ def test_final_summary_lists_existing_and_new_attention_without_inflating_failur
     assert result.queue_counts["attention"] == 2
     assert result.failed == 1
     assert result.attention_items == [
-        "师兄啊师兄 S01E161：刮削附件多次补齐失败｜文件：/library/existing.mp4",
-        "斗破苍穹 S05E213：刮削附件多次补齐失败｜文件：/library/山雨欲来.mp4",
+        "师兄啊师兄 S01E161：刮削附件多次补齐失败｜当前记录文件：/library/existing.mp4",
+        "斗破苍穹 S05E213：刮削附件多次补齐失败｜当前记录文件：/library/old.mp4｜MP 预览目标：/library/山雨欲来.mp4",
     ]
     assert "需人工检查记录（共 2 条，含此前遗留）：" in messages[0]
     assert all(item in messages[0] for item in result.attention_items)
@@ -491,8 +603,8 @@ def test_run_with_only_attention_records_still_reports_their_details(monkeypatch
     assert len(messages) == 1
     assert "MP 视频整理记录 0 条" in messages[0]
     assert "需人工检查 2 条" in messages[0]
-    assert f"测试剧 S01E01：连续刷新后标题仍不一致｜文件：{Path(histories[0].dest)}" in messages[0]
-    assert f"测试电影：旧名称附件清理失败｜文件：{Path(histories[1].dest)}" in messages[0]
+    assert f"测试剧 S01E01：连续刷新后标题仍不一致｜当前记录文件：{Path(histories[0].dest)}" in messages[0]
+    assert f"测试电影：旧名称附件清理失败｜当前记录文件：{Path(histories[1].dest)}" in messages[0]
 
 
 def test_v3_run_queue_is_coalesced_per_plugin_instance():
@@ -1110,8 +1222,6 @@ def test_failed_intent_checkpoint_prevents_external_operations(monkeypatch):
     plugin._scan_after_reorganize = True
     plugin._cleanup_old_sidecars = True
     plugin._skip_same_name = True
-    plugin._refresh_mode = "all"
-    plugin._replace_images = True
     plugin._max_items = 10
     plugin._days = 15
     plugin._dry_run = False
@@ -1217,8 +1327,6 @@ def test_formal_jellyfin_title_waits_for_fresh_moviepilot_preview(monkeypatch, e
     plugin._enable_reorganize = enable_reorganize
     plugin._scan_after_reorganize = False
     plugin._cleanup_old_sidecars = True
-    plugin._refresh_mode = "all"
-    plugin._replace_images = True
     plugin._max_items = 10
     plugin._days = 15
     plugin._dry_run = False
@@ -1467,8 +1575,6 @@ def test_movie_history_uses_movie_matching_and_completes_without_refresh(
     plugin._dry_run = False
     plugin._notify = False
     plugin._library_ids = []
-    plugin._refresh_mode = "all"
-    plugin._replace_images = True
     plugin._scan_after_reorganize = False
     saved = []
     plugin._load_processing_state = lambda: deepcopy(saved[-1]) if saved else {}
@@ -1542,11 +1648,14 @@ def test_unconfirmed_transfer_never_waits_for_scrape_or_counts_success(tmp_path,
         assert saved[-1]["episode"]["status"] == plugin._STATE_PENDING_REORGANIZE
 
 
-@pytest.mark.parametrize("delayed_sidecars", [False, True])
+@pytest.mark.parametrize("delayed_sidecars,replaced_history_id", [
+    (False, False), (True, False), (True, True),
+])
 def test_reorganized_record_is_rechecked_by_jellyfin_before_completion(
     tmp_path,
     monkeypatch,
     delayed_sidecars,
+    replaced_history_id,
 ):
     old_media = tmp_path / "Show S01E01 - Old Title.mkv"
     new_media = tmp_path / "Show S01E01 - New Title.mkv"
@@ -1641,8 +1750,6 @@ def test_reorganized_record_is_rechecked_by_jellyfin_before_completion(
     plugin._dry_run = False
     plugin._notify = False
     plugin._library_ids = []
-    plugin._refresh_mode = "all"
-    plugin._replace_images = True
     plugin._scan_after_reorganize = False
     plugin._cleanup_old_sidecars = False
     plugin._skip_same_name = True
@@ -1685,13 +1792,31 @@ def test_reorganized_record_is_rechecked_by_jellyfin_before_completion(
         new_media.with_suffix(".jpg").write_bytes(b"image")
         history.dest = episode.path = str(new_media)
         saved[-1]["episode"]["sidecar_check_after"] = "2000-01-01T00:00:00"
-        FakeReorganizer.histories_by_ids = lambda _, ids: [history] if ids == {1} else []
+        def histories_by_ids(_, ids):
+            assert ids == {1}
+            return [] if replaced_history_id else [history]
+
+        FakeReorganizer.histories_by_ids = histories_by_ids
+        if replaced_history_id:
+            history.id = 2
+
+            def replacement_candidates(_, paths):
+                assert paths == {str(new_media)}
+                return [history]
+
+            FakeReorganizer.replacement_history_candidates = replacement_candidates
+            FakeReorganizer.matches_replacement_history = (
+                lambda _, candidate, key, state, target:
+                candidate is history and key == "episode" and state["history_id"] == 1
+                and target == str(new_media)
+            )
         FakeReorganizer.recent_histories = lambda *_args, **_kwargs: pytest.fail("follow-up must not scan recent history")
         plugin._maintain_danmu = lambda *_args: pytest.fail("media follow-up must not scan Danmu")
         plugin._run_once(follow_up_only=True)
         assert results[-1].reorganized == 1
         assert results[-1].operations_used == 0
         assert results[-1].reorganized_titles == [str(new_media)]
+        assert saved[-1]["episode"]["history_id"] == (2 if replaced_history_id else 1)
         assert not saved[-1]["episode"].get("rename_report_pending")
         assert FakeReorganizer.reorganize_calls == 1
         return
@@ -1834,8 +1959,6 @@ def test_cleanup_verification_does_not_block_post_scan_metadata_check(
     plugin._scan_after_reorganize = True
     plugin._cleanup_old_sidecars = True
     plugin._skip_same_name = True
-    plugin._refresh_mode = "all"
-    plugin._replace_images = True
     plugin._max_items = 10
     plugin._days = 15
     plugin._dry_run = False

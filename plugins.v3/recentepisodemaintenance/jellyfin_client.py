@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import json
+from base64 import b64encode
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -490,24 +491,38 @@ class JellyfinServiceClient:
                 libraries.append({"title": str(name), "value": str(item_id)})
         return libraries
 
-    def refresh_episode(
-        self,
-        item_id: str,
-        metadata_mode: str = "FullRefresh",
-        image_mode: str = "FullRefresh",
-        replace_metadata: bool = True,
-        replace_images: bool = True,
-    ) -> None:
+    def refresh_episode(self, item_id: str) -> None:
         params = {
-            "MetadataRefreshMode": metadata_mode or "FullRefresh",
-            "ImageRefreshMode": image_mode or "FullRefresh",
-            "ReplaceAllMetadata": str(bool(replace_metadata)).lower(),
-            "ReplaceAllImages": str(bool(replace_images)).lower(),
+            "MetadataRefreshMode": "FullRefresh",
+            "ImageRefreshMode": "FullRefresh",
+            "ReplaceAllMetadata": "true",
+            "ReplaceAllImages": "true",
         }
         self._post_json(f"Items/{item_id}/Refresh", params)
 
     def scan_library(self) -> None:
         self._post_json("Library/Refresh")
+
+    def has_primary_image(self, item_id: str) -> bool:
+        images = self._get_json(f"Items/{item_id}/Images", retry=False)
+        if not isinstance(images, list) or any(
+            not isinstance(image, dict) or not isinstance(image.get("ImageType"), str)
+            for image in images
+        ):
+            raise RuntimeError("无法确认 Jellyfin 现有图片")
+        return any(image["ImageType"] == "Primary" for image in images)
+
+    def add_primary_image_if_missing(self, item_id: str, jpeg: bytes) -> bool:
+        if self.has_primary_image(item_id):
+            return False
+        response = self.service.post_data(
+            self._url(f"Items/{item_id}/Images/Primary"),
+            data=b64encode(jpeg).decode("ascii"), headers={"Content-Type": "image/jpeg"},
+        )
+        self._json(response)
+        if not self.has_primary_image(item_id):
+            raise RuntimeError("Jellyfin 未确认主图已保存")
+        return True
 
     def danmu_settings(self) -> dict[str, Any]:
         plugins = self._get_json("Plugins")
