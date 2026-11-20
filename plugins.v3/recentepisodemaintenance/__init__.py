@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from hashlib import sha256
+from json import dumps
 from os import scandir
 from pathlib import Path
 from shutil import rmtree
@@ -59,6 +60,7 @@ class RecentEpisodeMaintenance(_PluginBase):
     _OLD_SIDECAR_VERIFY_MINUTES = 10
     _OLD_SIDECAR_MAX_PASSES = 2
     _REFRESH_RECHECK_MINUTES = 30
+    _PLACEHOLDER_REFRESH_RETRY_HOURS = (6, 12, 24)
     _PREVIEW_CACHE_MINUTES = 30
     _PREVIEW_RETRY_MINUTES = 60
     _FOLLOW_UP_POLL_MINUTES = 10
@@ -110,7 +112,7 @@ class RecentEpisodeMaintenance(_PluginBase):
     plugin_name = "最近媒体维护"
     plugin_desc = "维护 MoviePilot 最近整理入库的 Jellyfin 电影和剧集"
     plugin_icon = "https://raw.githubusercontent.com/byangmath/MoviePilot-Plugins/main/icons/recentepisodemaintenance.png"
-    plugin_version = "1.0.7"
+    plugin_version = "1.0.8"
     plugin_author = "byangmath"
     author_url = "https://github.com/byangmath"
     plugin_config_prefix = "recentepisodemaintenance_"
@@ -161,15 +163,21 @@ class RecentEpisodeMaintenance(_PluginBase):
             config["run_once"] = False
             config_changed = True
         retry_attention = bool(config.get("retry_attention", False))
-        if retry_attention:
+        retry_selection = config.get("retry_attention_selection")
+        if retry_attention or retry_selection:
             config["retry_attention"] = False
+            config["retry_attention_selection"] = []
             config_changed = True
 
         if config_changed:
             self.__update_config(config)
 
         if retry_attention:
-            run_once = self._retry_attention_records() > 0 or run_once
+            selected = {value for value in retry_selection if isinstance(value, str)} if isinstance(retry_selection, list) else set()
+            if selected:
+                self.run_once(attention_selection=selected)
+            else:
+                logger.info("[最近媒体维护] 未勾选人工检查记录，未执行重新处理")
 
         if run_once:
             self.run_once()
@@ -242,9 +250,9 @@ class RecentEpisodeMaintenance(_PluginBase):
                             ),
                             self._switch(
                                 "retry_attention",
-                                "重新处理需人工检查记录",
+                                "重新处理选中的记录",
                                 12,
-                                "重置全部人工检查记录的对应重试次数并立即重新入队，保存后自动关闭",
+                                "保存后立即重新处理下方勾选的问题，并清空选择、关闭开关",
                             ),
                             self._attention_panel(),
                             self._text(
@@ -313,6 +321,7 @@ class RecentEpisodeMaintenance(_PluginBase):
             "enabled": False,
             "run_once": False,
             "retry_attention": False,
+            "retry_attention_selection": [],
             "cron": "0 4 * * *",
             "days": 7,
             "max_items": 20,
@@ -337,15 +346,31 @@ class RecentEpisodeMaintenance(_PluginBase):
             self._run_state_lock = Lock()
             self._run_active = False
             self._pending_run = False
+            self._pending_attention_selection: set[str] = set()
 
-    def run_once(self, follow_up_only: bool = False):
+    def _take_queued_run(self) -> dict[str, Any] | None:
+        if self._pending_attention_selection:
+            selection = self._pending_attention_selection
+            self._pending_attention_selection = set()
+            return {"attention_selection": selection}
+        if self._pending_run:
+            self._pending_run = False
+            return {}
+        return None
+
+    def run_once(self, follow_up_only: bool = False, *, attention_selection: set[str] | None = None):
         self._ensure_run_state()
+        options = ({"attention_selection": attention_selection} if attention_selection is not None
+                   else {"follow_up_only": True} if follow_up_only else {})
 
         with self._run_state_lock:
             if self._run_active:
-                if follow_up_only:
+                if attention_selection is not None:
+                    self._pending_attention_selection.update(attention_selection)
+                elif follow_up_only:
                     return
-                self._pending_run = True
+                else:
+                    self._pending_run = True
                 logger.info(
                     "[最近媒体维护] 已有任务正在运行，本次触发已排队，"
                     "将在本轮结束后运行"
@@ -355,10 +380,7 @@ class RecentEpisodeMaintenance(_PluginBase):
 
         while True:
             try:
-                if follow_up_only:
-                    self._run_once(follow_up_only=True)
-                else:
-                    self._run_once()
+                self._run_once(**options)
             except Exception as err:
                 logger.exception(f"[最近媒体维护] 运行异常：{err}")
                 if self._notify:
@@ -378,11 +400,10 @@ class RecentEpisodeMaintenance(_PluginBase):
                         )
 
             with self._run_state_lock:
-                if not self._pending_run:
+                options = self._take_queued_run()
+                if options is None:
                     self._run_active = False
                     return
-                self._pending_run = False
-                follow_up_only = False
 
             logger.info("[最近媒体维护] 上一轮已结束，开始执行排队任务")
 
@@ -406,11 +427,10 @@ class RecentEpisodeMaintenance(_PluginBase):
                 confirmation_failed = True
             finally:
                 with self._run_state_lock:
-                    pending_run = self._pending_run
-                    self._pending_run = False
+                    queued_run = self._take_queued_run()
                     self._run_active = False
-            if pending_run:
-                self.run_once()
+            if queued_run is not None:
+                self.run_once(**queued_run)
                 return
             if confirmation_failed:
                 return
@@ -478,15 +498,16 @@ class RecentEpisodeMaintenance(_PluginBase):
             logger.error(f"[最近媒体维护] 弹幕队列检查失败：{safe_error(err)}")
         finally:
             with self._run_state_lock:
-                pending_run = self._pending_run
-                self._pending_run = False
+                queued_run = self._take_queued_run()
                 self._run_active = False
-            if pending_run:
-                self.run_once()
+            if queued_run is not None:
+                self.run_once(**queued_run)
 
-    def _run_once(self, follow_up_only: bool = False):
+    def _run_once(self, follow_up_only: bool = False, *, attention_selection: set[str] | None = None):
         operation_limit = max(int(self._max_items), 1)
         result = RunResult(operation_limit=operation_limit)
+        scoped = attention_selection is not None
+        follow_up_only = follow_up_only or scoped
         artwork_enabled = getattr(self, "_enable_artwork", False) and not follow_up_only
         metadata_enabled = self._enable_refresh or self._enable_reorganize
         if not metadata_enabled and not getattr(self, "_enable_danmu", False) and not artwork_enabled:
@@ -512,7 +533,19 @@ class RecentEpisodeMaintenance(_PluginBase):
             return
         try:
             stored_state = self._load_processing_state()
-            if follow_up_only:
+            if scoped:
+                media_keys, danmu_keys = self._retry_attention_records(attention_selection, state=stored_state)
+                if not media_keys and not danmu_keys:
+                    return
+                media_ids = {int(stored_state[key]["history_id"]) for key in media_keys if stored_state[key].get("history_id")}
+                danmu_ids = {int(stored_state[key]["history_id"]) for key in danmu_keys if stored_state[key].get("history_id")}
+                selected_histories = reorganizer.histories_by_ids(media_ids | danmu_ids)
+                danmu_pool = [h for h in selected_histories if reorganizer.processing_key(h) in danmu_keys]
+                history_pool, stored_state = self._reconcile_missing_histories(
+                    [h for h in selected_histories if reorganizer.processing_key(h) in media_keys],
+                    stored_state, media_ids, reorganizer, True, scope_keys=media_keys,
+                )
+            elif follow_up_only:
                 ids = {
                     int(item["history_id"]) for item in stored_state.values()
                     if item.get("history_id")
@@ -526,14 +559,17 @@ class RecentEpisodeMaintenance(_PluginBase):
                     tracked_history_ids=ids,
                     preferred_history_ids=self._protected_history_ids(stored_state),
                 )
-            history_pool, stored_state = self._reconcile_missing_histories(
-                history_pool, stored_state, ids, reorganizer, follow_up_only,
-            )
+            if not scoped:
+                history_pool, stored_state = self._reconcile_missing_histories(
+                    history_pool, stored_state, ids, reorganizer, follow_up_only,
+                )
+                danmu_pool = [] if follow_up_only else history_pool
             histories, processing_state, selection = self._select_histories(
                 histories=history_pool,
                 reorganizer=reorganizer,
                 state=stored_state,
                 follow_up_only=follow_up_only,
+                scoped=scoped,
             )
             result.reorganize_candidates = len(histories)
             result.history_details = {
@@ -562,7 +598,8 @@ class RecentEpisodeMaintenance(_PluginBase):
                 )
             }
             logger.info(
-                ("[最近媒体维护] 按历史 ID 查询到期复查记录，" if follow_up_only else
+                ("[最近媒体维护] 仅处理本次勾选的人工检查记录，" if scoped else
+                 "[最近媒体维护] 按历史 ID 查询到期复查记录，" if follow_up_only else
                  f"[最近媒体维护] 查询 MP 最近 {self._days} 天成功视频整理记录，") +
                 f"共 {len(history_pool)} 条；本轮最多执行 {operation_limit} 次操作，"
                 f"检查 {len(histories)} 条视频记录"
@@ -599,8 +636,8 @@ class RecentEpisodeMaintenance(_PluginBase):
                  else "[最近媒体维护] 当前时间范围内没有到期待处理的整理记录")
                 + waiting_text
             )
-            if not follow_up_only:
-                self._maintain_danmu(history_pool, reorganizer, processing_state, result)
+            if danmu_pool:
+                self._maintain_danmu(danmu_pool, reorganizer, processing_state, result)
             if artwork_enabled:
                 self._maintain_episode_artwork(
                     history_pool, reorganizer, processing_state, result,
@@ -1086,6 +1123,10 @@ class RecentEpisodeMaintenance(_PluginBase):
                         processing_state,
                         episode_history_keys,
                     )
+                    placeholder_retry = (episode.is_episode and not placeholder_preview
+                                         and episode.title_is_placeholder(episode.name))
+                    refresh_limit = (len(self._PLACEHOLDER_REFRESH_RETRY_HOURS) + 1
+                                     if placeholder_retry else self._MAX_REFRESH_ATTEMPTS)
                     for refresh_target in refresh_targets:
                         deferred_reorganize_reasons[refresh_target] = (
                             "MP 和 Jellyfin 标题均不可靠，本轮尝试一次元数据刷新"
@@ -1094,7 +1135,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                         )
                     if (
                         not self._dry_run
-                        and refresh_attempts >= self._MAX_REFRESH_ATTEMPTS
+                        and refresh_attempts >= refresh_limit
                     ):
                         message = (
                             f"{episode_label} 已连续刷新 {refresh_attempts} 次，"
@@ -1122,6 +1163,19 @@ class RecentEpisodeMaintenance(_PluginBase):
                             f"文件：{episode_file}"
                         )
                         continue
+                    if not self._dry_run and placeholder_retry:
+                        retry_after = self._defer_placeholder_refresh_retry(
+                            processing_state, episode_history_keys, refresh_attempts,
+                        )
+                        if retry_after:
+                            result.add_skipped(*refresh_targets)
+                            for refresh_target in refresh_targets:
+                                deferred_reorganize_reasons[refresh_target] = "等待占位标题更新后再重试刷新"
+                            logger.info(
+                                f"[最近媒体维护] 暂缓再次刷新 {episode_label}："
+                                f"Jellyfin 仍为占位标题，最早 {retry_after} 再检查｜文件：{episode_file}"
+                            )
+                            continue
                     if result.operations_used >= result.operation_limit:
                         result.add_skipped(*refresh_targets)
                         for refresh_target in refresh_targets:
@@ -1192,7 +1246,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                         )
                         refresh_reason += (
                             f"（第 {refresh_attempts + 1}/"
-                            f"{self._MAX_REFRESH_ATTEMPTS} 次）"
+                            f"{refresh_limit} 次）"
                         )
                         logger.info(
                             f"[最近媒体维护] 刷新 {episode_label}："
@@ -2171,8 +2225,9 @@ class RecentEpisodeMaintenance(_PluginBase):
                 "完成清理前不触发 Jellyfin 媒体库扫描"
             )
 
-        if not state_persistence_failed and not follow_up_only:
-            self._maintain_danmu(history_pool, reorganizer, processing_state, result, client)
+        if not state_persistence_failed:
+            if danmu_pool:
+                self._maintain_danmu(danmu_pool, reorganizer, processing_state, result, client)
             if artwork_enabled:
                 self._maintain_episode_artwork(
                     history_pool, reorganizer, processing_state, result,
@@ -2655,13 +2710,15 @@ class RecentEpisodeMaintenance(_PluginBase):
         requested_ids: set[int],
         reorganizer: MoviePilotReorganizer,
         follow_up_only: bool,
+        *,
+        scope_keys: set[str] | None = None,
     ) -> tuple[list[Any], dict[str, dict[str, Any]]]:
         by_id = {int(history.id): history for history in histories if getattr(history, "id", None)}
         state = dict(state)
         missing = requested_ids - by_id.keys()
         protected = {}
         for key, item in list(state.items()):
-            if not isinstance(item, dict):
+            if (scope_keys is not None and key not in scope_keys) or not isinstance(item, dict):
                 continue
             history_id = int(item.get("history_id") or 0)
             if history_id not in missing:
@@ -2763,6 +2820,8 @@ class RecentEpisodeMaintenance(_PluginBase):
         reorganizer: MoviePilotReorganizer,
         state: dict[str, dict[str, Any]] | None = None,
         follow_up_only: bool = False,
+        *,
+        scoped: bool = False,
     ) -> tuple[list[Any], dict[str, dict[str, Any]], dict[str, Any]]:
         state = dict(state) if isinstance(state, dict) else self._load_processing_state()
         keyed_histories = [
@@ -2801,7 +2860,10 @@ class RecentEpisodeMaintenance(_PluginBase):
                     and "rename_reported" not in state_item):
                 state_item["rename_report_pending"] = True
             state[key] = state_item
-        recovered_intents = self._recover_operation_intents(state)
+        recoverable = {key: state[key] for key in active_keys} if scoped else state
+        recovered_intents = self._recover_operation_intents(recoverable)
+        if scoped:
+            state.update(recoverable)
         if recovered_intents:
             logger.warning(
                 f"[最近媒体维护] 检测到 {recovered_intents} 条上次运行未确认的"
@@ -3243,6 +3305,20 @@ class RecentEpisodeMaintenance(_PluginBase):
             datetime.now() + timedelta(minutes=cls._REFRESH_RECHECK_MINUTES)
         ).isoformat(timespec="seconds")
 
+    def _defer_placeholder_refresh_retry(
+        self, state: dict[str, dict[str, Any]], keys: set[str], attempts: int,
+    ) -> str | None:
+        if not keys or not 1 <= attempts <= len(self._PLACEHOLDER_REFRESH_RETRY_HOURS):
+            return None
+        if any((state.get(key) or {}).get("placeholder_retry_deferred_attempt") == attempts for key in keys):
+            return None
+        hours = self._PLACEHOLDER_REFRESH_RETRY_HOURS[attempts - 1]
+        retry_after = (datetime.now() + timedelta(hours=hours)).isoformat(timespec="seconds")
+        self._mark_processing_state(state, keys, self._STATE_PENDING_REFRESH, refresh_check_after=retry_after)
+        for key in keys:
+            state[key]["placeholder_retry_deferred_attempt"] = attempts
+        return retry_after
+
     def _schedule_post_scan_refresh(
         self,
         state: dict[str, dict[str, Any]],
@@ -3491,26 +3567,31 @@ class RecentEpisodeMaintenance(_PluginBase):
                 protected.add(history_id)
         return protected
 
-    def _retry_attention_records(self) -> int:
-        try:
+    @staticmethod
+    def _attention_selection_id(key: str, kind: str) -> str:
+        return sha256(f"{kind}:{key}".encode("utf-8")).hexdigest()
+
+    def _retry_attention_records(
+        self, selected: set[str], *, state: dict[str, dict[str, Any]] | None = None,
+    ) -> tuple[set[str], set[str]]:
+        if state is None:
             state = self._load_processing_state()
-        except Exception as err:
-            logger.error(f"[最近媒体维护] 无法重新处理人工检查记录：{err}")
-            return 0
-        retried = 0
+        media_keys: set[str] = set()
+        danmu_keys: set[str] = set()
         retry_at = datetime.now().isoformat(timespec="seconds")
         for key, value in list(state.items()):
             item = dict(value) if isinstance(value, dict) else {}
-            danmu = item.get("danmu") or {}
-            danmu_retried = danmu.get("status") == "attention"
-            if danmu_retried:
+            danmu = item.get("danmu")
+            if (isinstance(danmu, dict) and danmu.get("status") == "attention"
+                    and self._attention_selection_id(key, "danmu") in selected):
                 item["danmu"] = {**danmu, "status": "ready", "attempts": 0,
                                  "check_after": retry_at, "confirmations": 0, "error": "",
                                  "verify_comments": True, "manual_recheck": True,
                                  "manual_rechecks_remaining": DanmuMaintenance.MANUAL_UNAVAILABLE_RESULTS}
                 state[key] = item
-            if item.get("status") != self._STATE_ATTENTION:
-                retried += int(danmu_retried)
+                danmu_keys.add(key)
+            if (item.get("status") != self._STATE_ATTENTION
+                    or self._attention_selection_id(key, "media") not in selected):
                 continue
             attention_stage = self._attention_stage(item)
             item.pop("preview_check_after", None)
@@ -3529,6 +3610,7 @@ class RecentEpisodeMaintenance(_PluginBase):
             elif attention_stage == "refresh":
                 item["status"] = self._STATE_PENDING_REFRESH
                 item["refresh_attempts"] = 0
+                item.pop("placeholder_retry_deferred_attempt", None)
                 item["placeholder_refresh_done"] = False
                 item["refresh_check_after"] = retry_at
                 if not self._preview_target_is_committed(item):
@@ -3548,17 +3630,18 @@ class RecentEpisodeMaintenance(_PluginBase):
             item.pop("attention_stage", None)
             item.pop("attention_detail", None)
             state[key] = item
-            retried += 1
+            media_keys.add(key)
+        retried = len(media_keys) + len(danmu_keys)
         if not retried:
-            logger.info("[最近媒体维护] 当前没有需人工检查的记录")
-            return 0
+            logger.info("[最近媒体维护] 勾选的记录已不在人工检查列表，未执行重新处理")
+            return set(), set()
         if not self._save_processing_state(state):
             logger.error("[最近媒体维护] 人工检查记录重新入队失败，未执行立即运行")
-            return 0
+            return set(), set()
         logger.info(
             f"[最近媒体维护] 已将 {retried} 条需人工检查记录重新加入处理队列"
         )
-        return retried
+        return media_keys, danmu_keys
 
     @staticmethod
     def _attention_stage(item: dict[str, Any]) -> str:
@@ -3629,7 +3712,8 @@ class RecentEpisodeMaintenance(_PluginBase):
                 if item.get("attention_detail"):
                     reason += f"\n{item['attention_detail']}"
                 target = self._attention_target_line(item, path)
-                rows.append({"name": name, "kind": "整理与元数据",
+                rows.append({"selection_id": self._attention_selection_id(key, "media"),
+                             "name": name, "kind": "整理与元数据",
                              "issue": reason, "review": "不适用",
                              "path": f"{path}\n{target}" if target else path})
             danmu = item.get("danmu")
@@ -3643,35 +3727,62 @@ class RecentEpisodeMaintenance(_PluginBase):
                         review = "累计确认" + history.replace("；本次手动复核", "\n本次手动复核")
                 for separator in ("｜查询：", "｜来源："):
                     issue = issue.replace(separator, "\n" + separator[1:])
-                rows.append({"name": danmu.get("label") or name,
+                rows.append({"selection_id": self._attention_selection_id(key, "danmu"),
+                             "name": danmu.get("label") or name,
                              "kind": "弹幕无资源已暂停" if unavailable else "弹幕需人工检查",
                              "issue": issue, "review": review, "path": danmu.get("path") or path})
         return [{key: safe_error(RuntimeError(value)) for key, value in row.items()} for row in rows]
 
     @staticmethod
     def _attention_table(rows: list[dict[str, str]]) -> dict[str, Any]:
-        columns = (("name", "媒体", 2), ("kind", "问题类型", 2),
-                   ("issue", "具体问题", 3), ("review", "处理记录", 2), ("path", "文件路径", 3))
+        columns = (("name", "媒体"), ("kind", "问题类型"), ("issue", "具体问题"),
+                   ("review", "处理记录"), ("path", "文件路径"))
+        selection = "(model.retry_attention_selection || [])"
+        all_ids = dumps([row["selection_id"] for row in rows])
+        all_checked = f"{all_ids}.every(id => {selection}.includes(id))"
+
+        def checkbox_cell(values: dict[str, str], header: bool) -> dict[str, Any]:
+            if header:
+                label = "全选人工检查记录"
+                checked = all_checked
+                change = f"checked ? {all_ids} : []"
+            else:
+                label = f"选择 {values['name']}：{values['kind']}"
+                row_id = dumps(values["selection_id"])
+                checked = f"{selection}.includes({row_id})"
+                others = f"{selection}.filter(id => id !== {row_id})"
+                change = f"checked ? [...{others}, {row_id}] : {others}"
+            props = {"aria-label": label, "title": label, "hide-details": True, "density": "compact",
+                     "modelValue": "{{ " + checked + " }}",
+                     "onUpdate:modelValue": f"function (checked) {{ model.retry_attention_selection = {change}; }}"}
+            if header:
+                partial = f"{all_ids}.some(id => {selection}.includes(id)) && !({all_checked})"
+                props["indeterminate"] = "{{ " + partial + " }}"
+            return {"component": "VCol", "props": {
+                "role": "columnheader" if header else "cell",
+                "style": {"flex": "0 0 3rem", "maxWidth": "3rem", "padding": "0.25rem 0"},
+            }, "content": [{"component": "VCheckbox", "props": props}]}
 
         def render_row(values: dict[str, str], header: bool = False) -> dict[str, Any]:
-            style = {"minWidth": "52rem", "flexWrap": "nowrap",
+            style = {"minWidth": "56rem", "display": "grid", "gridTemplateColumns": "3rem 2fr 2fr 3fr 2fr 3fr",
                      "borderBottom": "1px solid rgba(var(--v-theme-on-surface), 0.16)"}
             if header:
                 style.update(position="sticky", top="0", zIndex="1", fontWeight="600",
                              background="rgb(var(--v-theme-surface))")
             return {"component": "VRow", "props": {"role": "row", "no-gutters": True, "style": style},
-                    "content": [{
+                    "content": [checkbox_cell(values, header), *({
                         "component": "VCol", "text": values[key],
-                        "props": {"cols": width, "role": "columnheader" if header else "cell", "style": {
-                            "whiteSpace": "pre-line", "overflowWrap": "anywhere", "padding": "0.65rem 0.75rem",
+                        "props": {"role": "columnheader" if header else "cell", "style": {
+                            "minWidth": "0", "whiteSpace": "pre-line", "overflowWrap": "anywhere",
+                            "padding": "0.65rem 0.75rem",
                         }},
-                    } for key, _, width in columns]}
+                    } for key, _ in columns)]}
 
         return {
             "component": "VCol",
             "props": {"role": "table", "aria-label": "需人工检查记录", "tabindex": 0,
                       "style": {"padding": "0", "maxHeight": "22rem", "maxWidth": "100%", "overflow": "auto"}},
-            "content": [render_row({key: title for key, title, _ in columns}, header=True),
+            "content": [render_row(dict(columns), header=True),
                         *(render_row(row) for row in rows)],
         }
 
@@ -3885,6 +3996,7 @@ class RecentEpisodeMaintenance(_PluginBase):
         for key in keys:
             item = state.get(key) or {}
             item["refresh_confirmation_pending"] = False
+            item.pop("placeholder_retry_deferred_attempt", None)
             item["refresh_confirmed_at"] = datetime.now().isoformat(timespec="seconds")
             state[key] = item
         path = str(file_path or "未知文件")
@@ -4063,6 +4175,7 @@ class RecentEpisodeMaintenance(_PluginBase):
                 item["refresh_check_after"] = refresh_check_after
             elif status != RecentEpisodeMaintenance._STATE_PENDING_REFRESH:
                 item.pop("refresh_check_after", None)
+                item.pop("placeholder_retry_deferred_attempt", None)
             if refresh_attempts is not None:
                 item["refresh_attempts"] = max(int(refresh_attempts), 0)
             if sidecar_pending is not None:

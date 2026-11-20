@@ -499,7 +499,8 @@ def retry_manual_state(state):
     plugin = RecentEpisodeMaintenance()
     plugin.get_data = lambda _: deepcopy(state)
     plugin.save_data = lambda _, value: state.update(deepcopy(value))
-    assert plugin._retry_attention_records() == 1
+    media_keys, danmu_keys = plugin._retry_attention_records({plugin._attention_selection_id(key, "danmu") for key in state})
+    assert not media_keys and len(danmu_keys) == 1
 
 
 def test_empty_source_stops_automatically_and_manual_retry_does_not_reset_evidence(tmp_path):
@@ -823,7 +824,7 @@ def test_pending_danmu_keeps_completed_history_tracked_and_retryable():
     saved = []
     plugin.save_data = lambda _, value: saved.append(deepcopy(value))
     assert plugin._tracked_history_ids(state) == {1}
-    assert plugin._retry_attention_records() == 1
+    assert plugin._retry_attention_records({plugin._attention_selection_id("key", "danmu")}) == (set(), {"key"})
     assert saved[-1]["key"]["danmu"]["status"] == "ready"
     assert saved[-1]["key"]["status"] == "complete"
 

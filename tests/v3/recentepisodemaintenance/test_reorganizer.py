@@ -183,7 +183,7 @@ def test_missing_history_preserves_state_and_quarantines_unsafe_candidates(confl
     assert state[key]["attention_stage"] == "history"
     plugin._load_processing_state = lambda: state
     plugin._save_processing_state = lambda _: True
-    assert plugin._retry_attention_records() == 1
+    assert plugin._retry_attention_records({plugin._attention_selection_id(key, "media")}) == ({key}, set())
     assert state[key]["status"] == "pending_reorganize"
     assert state[key]["operation_intent"]
     assert "history_lookup_attempts" not in state[key]

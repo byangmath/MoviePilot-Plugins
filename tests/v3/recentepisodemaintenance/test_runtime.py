@@ -78,15 +78,25 @@ def test_config_attention_panel_lists_issues_without_retrying(monkeypatch):
     monkeypatch.setattr(plugin, "_jellyfin_service_options", lambda: [])
     monkeypatch.setattr(plugin, "_library_options", lambda: [])
     monkeypatch.setattr(plugin, "_load_processing_state", lambda: state)
-    monkeypatch.setattr(plugin, "_retry_attention_records", lambda: pytest.fail("config read retried tasks"))
+    monkeypatch.setattr(plugin, "_retry_attention_records", lambda *args, **kwargs: pytest.fail("config read retried tasks"))
     monkeypatch.setattr(plugin, "_save_processing_state", lambda _: pytest.fail("config read wrote state"))
     form, defaults = plugin.get_form()
     assert form_models(form)[:6] == ["enabled", "run_once", "notify", "dry_run", "retry_attention", None]
     title, table = attention_panel_content(form[0]["content"][0]["content"][5])
     assert title.endswith("（4 项）")
     assert table["props"]["role"] == "table"
+    checks = [row["content"][0]["content"][0] for row in table["content"]]
+    assert all(check["component"] == "VCheckbox" for check in checks)
+    assert checks[0]["props"]["aria-label"] == "全选人工检查记录"
+    assert "indeterminate" in checks[0]["props"]
+    media_id, danmu_id = (plugin._attention_selection_id("episode", kind) for kind in ("media", "danmu"))
+    assert media_id != danmu_id
+    assert media_id in checks[0]["props"]["onUpdate:modelValue"]
+    assert danmu_id in checks[0]["props"]["onUpdate:modelValue"]
+    assert media_id in checks[1]["props"]["modelValue"] and danmu_id not in checks[1]["props"]["modelValue"]
+    assert danmu_id in checks[2]["props"]["modelValue"] and media_id not in checks[2]["props"]["modelValue"]
     headers, media, danmu, unavailable, legacy = (
-        [cell["text"] for cell in row["content"]] for row in table["content"]
+        [cell["text"] for cell in row["content"][1:]] for row in table["content"]
     )
     assert headers == ["媒体", "问题类型", "具体问题", "处理记录", "文件路径"]
     assert media == ["剧集 S01E01", "整理与元数据", "刮削附件多次补齐失败\n重新整理后仍缺少图片", "不适用",
@@ -96,11 +106,12 @@ def test_config_attention_panel_lists_issues_without_retrying(monkeypatch):
                                "累计确认无匹配或无弹幕 16 次\n本次手动复核剩余 0 次，已停止自动重试；手动重新处理仅复核可用性"]
     assert legacy[1:4] == ["弹幕无资源已暂停", "LogVar 尚未匹配到目标媒体\n查询：旧记录",
                           "累计确认无匹配或无弹幕 3 次，已停止自动重试；手动重新处理仅复核可用性"]
-    assert defaults["retry_attention"] is False and state == previous
+    assert defaults["retry_attention"] is False and defaults["retry_attention_selection"] == []
+    assert state == previous
 
 
 def test_attention_table_keeps_all_rows_in_scrollable_view():
-    rows = [{"name": str(i), "kind": "弹幕", "issue": "下载失败", "review": "不适用",
+    rows = [{"selection_id": str(i), "name": str(i), "kind": "弹幕", "issue": "下载失败", "review": "不适用",
              "path": "/" + "long-path/" * 40}
             for i in range(20)]
     table = RecentEpisodeMaintenance._attention_table(rows)
@@ -127,6 +138,146 @@ def test_attention_panel_distinguishes_empty_and_unreadable_state(monkeypatch):
     monkeypatch.setattr(plugin, "_load_processing_state", unavailable)
     title, body = attention_panel_content(plugin._attention_panel())
     assert "0 项" not in title and "暂无法读取" in body["text"]
+
+
+@pytest.mark.parametrize("choice", ["media", "danmu", "both", "none", "stale", "legacy", "switch-off"])
+def test_config_retries_only_selected_issues_and_clears_selection(monkeypatch, choice):
+    plugin = RecentEpisodeMaintenance()
+    initial = {
+        "episode": {"status": "attention", "attention_stage": "refresh", "refresh_attempts": 3,
+                    "placeholder_retry_deferred_attempt": 2,
+                    "danmu": {"status": "attention", "attempts": 3, "unavailable_count": 16}},
+        "other": {"status": "attention", "rename_attempts": 2},
+        "finished": {"status": "complete"},
+    }
+    state = deepcopy(initial)
+    saved, runs, configs = [], [], []
+    monkeypatch.setattr(plugin, "_load_processing_state", lambda: state)
+    monkeypatch.setattr(plugin, "_save_processing_state", lambda value: saved.append(deepcopy(value)) or True)
+    monkeypatch.setattr(plugin, "update_config", lambda value: configs.append(deepcopy(value)), raising=False)
+    def run_selected(*, attention_selection):
+        scope = plugin._retry_attention_records(attention_selection)
+        if any(scope):
+            runs.append(scope)
+
+    monkeypatch.setattr(plugin, "run_once", run_selected)
+    media = plugin._attention_selection_id("episode", "media")
+    danmu = plugin._attention_selection_id("episode", "danmu")
+    stale = plugin._attention_selection_id("finished", "media")
+    selections = {"media": [media, media, {}], "danmu": [danmu], "both": [media, danmu],
+                  "none": [], "stale": [stale, "__all__"], "switch-off": [media]}
+    config = {"media_server_name": "Jellyfin", "library_ids": ["__all__"],
+              "retry_attention": choice != "switch-off"}
+    if choice in selections:
+        config["retry_attention_selection"] = selections[choice]
+    plugin.init_plugin(config)
+    assert configs[-1]["retry_attention"] is False and configs[-1]["retry_attention_selection"] == []
+    assert state["other"] == initial["other"] and state["finished"] == initial["finished"]
+    item = state["episode"]
+    if choice in {"media", "both"}:
+        assert item["status"] == "pending_refresh" and item["refresh_attempts"] == 0
+        assert "placeholder_retry_deferred_attempt" not in item
+    else:
+        assert item["status"] == "attention" and item["refresh_attempts"] == 3
+    if choice in {"danmu", "both"}:
+        assert item["danmu"]["status"] == "ready" and item["danmu"]["unavailable_count"] == 16
+    else:
+        assert item["danmu"] == initial["episode"]["danmu"]
+    assert len(saved) == len(runs) == int(choice in {"media", "danmu", "both"})
+
+
+@pytest.mark.parametrize("retry,selection", [(False, []), (True, []), (True, ["selected"])])
+@pytest.mark.parametrize("already_running", [False, True])
+def test_run_once_config_always_requests_one_full_run(monkeypatch, retry, selection, already_running):
+    plugin = RecentEpisodeMaintenance()
+    calls, persisted = [], []
+    config = {"media_server_name": "Jellyfin", "library_ids": ["__all__"],
+              "run_once": True, "retry_attention": retry,
+              "retry_attention_selection": selection}
+
+    def run(**options):
+        calls.append(options)
+        if already_running and len(calls) == 1:
+            plugin.init_plugin(config)
+
+    monkeypatch.setattr(plugin, "_run_once", run)
+    monkeypatch.setattr(plugin, "update_config", lambda value: persisted.append(deepcopy(value)), raising=False)
+    if already_running:
+        plugin.run_once(follow_up_only=True)
+    else:
+        plugin.init_plugin(config)
+
+    expected = [{"follow_up_only": True}] if already_running else []
+    if selection:
+        expected.append({"attention_selection": set(selection)})
+    assert calls == expected + [{}]
+    assert len(persisted) == 1 and persisted[0]["run_once"] is False
+
+
+@pytest.mark.parametrize("kind", ["media", "danmu"])
+def test_manual_run_queries_only_selected_history_and_runs_only_selected_kind(monkeypatch, kind):
+    current = "/library/Show S01E168 - Old.mkv"
+    selected = SimpleNamespace(id=168, key="selected", date="2999-01-01 00:00:00", dest=current)
+    other = SimpleNamespace(id=169, key="other", date=selected.date, dest="/library/Other.mkv")
+    initial = {
+        "selected": {"history_id": 168, "status": "attention", "attention_stage": "refresh",
+                     "danmu": {"status": "attention", "path": current}},
+        "other": {"history_id": 169, "status": "pending_refresh",
+                  "operation_intent": {"operation": "refresh", "refresh_attempts": 1},
+                  "danmu": {"status": "ready", "check_after": "2000-01-01T00:00:00"}},
+    }
+    calls, saved, results = [], [], []
+
+    def histories_by_ids(ids):
+        assert ids == {168}
+        return [selected, other]
+
+    def preview(history):
+        assert history is selected
+        calls.append("preview")
+        return OperationResult(success=True, target=Path("/library/Show S01E168 - New.mkv"))
+
+    reorganizer = SimpleNamespace(
+        histories_by_ids=histories_by_ids, processing_key=lambda h: h.key,
+        target_path=lambda h: Path(h.dest), display_name=lambda h: h.key,
+        episode_target=lambda h: EpisodeTarget(path=h.dest), preview=preview,
+        recent_histories=lambda **kwargs: pytest.fail("manual retry queried recent histories"),
+    )
+    episode = EpisodeItem(item_id="selected-item", name="Old", series_name="Show",
+                          season_number=1, episode_number=168, path=current)
+    client = SimpleNamespace(libraries=lambda: [], path_key=JellyfinServiceClient.path_key,
+        match_recent_episodes=lambda **kwargs: {JellyfinServiceClient.path_key(current): [episode]},
+        refresh_episode=lambda **kwargs: calls.append(kwargs["item_id"]))
+    monkeypatch.setattr(plugin_module, "MoviePilotReorganizer", lambda **kwargs: reorganizer)
+    plugin = RecentEpisodeMaintenance()
+    plugin._enable_refresh, plugin._enable_reorganize = True, False
+    plugin._enable_artwork, plugin._enable_danmu = True, True
+    plugin._max_items, plugin._days = 10, 15
+    plugin._scan_after_reorganize = False
+    plugin._dry_run, plugin._notify = False, False
+    plugin._library_ids = []
+    plugin._get_jellyfin_client = lambda: client
+    plugin._load_processing_state = lambda: deepcopy(saved[-1] if saved else initial)
+    plugin._save_processing_state = lambda state: saved.append(deepcopy(state)) or True
+    plugin._maintain_episode_artwork = lambda *args, **kwargs: pytest.fail("manual retry ran artwork maintenance")
+
+    def maintain_danmu(histories, *_):
+        assert histories == [selected]
+        calls.append("danmu")
+
+    plugin._maintain_danmu = maintain_danmu
+    finish = plugin._finish_run
+    plugin._finish_run = lambda result, state: (results.append(result), finish(result, state))
+    plugin.run_once(attention_selection={plugin._attention_selection_id("selected", kind)})
+    assert saved[-1]["other"] == initial["other"]
+    if kind == "media":
+        assert calls == ["preview", "selected-item"]
+        assert results[-1].reorganize_candidates == 1
+        assert saved[-1]["selected"]["danmu"] == initial["selected"]["danmu"]
+    else:
+        assert calls == ["danmu"]
+        assert results[-1].reorganize_candidates == 0
+        assert saved[-1]["selected"]["status"] == "attention"
 
 
 @pytest.mark.parametrize("age,valid", [
@@ -195,7 +346,7 @@ def test_manual_refresh_retry_preserves_committed_target(pending):
     saved = []
     plugin._load_processing_state = lambda: {"episode": deepcopy(item)}
     plugin._save_processing_state = lambda state: saved.append(deepcopy(state)) or True
-    assert plugin._retry_attention_records() == 1
+    assert plugin._retry_attention_records({plugin._attention_selection_id("episode", "media")}) == ({"episode"}, set())
     assert saved[-1]["episode"]["expected_path"] == item["expected_path"]
     assert saved[-1]["episode"]["previewed_at"] == item["previewed_at"]
     if pending == "operation_intent":
@@ -265,6 +416,67 @@ def test_stale_refresh_preview_is_rechecked_before_confirmation_or_cap(monkeypat
         plugin._run_once()
         assert calls == ["preview", "preview"]
         assert saved[-1]["episode"]["refresh_attempts"] == 3
+
+
+@pytest.mark.parametrize("resolves_during_recheck", [True, False])
+def test_placeholder_title_confirms_early_and_defers_each_retry(monkeypatch, resolves_during_recheck):
+    current = "/library/Show S01E168 - Episode 168.mkv"
+    expected = "/library/Show S01E168 - New Title.mkv"
+    history = SimpleNamespace(id=168, date="2999-01-01 00:00:00", dest=current)
+    episode = EpisodeItem(item_id="jf", name="Episode 168", series_name="Show",
+                          season_number=1, episode_number=168, path=current)
+    fake = SimpleNamespace(recent_histories=lambda **kwargs: [history], processing_key=lambda _: "episode",
+                           target_path=lambda _: Path(current), display_name=lambda _: "Show S01E168",
+                           episode_target=lambda _: EpisodeTarget(path=current),
+                           preview=lambda _: OperationResult(success=True, target=Path(expected)))
+    submissions = []
+    client = SimpleNamespace(libraries=lambda: [], path_key=JellyfinServiceClient.path_key,
+        match_recent_episodes=lambda **kwargs: {JellyfinServiceClient.path_key(current): [episode]},
+        refresh_episode=lambda **kwargs: submissions.append(kwargs["item_id"]))
+    monkeypatch.setattr(plugin_module, "MoviePilotReorganizer", lambda **kwargs: fake)
+    plugin = RecentEpisodeMaintenance()
+    plugin._enable_refresh, plugin._enable_reorganize = True, False
+    plugin._max_items, plugin._days = 10, 15
+    plugin._scan_after_reorganize = False
+    plugin._dry_run, plugin._notify = False, False
+    plugin._library_ids = []
+    plugin._get_jellyfin_client = lambda: client
+    saved, results = [], []
+    plugin._load_processing_state = lambda: deepcopy(saved[-1] if saved else {})
+    plugin._save_processing_state = lambda state: saved.append(deepcopy(state)) or True
+    finish = plugin._finish_run
+    plugin._finish_run = lambda result, state: (results.append(result), finish(result, state))
+
+    plugin._run_once()
+    assert submissions == ["jf"] and saved[-1]["episode"]["refresh_attempts"] == 1
+    initial_confirmation = datetime.fromisoformat(saved[-1]["episode"]["refresh_check_after"])
+    assert timedelta(minutes=29) < initial_confirmation - datetime.now() <= timedelta(minutes=30)
+    for attempts, hours in enumerate((6, 12, 24), 1):
+        saved[-1]["episode"]["refresh_check_after"] = "2000-01-01T00:00:00"
+        plugin._run_once()
+        item = saved[-1]["episode"]
+        assert item["refresh_attempts"] == len(submissions) == attempts
+        assert item["status"] == "pending_refresh" and item["refresh_confirmation_pending"] is True
+        delay = datetime.fromisoformat(item["refresh_check_after"]) - datetime.now()
+        assert timedelta(hours=hours, seconds=-3) <= delay <= timedelta(hours=hours)
+        assert not plugin._has_due_follow_up(saved[-1])
+        plugin._run_once()
+        assert len(submissions) == attempts and saved[-1]["episode"]["refresh_check_after"] == item["refresh_check_after"]
+        saved[-1]["episode"]["refresh_check_after"] = "2000-01-01T00:00:00"
+        if resolves_during_recheck:
+            episode.name = "New Title"
+            plugin._run_once()
+            assert len(submissions) == 1 and results[-1].refresh_confirmed == 1
+            assert "placeholder_retry_deferred_attempt" not in saved[-1]["episode"]
+            return
+        plugin._run_once()
+        assert saved[-1]["episode"]["refresh_attempts"] == len(submissions) == attempts + 1
+
+    saved[-1]["episode"]["refresh_check_after"] = "2000-01-01T00:00:00"
+    plugin._run_once()
+    item = saved[-1]["episode"]
+    assert item["status"] == "attention" and item["attention_stage"] == "refresh"
+    assert len(submissions) == item["refresh_attempts"] == 4
 
 
 def test_skipped_count_is_unique_per_episode():
@@ -630,6 +842,22 @@ def test_v3_run_queue_is_coalesced_per_plugin_instance():
     assert other_calls == ["run"]
 
 
+def test_queued_manual_scope_does_not_turn_into_full_run():
+    plugin = RecentEpisodeMaintenance()
+    plugin._notify = False
+    calls = []
+
+    def run(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            plugin.run_once(attention_selection={"only-media"})
+            plugin.run_once(attention_selection={"only-danmu"})
+
+    plugin._run_once = run
+    plugin.run_once(follow_up_only=True)
+    assert calls == [{"follow_up_only": True}, {"attention_selection": {"only-media", "only-danmu"}}]
+
+
 def test_final_queue_counts_use_mutually_exclusive_current_states():
     plugin = RecentEpisodeMaintenance()
     result = RunResult(queue_counts={"pending": 4, "new": 2, "monitoring": 1})
@@ -965,7 +1193,8 @@ def test_retry_attention_records_resets_the_failed_stage():
 
     plugin._save_processing_state = save_state
 
-    assert plugin._retry_attention_records() == 4
+    selection = {plugin._attention_selection_id(key, "media") for key in stored}
+    assert plugin._retry_attention_records(selection) == ({"cleanup", "sidecar", "rename", "refresh"}, set())
     state = saved[-1]
     assert state["cleanup"]["status"] == plugin._STATE_PENDING_REORGANIZE
     assert state["cleanup"]["cleanup_passes"] == 0
@@ -1020,7 +1249,8 @@ def test_manual_attention_retry_is_selected_immediately_without_restarting_coold
         target_path=lambda history: Path(history.dest),
     )
 
-    assert plugin._retry_attention_records() == 4
+    keys = {"1", "2", "3", "4"}
+    assert plugin._retry_attention_records({plugin._attention_selection_id(key, "media") for key in keys}) == (keys, set())
     selected, final_state, selection = plugin._select_histories(histories, fake)
 
     assert {history.id for history in selected} == {1, 2, 3, 4}
@@ -1424,7 +1654,7 @@ def test_formal_jellyfin_title_waits_for_fresh_moviepilot_preview(monkeypatch, e
     assert saved[-1]["episode"]["status"] == plugin._STATE_ATTENTION
 
     episode.name = "黑夜女神"
-    assert plugin._retry_attention_records() == 1
+    assert plugin._retry_attention_records({plugin._attention_selection_id("episode", "media")}) == ({"episode"}, set())
     plugin._run_once()
     assert FakeClient.refresh_calls == 3
     assert saved[-1]["episode"]["status"] == plugin._STATE_MONITORING
@@ -1642,7 +1872,7 @@ def test_unconfirmed_transfer_never_waits_for_scrape_or_counts_success(tmp_path,
         assert saved[-1]["episode"]["attention_stage"] == "transfer"
         plugin._run_once()
         assert len(calls) == 1
-        assert plugin._retry_attention_records() == 1
+        assert plugin._retry_attention_records({plugin._attention_selection_id("episode", "media")}) == ({"episode"}, set())
         assert saved[-1]["episode"]["status"] == plugin._STATE_PENDING_REORGANIZE
     else:
         assert saved[-1]["episode"]["status"] == plugin._STATE_PENDING_REORGANIZE
